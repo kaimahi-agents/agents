@@ -1,0 +1,7 @@
+{
+  "namespace": "trial",
+  "commonLabels": {
+    "team": "kaimahi-agents",
+    "environment": "trial"
+  }
+}

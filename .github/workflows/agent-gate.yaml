@@ -1,0 +1,119 @@
+name: Agent Gate
+
+# Branch protection on `main` requires two approvals plus code-owner
+# review on every pull request -- stricter than any per-classification
+# review count this workflow could compute itself -- so this workflow
+# performs no review-count logic and calls no GitHub API or token. It
+# only renders and verifies offline, and is a single job named exactly
+# `agent-gate`: the stable required-status-check context.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+# Read-only, and only `contents`: this gate never needs the pull-request
+# API (no review counting, no PR-body parsing) and never writes
+# anything.
+permissions:
+  contents: read
+
+# Serialize (not cancel) concurrent runs for the same PR: cancelling an
+# in-progress run would leave the PR's head SHA without a completed
+# required status check ("stranding" it against branch protection).
+concurrency:
+  group: agent-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  agent-gate:
+    name: agent-gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Explicit head SHA: without this, a run triggered by certain
+          # pull_request event types can check out the wrong commit.
+          # fetch-depth 0 pulls full history for every branch/tag so the
+          # base SHA below is normally already present; the explicit
+          # fetch step after this one makes that independent of any
+          # checkout-action fetch-depth default.
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch the PR base SHA explicitly
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: git fetch --no-tags --prune origin "$BASE_SHA"
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Run offline unit tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Run the bounded secret scanner
+        run: python3 tools/secret-scan .
+
+      - name: Discover changed agents and render/verify every environment
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # Three-dot diff: compare HEAD against the merge base of
+          # BASE and HEAD, not against BASE's current tip directly, so
+          # commits landed on the base branch after this PR forked (but
+          # not yet merged into it) are never misreported as part of
+          # the PR's own change set.
+          if ! agents="$(git diff --name-only "$BASE_SHA...$HEAD_SHA" -- agents/ | python3 tools/discover-changed-agents)"; then
+            echo "failed to compute the changed-agent list" >&2
+            exit 1
+          fi
+          if [ -z "$agents" ]; then
+            echo "no agents/* changes in this pull request"
+            exit 0
+          fi
+
+          bundle_dir="${RUNNER_TEMP:-/tmp}/agent-gate-bundles"
+          mkdir -p "$bundle_dir"
+          status=0
+          for agent in $agents; do
+            # $agent is already a validated safe slug (tools/discover-
+            # changed-agents), so this path can never traverse outside
+            # $bundle_dir.
+            for environment in trial production; do
+              echo "== $agent / $environment =="
+              rendered="$bundle_dir/$agent-$environment.yaml"
+              if python3 tools/render "agents/$agent" "$environment" --output "$rendered"; then
+                # Only compare committed-vs-fresh bundle freshness when
+                # the render itself succeeded and actually produced
+                # $rendered: a render failure is already the primary,
+                # actionable error above -- a stale/missing-bundle
+                # diagnostic on top of it would be a misleading
+                # duplicate for a rendered output that never existed.
+                if [ "$environment" = "production" ]; then
+                  committed="agents/$agent/bundle.yaml"
+                  if [ ! -f "$committed" ]; then
+                    echo "agents/$agent: missing committed production bundle.yaml" >&2
+                    status=1
+                  elif ! cmp -s "$rendered" "$committed"; then
+                    echo "agents/$agent: committed production bundle.yaml does not match a fresh render (stale generated output)" >&2
+                    status=1
+                  fi
+                fi
+              else
+                status=1
+              fi
+
+              # tools/verify enforces, per environment, that every case
+              # eval/acceptance.md maps to that environment has a
+              # matching, passing receipt -- this is how a candidate
+              # trial evaluation campaign's required cases are checked.
+              python3 tools/verify "agents/$agent" "$environment" || status=1
+            done
+          done
+          exit "$status"
+          # CI never contacts a cluster: every step above is render/verify
+          # only, offline, against files already checked out.

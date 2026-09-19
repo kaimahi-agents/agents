@@ -1,0 +1,17 @@
+{
+  "case_id": "240",
+  "workload": {
+    "repository": "Azure/k8s-lint",
+    "pull_request": 240,
+    "dependency_update": {
+      "package": "vitest",
+      "target_range": "^5.0.0"
+    },
+    "changed_files": ["package.json", "package-lock.json"]
+  },
+  "scenario": "Repair a failing CI check on an existing dependency-update pull request by regenerating the lockfile for the intended upgrade, without expanding scope, without touching credentials, and without publishing directly.",
+  "expected_outcome": {
+    "delivery": "verified-exact-patch",
+    "automerge": false
+  }
+}

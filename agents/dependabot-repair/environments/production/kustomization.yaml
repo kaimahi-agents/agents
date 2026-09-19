@@ -1,0 +1,7 @@
+{
+  "namespace": "production",
+  "commonLabels": {
+    "team": "kaimahi-agents",
+    "environment": "production"
+  }
+}

@@ -1,0 +1,2 @@
+#!/usr/bin/env python3
+from agentctl import main_render; raise SystemExit(main_render())
