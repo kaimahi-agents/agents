@@ -1,0 +1,2 @@
+#!/usr/bin/env python3
+from agentctl import main_verify; raise SystemExit(main_verify())

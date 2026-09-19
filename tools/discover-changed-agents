@@ -1,0 +1,2 @@
+#!/usr/bin/env python3
+from agentctl import main_discover_changed_agents; raise SystemExit(main_discover_changed_agents())

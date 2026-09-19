@@ -1,0 +1,2 @@
+#!/usr/bin/env python3
+from agentctl import main_deploy; raise SystemExit(main_deploy())

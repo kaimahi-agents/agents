@@ -1,0 +1,50 @@
+{
+  "apiVersion": "core.orka.ai/v1alpha1",
+  "kind": "RepositoryMonitor",
+  "metadata": {
+    "name": "lint-fresh-v1"
+  },
+  "spec": {
+    "provider": "github",
+    "repoURL": "https://github.com/Azure/k8s-lint",
+    "branch": "main",
+    "suspend": true,
+    "targets": {
+      "pullRequests": {
+        "enabled": true,
+        "includeDrafts": false,
+        "maxPerRun": 1
+      },
+      "issues": {
+        "enabled": false
+      }
+    },
+    "agents": {
+      "reviewer": {"name": "dependabot-repair-v1"},
+      "repairer": {"name": "dependabot-repair-v1"}
+    },
+    "readCredentialRef": {"name": "source-read"},
+    "publicationReadCredentialRef": {"name": "publication-read"},
+    "publicationCredentialRef": {"name": "publication-write"},
+    "forgeCredentialRef": {"name": "forge-access"},
+    "review": {
+      "requireGreenCI": true,
+      "exactEventEnabled": false,
+      "publish": {"enabled": false}
+    },
+    "repair": {
+      "enabled": true,
+      "maxRepairsPerPR": 1,
+      "maxRepairsPerHead": 1,
+      "maxValidationRetries": 0
+    },
+    "triggers": {
+      "github": {"labels": {"enabled": false}}
+    },
+    "automerge": {"enabled": false},
+    "policy": {
+      "protectedLabels": ["security-sensitive"],
+      "pauseLabels": ["orka:pause"]
+    }
+  }
+}
