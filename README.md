@@ -23,23 +23,24 @@ upstream proposal for supported dependency installation is filed as
 
 Every pull request renders and verifies each changed agent, offline,
 checking that every case its acceptance rules require has a matching,
-passing receipt; the check never contacts a cluster. Every pull request
-also requires two approving reviews and a code-owner review before it
-can merge. The PR template asks one question, for reviewer focus: does
-the change touch prompt wording only, or does it change authority,
-runtime, memory, or acceptance rules? `CODEOWNERS` routes every change
-to the `agent-maintainers` team.
+passing receipt; the required gate never contacts a cluster. Reviews
+are not yet required because there is a single maintainer; the gate is.
+Branch protection requires zero approvals, does not require code-owner
+review, requires `agent-gate`, and applies to administrators. The PR
+template asks whether a change touches prompt wording only or
+changes authority, runtime, memory, or acceptance rules. `CODEOWNERS`
+still routes every change to the `agent-maintainers` team.
 
-## Intended evidence trail
+## Evidence trail
 
-Four pull requests demonstrate this end to end; each one's own state
-is the record of what actually happened, not this README:
+Each pull request's state is the record of what happened:
 
 - [PR 1](https://github.com/kaimahi-agents/agents/pull/1): initial
   import of version 1 and the tooling.
-- [PR 2](https://github.com/kaimahi-agents/agents/pull/2): a prompt
-  change intended to show the gate blocking a failing evaluation.
-- [PR 3](https://github.com/kaimahi-agents/agents/pull/3): a candidate
-  change intended to address that failure, evaluated live.
-- [PR 4](https://github.com/kaimahi-agents/agents/pull/4): intended to
-  deploy that candidate, then roll it back.
+- [PR 2](https://github.com/kaimahi-agents/agents/pull/2): the example
+  of a blocked change, evaluated on 2026-09-19 with 36 requests against
+  the limit of 10.
+- [PR 3](https://github.com/kaimahi-agents/agents/pull/3): the safe-stop
+  precedence candidate, awaiting fresh evaluation under provable rules.
+- [PR 4](https://github.com/kaimahi-agents/agents/pull/4): the
+  mechanically provable missing-toolchain acceptance rules.
