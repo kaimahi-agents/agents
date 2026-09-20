@@ -2,7 +2,7 @@
   "apiVersion": "core.orka.ai/v1alpha1",
   "kind": "Agent",
   "metadata": {
-    "name": "dependabot-repair-v3"
+    "name": "dependabot-repair-v1"
   },
   "spec": {
     "runtime": {

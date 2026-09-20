@@ -41,6 +41,6 @@ Each pull request's state is the record of what happened:
   of a blocked change, evaluated on 2026-09-19 with 36 requests against
   the limit of 10.
 - [PR 3](https://github.com/kaimahi-agents/agents/pull/3): the safe-stop
-  precedence candidate, passed in one fresh run under provable rules.
+  precedence candidate, awaiting fresh evaluation under provable rules.
 - [PR 4](https://github.com/kaimahi-agents/agents/pull/4): the
   mechanically provable missing-toolchain acceptance rules.
