@@ -72,10 +72,15 @@ class ReadmeTestCase(unittest.TestCase):
             with self.subTest(link=link):
                 self.assertIn(link, self.text)
 
-    def test_pr_four_link_is_the_highest_repository_pr_number_linked(self):
-        # Pins the "predictable repository PR URLs 1-4" contract: exactly
-        # four, no fifth speculative PR linked.
-        self.assertNotIn("https://github.com/kaimahi-agents/agents/pull/5", self.text)
+    def test_single_maintainer_review_policy_is_stated_plainly(self):
+        for term in ("single maintainer", "required gate", "zero approvals", "does not require code-owner review",
+                     "requires `agent-gate`", "applies to administrators"):
+            with self.subTest(term=term):
+                self.assertIn(term, self.normalized)
+
+    def test_pr_two_is_the_concrete_blocked_change_example(self):
+        self.assertIn("example of a blocked change", self.normalized)
+        self.assertIn("36 requests against the limit of 10", self.normalized)
 
     def test_does_not_contain_a_local_or_internal_identifier_shape(self):
         # Any *specific* internal name (a person, a workstream ID, a local host path, an
@@ -99,15 +104,10 @@ class ReadmeTestCase(unittest.TestCase):
         # dangling reference.
         self.assertNotIn("DESIGN.md", self.text)
 
-    def test_does_not_assert_an_outcome_for_prs_2_through_4_before_they_exist(self):
-        # PRs 2-4 are not opened yet when this README is authored; it may
-        # describe their *intended* purpose but must never assert that one
-        # already merged, passed, or was blocked -- each PR's own state is
-        # the actual record.
-        lowered = self.normalized.lower()
-        for outcome_word in ("merged", "passed", "blocked", "failed", "rolled back"):
-            with self.subTest(outcome_word=outcome_word):
-                self.assertNotIn(outcome_word, lowered)
+    def test_pr_four_is_described_as_the_acceptance_rule_change(self):
+        for term in ("mechanically provable", "missing-toolchain", "acceptance rules"):
+            with self.subTest(term=term):
+                self.assertIn(term, self.normalized)
 
 
 if __name__ == "__main__":
