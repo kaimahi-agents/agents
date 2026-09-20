@@ -691,7 +691,8 @@ class LifecycleCliTestCase(unittest.TestCase):
         args = {"--context": "ctx", "--kubeconfig": "cred", "--evidence-root": str(self.evidence),
                 "--agent-dir": str(self.agent), "--environment": "trial", "--namespace": NAMESPACE,
                 "--date": "2026-09-17", "--runtime-configmap-name": "runtime-selector",
-                "--runtime-configmap-key": "image", "--api-base-url": "https://api.example.com"}
+                "--runtime-configmap-key": "image", "--runtime-namespace": "runtime-system",
+                "--api-base-url": "https://api.example.com"}
         args.update(overrides)
         return [token for flag, value in args.items() for token in (flag, value)]
 
@@ -718,6 +719,13 @@ class LifecycleCliTestCase(unittest.TestCase):
                           "memory-inventory-matches-baseline", "proposal-inventory-matches-baseline"})
         self.assertEqual(receipt["digests"]["runtime-image"], RUNTIME_DIGEST)
         self.assertEqual(receipt["counts"], {"memory-items": 0, "proposal-items": 0})
+
+    def test_runtime_selector_is_read_from_its_explicit_namespace(self):
+        self.run_lifecycle("deploy")
+        runtime_call = next(argv for argv, _ in self.kubectl.calls if "runtime-selector" in argv)
+        self.assertEqual(runtime_call[runtime_call.index("-n") + 1], "runtime-system")
+        agent_call = next(argv for argv, _ in self.kubectl.calls if self.AGENT_NAME in argv)
+        self.assertEqual(agent_call[agent_call.index("-n") + 1], NAMESPACE)
 
     def test_rollback_verify_applies_nothing(self):
         self.run_lifecycle("rollback")
@@ -782,6 +790,15 @@ class LifecycleCliTestCase(unittest.TestCase):
             "data": {"image": "registry.example.com/agent@sha256:" + "f0" * 32}}
         self.assertEqual(self.run_lifecycle("deploy")["verdict"], "fail")
         self.assertEqual(self.receipt("deploy")["assertions"]["runtime-image-matches-lock"]["verdict"], "fail")
+
+    def test_a_server_side_null_items_value_is_an_empty_inventory(self):
+        with mock.patch.object(agentctl.subprocess, "run", self.kubectl), \
+                mock.patch.object(agentctl, "http_get_json", lambda *a, **k: {"items": None, "metadata": {}}), \
+                redirect_stdout(io.StringIO()):
+            agentctl._lifecycle_cli("deploy", self.argv())
+        receipt = self.receipt("deploy")
+        self.assertEqual(receipt["verdict"], "pass")
+        self.assertEqual(receipt["counts"], {"memory-items": 0, "proposal-items": 0})
 
     def test_an_inventory_count_that_drifts_from_the_baseline_fails(self):
         with mock.patch.object(agentctl.subprocess, "run", self.kubectl), \

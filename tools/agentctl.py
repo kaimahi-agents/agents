@@ -970,6 +970,8 @@ def _inventory_readback(api_base_url, path, token, expected_count):
     except HttpError:
         return None, None, {}
     items = response.get("items") if isinstance(response, dict) else None
+    if isinstance(response, dict) and "items" in response and items is None:
+        items = []  # The API encodes an empty server-side slice as JSON null.
     if not isinstance(items, list):
         return False, None, {"response": response}
     return len(items) == expected_count, len(items), {"response": response}
@@ -985,7 +987,7 @@ def _lifecycle_cli(kind: str, argv) -> int:
     for flag, default in (("--agent-resource-type", "agents.core.orka.ai"),
                           ("--prompt-configmap-name", "system-prompt"), ("--prompt-configmap-key", "system.md")):
         parser.add_argument(flag, default=default)
-    for flag in ("--runtime-configmap-name", "--runtime-configmap-key", "--api-base-url"):
+    for flag in ("--runtime-configmap-name", "--runtime-configmap-key", "--runtime-namespace", "--api-base-url"):
         parser.add_argument(flag, required=True)
     parser.add_argument("--api-token-file", type=Path)
     if kind == "rollback":
@@ -1020,7 +1022,9 @@ def _lifecycle_cli(kind: str, argv) -> int:
     try:
         agent_obj, configmap = get(args.agent_resource_type, names[0]), get("configmap", args.prompt_configmap_name)
         monitor_obj = get(args.monitor_resource_type, names[1]) if kind == "rollback" else None
-        runtime_configmap = get("configmap", args.runtime_configmap_name)
+        runtime_configmap = run_kubectl_json(
+            args.context, args.kubeconfig,
+            ["get", "configmap", args.runtime_configmap_name, "-n", args.runtime_namespace])
     except KubectlError:
         agent_obj = configmap = monitor_obj = runtime_configmap = None
     primary_matched, primary_evidence = None, {}
