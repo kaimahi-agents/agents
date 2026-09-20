@@ -18,17 +18,19 @@ class RolloutDecisionTestCase(unittest.TestCase):
         self.text = ROLLOUT.read_text(encoding="utf-8")
         self.normalized = re.sub(r"\s+", " ", self.text)
 
-    def test_two_approvals_are_required_unconditionally(self):
-        self.assertIn("two distinct, non-author approvals", self.normalized)
-        self.assertIn("without exception", self.normalized)
+    def test_the_gate_is_required_but_reviews_are_not_yet_required(self):
+        for phrase in ("required `agent-gate`", "Reviews are not yet required", "single maintainer"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, self.normalized)
 
-    def test_no_lower_risk_classification_reduces_the_requirement(self):
-        for phrase in ("one for prompt-only", "prompt-only changes", "for its classification"):
+    def test_obsolete_approval_requirements_are_absent(self):
+        for phrase in ("two distinct, non-author approvals", "at least one of them from a code owner"):
             with self.subTest(phrase=phrase):
                 self.assertNotIn(phrase, self.normalized)
 
-    def test_a_code_owner_review_is_required(self):
-        self.assertIn("at least one of them from a code owner", self.normalized)
+    def test_codeowners_routes_changes_without_being_an_approval_requirement(self):
+        self.assertIn("`CODEOWNERS` still routes changes", self.normalized)
+        self.assertIn("is not an approval requirement", self.normalized)
 
     def test_mechanically_scored_policy_receipts_require_every_assertion_not_a_human_verdict(self):
         self.assertNotIn("human-verdict", self.normalized)

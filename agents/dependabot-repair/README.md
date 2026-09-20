@@ -16,7 +16,9 @@ both delivering a verified-exact patch with automerge left off.
 - Runtime: `claude` under contract `orka.harness.v2`.
 - Tools: Read, Write, Edit, Bash, Glob, Grep.
 - Monitor intake is suspended (manual only); automerge is off.
-- The production runtime image digest remains in the version 1 receipt history.
+- The production runtime image digest remains in the Git history of
+  `dependencies.lock.yaml`; the version 3 candidate locks the npm-less stock
+  image but has not been deployed to production.
 
 ## Version 2 candidate (imported failure)
 
