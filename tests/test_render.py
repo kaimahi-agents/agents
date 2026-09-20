@@ -10,11 +10,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tests.fixtures import PROMPT_TEXT, write_agent, write_json  # noqa: E402
+from tests.fixtures import PROMPT_TEXT, acceptance_block, write_agent, write_json  # noqa: E402
 from tools import agentctl  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REAL_AGENT = REPO_ROOT / "agents" / "dependabot-repair"
+PRODUCTION_BUNDLE_DIGEST = "74808bb3e69f73719cc180cc8a2b6f52f18eae10d0079fdf0456cd65aab590ad"
+POLICY_CASE = {"case_id": "toolchain-unavailable", "environment": "trial", "case_sha256": "a" * 64,
+              "required": False, "policy": agentctl.MISSING_TOOLCHAIN_POLICY,
+              "assertions": sorted(agentctl.MISSING_TOOLCHAIN_ASSERTIONS),
+              "limits": dict(agentctl.MISSING_TOOLCHAIN_LIMITS)}
 
 
 class RenderTestCase(unittest.TestCase):
@@ -115,6 +120,44 @@ class RenderTestCase(unittest.TestCase):
         with self.assertRaises(agentctl.BundleError):
             self.render()
 
+    def test_an_unreferenced_policy_file_never_affects_the_digest(self):
+        baseline = self.render()["bundle_digest"]
+        (self.agent / "eval" / "policies").mkdir(parents=True, exist_ok=True)
+        (self.agent / "eval" / "policies" / "missing-toolchain.md").write_text("policy text\n", encoding="utf-8")
+        self.assertEqual(self.render(name="unreferenced.yaml")["bundle_digest"], baseline)
+
+    def test_a_declared_policy_requires_its_policy_file_to_render(self):
+        (self.agent / "eval" / "acceptance.md").write_text(acceptance_block(POLICY_CASE), encoding="utf-8")
+        with self.assertRaises(agentctl.BundleError):
+            self.render(name="missing-policy.yaml")
+
+    def test_declaring_the_missing_toolchain_policy_changes_the_digest(self):
+        baseline = self.render()["bundle_digest"]
+        (self.agent / "eval" / "policies").mkdir(parents=True, exist_ok=True)
+        (self.agent / "eval" / "policies" / "missing-toolchain.md").write_text("policy text\n", encoding="utf-8")
+        (self.agent / "eval" / "acceptance.md").write_text(acceptance_block(POLICY_CASE), encoding="utf-8")
+        with_policy = self.render(name="with-policy.yaml")["bundle_digest"]
+        self.assertNotEqual(with_policy, baseline)
+        (self.agent / "eval" / "policies" / "missing-toolchain.md").write_text("different text\n", encoding="utf-8")
+        self.assertNotEqual(self.render(name="changed-policy.yaml")["bundle_digest"], with_policy)
+
+    def test_the_missing_toolchain_policy_requires_the_exact_bound_limits(self):
+        for limits in ({"provider_requests": 10, "tool_calls": 5}, {"provider_requests": 9, "tool_calls": 4}, {}):
+            with self.subTest(limits=limits):
+                case = dict(POLICY_CASE, limits=limits) if limits else {
+                    k: v for k, v in POLICY_CASE.items() if k != "limits"}
+                (self.agent / "eval" / "acceptance.md").write_text(acceptance_block(case), encoding="utf-8")
+                with self.assertRaises(agentctl.BundleError):
+                    agentctl.parse_acceptance_cases((self.agent / "eval" / "acceptance.md").read_text())
+
+    def test_central_acceptance_is_not_yet_wired_to_the_policy(self):
+        # Requirement F: adding a missing-toolchain-v2 case to the real acceptance.md would move
+        # the affected environment's bundle digest, which this change deliberately avoids.
+        content = (REAL_AGENT / "eval" / "acceptance.md").read_bytes()
+        self.assertNotIn(b"missing-toolchain-v2", content)
+        self.assertEqual(agentctl.sha256_hex(content),
+                         "182a27d4a9fa255a1134b37565d24ec31eb5ad56235adabaf429bcb24dbaca3a")
+
 
 class RenderCliTestCase(unittest.TestCase):
     def test_cli_prints_the_three_digest_fields(self):
@@ -142,8 +185,11 @@ class CommittedBundleTestCase(unittest.TestCase):
     def test_committed_production_bundle_is_a_fresh_render(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "bundle.yaml"
-            agentctl.render_agent(REAL_AGENT, "production", output)
+            result = agentctl.render_agent(REAL_AGENT, "production", output)
             self.assertEqual(output.read_bytes(), (REAL_AGENT / "bundle.yaml").read_bytes())
+            # Pins the v1 production digest: adding the missing-toolchain policy file must never
+            # move this digest while no acceptance case declares that policy.
+            self.assertEqual(result["bundle_digest"], PRODUCTION_BUNDLE_DIGEST)
 
 
 if __name__ == "__main__":

@@ -14,8 +14,12 @@ A candidate change may be promoted to `production` only when:
   lower-risk classification that reduces the requirement to one
   approval, because the prompt is itself part of the agent's authority
   surface;
-- where the evaluation campaign reserves a human-verdict field, a human
-  reviewer has read the receipt and recorded that verdict.
+- for a case bound to a mechanically-scored acceptance policy (for
+  example `missing-toolchain-v2`), every one of that policy's
+  assertions must independently show `pass` with complete evidence --
+  there is no operator verdict to fall back on. A receipt imported from
+  before this repository had its own evaluation tooling keeps whatever
+  review context was recorded for it at the time.
 
 ## Rollback criteria
 
