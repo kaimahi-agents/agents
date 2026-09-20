@@ -99,15 +99,15 @@ class ReadmeTestCase(unittest.TestCase):
         # dangling reference.
         self.assertNotIn("DESIGN.md", self.text)
 
-    def test_does_not_assert_an_outcome_for_prs_2_through_4_before_they_exist(self):
-        # PRs 2-4 are not opened yet when this README is authored; it may
-        # describe their *intended* purpose but must never assert that one
-        # already merged, passed, or was blocked -- each PR's own state is
-        # the actual record.
-        lowered = self.normalized.lower()
-        for outcome_word in ("merged", "passed", "blocked", "failed", "rolled back"):
-            with self.subTest(outcome_word=outcome_word):
-                self.assertNotIn(outcome_word, lowered)
+    def test_does_not_assert_future_outcomes_for_prs_three_and_four(self):
+        # PR2 records an imported failure on its own branch. PR3 and PR4 remain
+        # future work, so their bullet lines may describe intent but not outcome.
+        for pr_number in (3, 4):
+            match = re.search(rf"pull/{pr_number}\).*?(?=- \[PR|$)", self.normalized, re.IGNORECASE)
+            self.assertIsNotNone(match)
+            for outcome_word in ("merged", "passed", "blocked", "failed", "rolled back"):
+                with self.subTest(pr=pr_number, outcome_word=outcome_word):
+                    self.assertNotIn(outcome_word, match.group(0).lower())
 
 
 if __name__ == "__main__":

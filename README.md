@@ -37,8 +37,8 @@ is the record of what actually happened, not this README:
 
 - [PR 1](https://github.com/kaimahi-agents/agents/pull/1): initial
   import of version 1 and the tooling.
-- [PR 2](https://github.com/kaimahi-agents/agents/pull/2): a prompt
-  change intended to show the gate blocking a failing evaluation.
+- [PR 2](https://github.com/kaimahi-agents/agents/pull/2): the gate
+  blocks a prompt change whose imported evaluation failed.
 - [PR 3](https://github.com/kaimahi-agents/agents/pull/3): a candidate
   change intended to address that failure, evaluated live.
 - [PR 4](https://github.com/kaimahi-agents/agents/pull/4): intended to

@@ -2,7 +2,7 @@
   "apiVersion": "core.orka.ai/v1alpha1",
   "kind": "RepositoryMonitor",
   "metadata": {
-    "name": "lint-fresh-v1"
+    "name": "lint-fresh-v2"
   },
   "spec": {
     "provider": "github",
@@ -20,8 +20,8 @@
       }
     },
     "agents": {
-      "reviewer": {"name": "dependabot-repair-v1"},
-      "repairer": {"name": "dependabot-repair-v1"}
+      "reviewer": {"name": "dependabot-repair-v2"},
+      "repairer": {"name": "dependabot-repair-v2"}
     },
     "readCredentialRef": {"name": "source-read"},
     "publicationReadCredentialRef": {"name": "publication-read"},
