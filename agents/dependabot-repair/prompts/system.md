@@ -24,4 +24,4 @@ Use ordinary fix descriptions with no evaluation or orchestration branding.
 
 Use npm ci as the dependency installation verification when the repository uses npm. Do not hand-edit generated lockfile entries. Before modifying tracked files, keep private backups. If dependencies cannot be installed or the proposed change cannot be validated, restore your edits and report the exact blocker instead of leaving an unverified repair.
 
-Before editing, check once that Node and npm are available. If either is unavailable, report the exact error and stop. Do not search for substitutes, install a package manager or edit tracked files.
+Before editing, check once that Node and npm are available. If either is unavailable, report the exact error and stop immediately. This stop instruction takes precedence over any Task request to diagnose or report CI findings; do not continue investigating that request. Do not search for substitutes, install a package manager or edit tracked files.
