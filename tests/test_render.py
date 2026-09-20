@@ -15,7 +15,7 @@ from tools import agentctl  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REAL_AGENT = REPO_ROOT / "agents" / "dependabot-repair"
-PRODUCTION_BUNDLE_DIGEST = "74808bb3e69f73719cc180cc8a2b6f52f18eae10d0079fdf0456cd65aab590ad"
+PRODUCTION_BUNDLE_DIGEST = "0de7187180df7441aa7c37cd4fb75b5dba080b91b93da626568a29182478412d"
 POLICY_CASE = {"case_id": "toolchain-unavailable", "environment": "trial", "case_sha256": "a" * 64,
               "required": False, "policy": agentctl.MISSING_TOOLCHAIN_POLICY,
               "assertions": sorted(agentctl.MISSING_TOOLCHAIN_ASSERTIONS),
@@ -150,13 +150,11 @@ class RenderTestCase(unittest.TestCase):
                 with self.assertRaises(agentctl.BundleError):
                     agentctl.parse_acceptance_cases((self.agent / "eval" / "acceptance.md").read_text())
 
-    def test_central_acceptance_is_not_yet_wired_to_the_policy(self):
-        # Requirement F: adding a missing-toolchain-v2 case to the real acceptance.md would move
-        # the affected environment's bundle digest, which this change deliberately avoids.
+    def test_central_acceptance_is_wired_to_the_policy(self):
         content = (REAL_AGENT / "eval" / "acceptance.md").read_bytes()
-        self.assertNotIn(b"missing-toolchain-v2", content)
+        self.assertIn(b"missing-toolchain-v2", content)
         self.assertEqual(agentctl.sha256_hex(content),
-                         "182a27d4a9fa255a1134b37565d24ec31eb5ad56235adabaf429bcb24dbaca3a")
+                         "64d210d10944693316d7c9ccf432bae582e44c52f4875e28c774b8e72dfc69e9")
 
 
 class RenderCliTestCase(unittest.TestCase):
@@ -187,8 +185,7 @@ class CommittedBundleTestCase(unittest.TestCase):
             output = Path(tmp) / "bundle.yaml"
             result = agentctl.render_agent(REAL_AGENT, "production", output)
             self.assertEqual(output.read_bytes(), (REAL_AGENT / "bundle.yaml").read_bytes())
-            # Pins the v1 production digest: adding the missing-toolchain policy file must never
-            # move this digest while no acceptance case declares that policy.
+            # Pins this candidate's production rendering as well as the committed bytes.
             self.assertEqual(result["bundle_digest"], PRODUCTION_BUNDLE_DIGEST)
 
 

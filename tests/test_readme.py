@@ -104,6 +104,9 @@ class ReadmeTestCase(unittest.TestCase):
         # dangling reference.
         self.assertNotIn("DESIGN.md", self.text)
 
+    def test_pr_three_records_the_fresh_passing_evaluation(self):
+        self.assertIn("passed in one fresh run under provable rules", self.normalized)
+
     def test_pr_four_is_described_as_the_acceptance_rule_change(self):
         for term in ("mechanically provable", "missing-toolchain", "acceptance rules"):
             with self.subTest(term=term):
