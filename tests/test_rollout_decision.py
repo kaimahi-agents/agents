@@ -30,6 +30,13 @@ class RolloutDecisionTestCase(unittest.TestCase):
     def test_a_code_owner_review_is_required(self):
         self.assertIn("at least one of them from a code owner", self.normalized)
 
+    def test_mechanically_scored_policy_receipts_require_every_assertion_not_a_human_verdict(self):
+        self.assertNotIn("human-verdict", self.normalized)
+        self.assertIn("mechanically-scored acceptance policy", self.normalized)
+        self.assertIn("missing-toolchain-v2", self.normalized)
+        self.assertIn("there is no operator verdict to fall back on", self.normalized)
+        self.assertIn("review context was recorded for it at the time", self.normalized)
+
     def test_secret_scanning_is_described_as_operator_discipline_plus_the_gate(self):
         # The local pre-push run is not automatically enforced; only the gate run is.
         self.assertIn("before pushing", self.normalized)
