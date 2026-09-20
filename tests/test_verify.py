@@ -330,14 +330,13 @@ class VerifyCliTestCase(unittest.TestCase):
             code = agentctl.main_verify(list(argv))
         return code, out.getvalue(), err.getvalue()
 
-    def test_cli_reports_the_current_campaign_result_in_each_environment(self):
-        for environment in ("trial", "production"):
+    def test_trial_is_blocked_and_production_still_verifies(self):
+        for environment, expected_code in (("trial", 1), ("production", 0)):
             with self.subTest(environment=environment):
-                expected_errors = agentctl.verify_agent(REAL_AGENT, environment)
                 code, out, err = self.run_cli(str(REAL_AGENT), environment)
-                self.assertEqual(code, 1 if expected_errors else 0)
-                self.assertEqual(bool(err), bool(expected_errors))
-                self.assertEqual("verify: ok" in out, not expected_errors)
+                self.assertEqual(code, expected_code)
+                self.assertEqual(bool(err), expected_code == 1)
+                self.assertEqual("verify: ok" in out, expected_code == 0)
 
     def test_failure_prints_a_plain_diagnostic_and_never_a_traceback(self):
         with tempfile.TemporaryDirectory() as tmp:
