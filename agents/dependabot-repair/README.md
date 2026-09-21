@@ -1,45 +1,46 @@
 # dependabot-repair
 
-Repairs a failing CI check on an existing Dependabot pull request by
-regenerating the lockfile for the intended dependency upgrade, without
-expanding scope, touching credentials, or publishing directly.
+## What it does
 
-## Version 1 (imported)
+This agent repairs CI on an existing Dependabot PR. It regenerates the
+lockfile for the requested upgrade and leaves the patch for a trusted
+publisher.
 
-Version 1 is imported production evidence from a real, authorized run
-dated 2026-09-17, labelled `source: imported` throughout its receipts.
-It repaired [Azure/k8s-lint#239](https://github.com/Azure/k8s-lint/pull/239)
-and [Azure/k8s-lint#240](https://github.com/Azure/k8s-lint/pull/240),
-both delivering a verified-exact patch with automerge left off.
+It fixed [Azure/k8s-lint #239](https://github.com/Azure/k8s-lint/pull/239) and
+[#240](https://github.com/Azure/k8s-lint/pull/240) on 2026-09-17. Those receipts
+are imported production evidence.
 
-- Model: `claude-haiku-4.5`, capped at 60 requests per run.
-- Runtime: `claude` under contract `orka.harness.v2`.
-- Tools: Read, Write, Edit, Bash, Glob, Grep.
-- Monitor intake is suspended (manual only); automerge is off.
-- The runtime image is recorded only as a digest, in
-  `dependencies.lock.yaml`.
+- Model: `claude-haiku-4.5`
+- Request cap: 60
+- Tools: Read, Write, Edit, Bash, Glob, Grep
+- Runtime contract: `orka.harness.v2`
+- Intake: manual
+- Automerge: off
 
-## Trial promotion and rollback
+`dependencies.lock.yaml` records the runtime image by digest.
 
-A safe-stop candidate passed its live case with 4 provider requests and was
-deployed to `trial`. The exact revert restored this version's prompt, model,
-60-request cap, and tool allow-list; memory and proposal inventories remained
-empty. The runtime selector returned from the candidate's stock npm-less image
-to this version's package-manager image, so it was restored rather than
-unchanged across the two deploy receipts. The rollback receipt also states that
-Agent identity is not restored, in-flight work would remain on its starting
-version, and no external system was involved.
+## What we tested
 
-## Structure
+A safe-stop change passed with 4 provider requests. We deployed it to `trial`,
+then reverted it. The deploy and rollback receipts both passed.
 
-- `resources/` — the Agent and RepositoryMonitor definitions.
-- `prompts/system.md` — the exact system prompt. It can be published
-  because the agent runs only on an explicit command, holds no
-  credentials, and never publishes directly.
-- `eval/` — acceptance rules plus imported and future receipts.
-- `environments/` — the `trial` and `production` overlays.
-- `memory/baseline-manifest.yaml` — the agent's empty memory baseline.
-- `decisions/rollout.md` — what is required before promoting a change.
+The rollback restored the prompt and Agent settings. Memory and proposal
+counts stayed at zero. It also restored the package-manager runtime image.
+Agent identity can change during a rollback. Work already running stays on the
+version it started with.
 
-Render and verify with `tools/render` and `tools/verify`; see the
-top-level README for how a change flows through review.
+## Files
+
+- `resources/`: Agent and monitor definitions
+- `prompts/system.md`: the published system prompt
+- `eval/`: cases, rules, and test receipts
+- `environments/`: trial and production overlays
+- `memory/baseline-manifest.yaml`: the empty memory baseline
+- `decisions/rollout.md`: promotion and rollback rules
+
+## Try it
+
+```sh
+tools/render agents/dependabot-repair trial --output /tmp/dependabot-repair.json
+tools/verify agents/dependabot-repair trial
+```
