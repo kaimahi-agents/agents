@@ -185,7 +185,13 @@ def render_agent(agent_dir: Path, environment: str, output: Path) -> dict[str, s
         except UnicodeDecodeError as exc:
             raise BundleError(f"prompts/system.md is not valid UTF-8: {exc}") from exc
     else:
-        prompt_text = ((agents[0].get("spec") or {}).get("systemPrompt") or {}).get("inline")
+        spec = agents[0].get("spec")
+        if not isinstance(spec, dict):
+            raise BundleError("Agent spec must be an object when prompts/system.md is absent")
+        system_prompt = spec.get("systemPrompt")
+        if not isinstance(system_prompt, dict):
+            raise BundleError("Agent spec.systemPrompt must be an object when prompts/system.md is absent")
+        prompt_text = system_prompt.get("inline")
         if not isinstance(prompt_text, str) or not prompt_text:
             raise BundleError("Agent must use a non-empty inline prompt when prompts/system.md is absent")
     items = [_transform(resource, environment, overlay) for resource in resources]

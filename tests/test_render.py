@@ -109,6 +109,20 @@ class RenderTestCase(unittest.TestCase):
                 with self.assertRaises(agentctl.BundleError):
                     agentctl.render_agent(native, "trial", self.root / "never.yaml")
 
+    def test_native_prompt_container_shapes_raise_bundle_errors(self):
+        for field, value in (("spec", "not-an-object"), ("systemPrompt", "not-an-object")):
+            with self.subTest(field=field):
+                native = write_native_agent(self.root / f"native-{field}")
+                agent_path = native / "resources" / "agent.yaml"
+                agent = json.loads(agent_path.read_text(encoding="utf-8"))
+                if field == "spec":
+                    agent["spec"] = value
+                else:
+                    agent["spec"]["systemPrompt"] = value
+                write_json(agent_path, agent)
+                with self.assertRaises(agentctl.BundleError):
+                    agentctl.render_agent(native, "trial", self.root / "never.yaml")
+
     def test_digest_is_stable_across_renders(self):
         self.assertEqual(self.render()["bundle_digest"], self.render(name="again.yaml")["bundle_digest"])
 
