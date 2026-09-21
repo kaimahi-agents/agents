@@ -30,6 +30,7 @@ the Agent runs only from an explicit Task.
 tools/render agents/dependabot-repair trial --output /tmp/dependabot-repair.json
 tools/verify agents/dependabot-repair trial
 kubectl --context "$CONTEXT" --kubeconfig "$KUBECONFIG" apply -f /tmp/dependabot-repair.json
+kubectl --context "$CONTEXT" --kubeconfig "$KUBECONFIG" create -f "$TASK_MANIFEST"
 ```
 
 ## What the tests check

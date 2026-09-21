@@ -26,10 +26,18 @@ a deploy receipt.
 
 Rollback is `git revert`. Reverting restores the earlier behavior inputs, so the
 digest returns to its earlier value. Its test receipts already exist and the
-gate needs no retest. Deploy the reverted bundle, then run:
+gate needs no retest. Deploy the reverted bundle, then run the readback verifier. Use
+`tools/rollback-verify --help` to inspect the interface.
 
 ```sh
-tools/rollback-verify --help
+tools/rollback-verify \
+  --context "$CONTEXT" --kubeconfig "$KUBECONFIG" \
+  --namespace "$NAMESPACE" --date "$DATE" \
+  --evidence-root "$EVIDENCE_ROOT" --agent-dir "agents/$AGENT" \
+  --environment trial --runtime-configmap-name "$RUNTIME_CONFIGMAP" \
+  --runtime-configmap-key "$RUNTIME_CONFIGMAP_KEY" \
+  --runtime-namespace "$RUNTIME_NAMESPACE" --api-base-url "$ORKA_API" \
+  --api-token-file "$API_TOKEN_FILE"
 ```
 
 Rollback does not undo work already published outside the cluster. It does not

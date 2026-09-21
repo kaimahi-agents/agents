@@ -8,15 +8,15 @@ Agents that run on Orka, and the tests that gate changes to them.
 
 ## Run one
 
-Render the bundle, check its receipts, and apply it to an Orka namespace.
+Render the bundle, install it, and submit an explicit Task for that Agent.
 
 ```sh
 tools/render agents/dependabot-repair trial --output /tmp/dependabot-repair.json
-tools/verify agents/dependabot-repair trial
 kubectl --context "$CONTEXT" --kubeconfig "$KUBECONFIG" apply -f /tmp/dependabot-repair.json
+kubectl --context "$CONTEXT" --kubeconfig "$KUBECONFIG" create -f "$TASK_MANIFEST"
 ```
 
-The agent README lists its runtime needs and what starts it.
+The agent README lists its runtime and Task requirements.
 
 ## Change one
 
@@ -26,9 +26,9 @@ explains the loop and what a red gate means.
 
 ## Versions and rollback
 
-A version is a digest of the prompt, Orka resources, dependency lock, and
-acceptance rules. Test receipts are tied to that digest. CI checks them offline
-and never talks to a cluster.
+A version is a digest of the prompt, Orka resources, dependency lock,
+acceptance rules, memory baseline, and environment overlay. Test receipts are
+tied to that digest. CI checks them offline and never talks to a cluster.
 
 Deploy applies the rendered bundle and records what the cluster reads back.
 Rollback uses `git revert`, so the earlier digest and its receipts return. Then
