@@ -20,9 +20,18 @@ The agent README lists its runtime and Task requirements.
 
 ## Change one
 
-Edit one agent directory. Render it and run its required cases, then commit the
-new receipt with the change. [The full guide](docs/changing-an-agent.md)
-explains the loop and what a red gate means.
+Set `AGENT` to the directory name, then render and check the change.
+
+```sh
+tools/render "agents/$AGENT" trial --output "/tmp/$AGENT.json"
+tools/verify "agents/$AGENT" trial
+```
+
+If behavior changed, run the tests listed in that agent's README. They write a
+small JSON receipt under `eval/receipts/<version-digest>/`. Commit that receipt
+with the edit. The gate turns red when the receipt is missing, belongs to a
+different version, or records a failed test. [The full guide explains the
+loop](docs/changing-an-agent.md).
 
 ## Versions and rollback
 
