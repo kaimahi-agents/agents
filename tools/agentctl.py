@@ -393,6 +393,26 @@ def _verify_policy_receipt(case: dict, receipt: dict) -> list[str]:
     if not is_valid_tool_calls(receipt.get("tool_calls")):
         errors.append("receipt is missing valid tool_calls info required by its policy")
     return errors
+def _verify_lifecycle_receipts(agent_dir: Path) -> list[str]:
+    """Validate every committed deploy/rollback summary without echoing author-supplied paths."""
+    root, errors = agent_dir / "lifecycle" / "receipts", []
+    for index, path in enumerate(sorted(root.rglob("*.json")) if root.is_dir() else []):
+        try:
+            receipt = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            errors.append(f"lifecycle receipt #{index} is not readable, valid JSON")
+            continue
+        kind = path.stem
+        if kind not in _LIFECYCLE:
+            errors.append(f"lifecycle receipt #{index} has an unsupported kind")
+            continue
+        current = validate_lifecycle_receipt(receipt, kind)
+        current += find_prohibited_in_document(receipt, "lifecycle receipt")
+        if not _is_hex_digest(path.parent.name) or receipt.get("bundle_digest") != path.parent.name:
+            current.append("bundle_digest does not match the receipt directory")
+        errors += [f"lifecycle receipt #{index}: {error}" for error in current]
+    return errors
+
 def verify_agent(agent_dir: Path, environment: str) -> list[str]:
     """Verify one agent directory for one environment, entirely offline. Returns non-sensitive
     diagnostics, never raising for an ordinary policy violation."""
@@ -423,6 +443,7 @@ def verify_agent(agent_dir: Path, environment: str) -> list[str]:
                for label, resource in zip(("agent", "monitor"), resources)
                if not _VERSIONED_NAME_RE.match(str((resource.get("metadata") or {}).get("name", "")))]
     errors += check_monitor_automerge_off(resources[1])
+    errors += _verify_lifecycle_receipts(agent_dir)
     return errors + [error for case in cases if case["required"]  # lock presence is enforced by render_agent
                      for error in _verify_required_case(agent_dir, environment, bundle_digest, case)]
 
@@ -929,7 +950,7 @@ def _add_cluster_arguments(parser) -> None:
 LIFECYCLE_RECEIPT_KEYS = frozenset({"kind", "bundle_digest", "date", "verdict", "assertions", "digests", "counts"})
 ROLLBACK_LIMITATIONS = (
     "Agent UID and generation may be new or advanced; rollback does not restore deployment identity.",
-    "In-flight work would finish on the previous version; no in-flight work was present or restored.",
+    "In-flight work, had there been any, would finish on the previous version; rollback does not move it.",
     "No external system was involved or checked.",
 )
 _LIFECYCLE = {
@@ -971,7 +992,8 @@ def validate_lifecycle_receipt(receipt, kind: str) -> list[str]:
          "counts must map safe-slug names to non-negative integers"),
         (receipt.get("verdict") != "pass" or all_assertions_pass_and_complete(receipt.get("assertions")),
          "overall verdict 'pass' requires every assertion to be verdict 'pass' and complete"),
-        (kind != "rollback" or valid_restored, "rollback restored contract is not the fixed public-safe shape"),
+        (kind != "rollback" or receipt.get("verdict") != "pass" or valid_restored,
+         "rollback restored contract is not the fixed public-safe shape"),
         (kind != "rollback" or receipt.get("limitations") == list(ROLLBACK_LIMITATIONS),
          "rollback limitations are not the fixed public-safe statements")) if not ok]
     _validate_assertions(receipt.get("assertions"), errors, "lifecycle receipt")
@@ -1095,7 +1117,7 @@ def _lifecycle_cli(kind: str, argv) -> int:
                "counts": {name: value for name, value in (("memory-items", memory[1]),
                                                           ("proposal-items", proposal[1])) if value is not None}}
     if kind == "rollback":
-        agent_spec = agent_item.get("spec") or {}
+        agent_spec = (agent_obj.get("spec") or {}) if isinstance(agent_obj, dict) else {}
         runtime = agent_spec.get("runtime") or {}
         receipt |= {"restored": {"model": (agent_spec.get("model") or {}).get("name"),
                                   "request-cap": runtime.get("defaultMaxTurns"),

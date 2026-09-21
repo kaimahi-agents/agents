@@ -2,6 +2,7 @@
 
 This repository is an evaluation of running agents on AKS using our own
 repositories as realistic workloads, not a team's operational process.
+
 ## The one agent with real results
 
 `agents/dependabot-repair` repaired failing CI checks on two existing
@@ -21,8 +22,8 @@ upstream proposal for supported dependency installation is filed as
 Every pull request renders and verifies each changed agent, offline,
 checking that every case its acceptance rules require has a matching,
 passing receipt; the required gate never contacts a cluster. With a
-single maintainer, branch protection requires zero approvals, does not require code-owner
-review, requires `agent-gate`, and applies to administrators. The PR
+single maintainer, branch protection requires zero approvals, does not
+require code-owner review, requires `agent-gate`, and applies to administrators. The PR
 template asks whether a change touches prompt wording only or
 changes authority, runtime, memory, or acceptance rules. `CODEOWNERS`
 still routes every change to the `agent-maintainers` team.
@@ -38,7 +39,7 @@ still routes every change to the `agent-maintainers` team.
 - [PR 3](https://github.com/kaimahi-agents/agents/pull/3) was the second
   attempt, passing the same gate with 4 requests.
 - [PR 7](https://github.com/kaimahi-agents/agents/pull/7) reverted that
-  candidate; its rollback receipt records the deployed readback.
+  candidate. This repository's rollback receipt records the deployed readback.
 
 This does not yet show agents composed together, memory revisioning, or more
 than one evaluation case per change.

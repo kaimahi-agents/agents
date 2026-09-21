@@ -34,7 +34,7 @@
   "kind": "rollback",
   "limitations": [
     "Agent UID and generation may be new or advanced; rollback does not restore deployment identity.",
-    "In-flight work would finish on the previous version; no in-flight work was present or restored.",
+    "In-flight work, had there been any, would finish on the previous version; rollback does not move it.",
     "No external system was involved or checked."
   ],
   "restored": {
