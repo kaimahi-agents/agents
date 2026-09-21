@@ -1,0 +1,12 @@
+{
+  "generator": {
+    "name": "kmx agent create",
+    "orkaSchemaCommit": "b07d42c0b9e52fe511b434827a342b4720f5d422",
+    "orkaSchemaTarget": "v0.1.3"
+  },
+  "provider": {
+    "model": "qwen2.5:3b",
+    "name": "hello",
+    "type": "openai"
+  }
+}

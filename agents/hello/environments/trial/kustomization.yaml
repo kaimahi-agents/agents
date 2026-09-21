@@ -1,0 +1,7 @@
+{
+  "namespace": "orka-system",
+  "commonLabels": {
+    "environment": "trial",
+    "kaimahi.dev/agent": "hello"
+  }
+}

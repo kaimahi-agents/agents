@@ -1,11 +1,10 @@
 name: Agent Gate
 
-# Branch protection on `main` requires two approvals plus code-owner
-# review on every pull request -- stricter than any per-classification
-# review count this workflow could compute itself -- so this workflow
-# performs no review-count logic and calls no GitHub API or token. It
-# only renders and verifies offline, and is a single job named exactly
-# `agent-gate`: the stable required-status-check context.
+# Branch protection on `main` requires this check and applies it to
+# administrators. Reviews are not required while there is one maintainer,
+# so this workflow performs no review-count logic and calls no GitHub API
+# or token. It only renders and verifies offline, and is a single job
+# named exactly `agent-gate`: the stable required-status-check context.
 on:
   pull_request:
     types: [opened, synchronize, reopened, edited]

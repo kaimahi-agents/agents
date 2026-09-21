@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tests.fixtures import acceptance_block, evaluation_receipt, write_agent, write_json  # noqa: E402
+from tests.fixtures import acceptance_block, evaluation_receipt, write_agent, write_json, write_native_agent  # noqa: E402
 from tools import agentctl  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -44,11 +44,21 @@ class VerifyAgentTestCase(unittest.TestCase):
     def test_environment_outside_the_closed_set_is_refused_first(self):
         self.assertEqual(self.verify("../trial"), [agentctl.ENVIRONMENT_CONTRACT_MESSAGE])
 
-    def test_resource_names_must_be_versioned(self):
-        write_agent(self.agent, cases=(required_case(),), agent_name="demo", monitor_name="demo-monitor")
+    def test_native_agent_without_a_monitor_or_prompt_file_verifies(self):
+        native = write_native_agent(self.root / "native")
+        self.assertEqual(agentctl.verify_agent(native, "trial"), [])
+
+    def test_resource_names_must_be_safe_slugs(self):
+        write_agent(self.agent, cases=(required_case(),), agent_name="Not Safe", monitor_name="also_not_safe")
         errors = self.verify()
         self.assertTrue(any("agent resource name" in error for error in errors))
         self.assertTrue(any("monitor resource name" in error for error in errors))
+
+    def test_monitored_agent_resource_names_remain_versioned(self):
+        write_agent(self.agent, cases=(required_case(),), agent_name="demo", monitor_name="demo-monitor")
+        errors = self.verify()
+        self.assertTrue(any("agent resource name" in error and "versioned" in error for error in errors))
+        self.assertTrue(any("monitor resource name" in error and "versioned" in error for error in errors))
 
     def test_monitor_automerge_must_be_explicitly_false(self):
         for spec in ({"automerge": {"enabled": True}}, {"automerge": True}, {"automerge": {}}, {}):
@@ -343,6 +353,14 @@ class VerifyCliTestCase(unittest.TestCase):
                 code, out, _ = self.run_cli(str(REAL_AGENT), environment)
                 self.assertEqual(code, 0)
                 self.assertIn("verify: ok", out)
+
+    def test_agent_without_required_cases_warns_but_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            agent = write_native_agent(Path(tmp) / "native")
+            code, out, err = self.run_cli(str(agent), "trial")
+        self.assertEqual(code, 0)
+        self.assertIn("verify: ok", out)
+        self.assertIn("warning: agent has no required test cases", err)
 
     def test_failure_prints_a_plain_diagnostic_and_never_a_traceback(self):
         with tempfile.TemporaryDirectory() as tmp:

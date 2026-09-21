@@ -1,0 +1,25 @@
+{
+  "case_id": "fixed-greeting",
+  "task": {
+    "apiVersion": "core.orka.ai/v1alpha1",
+    "kind": "Task",
+    "metadata": {
+      "name": "hello-95df834234a2c49b5679a2b00754e0b8",
+      "namespace": "orka-system"
+    },
+    "spec": {
+      "agentRef": {
+        "name": "hello",
+        "namespace": "orka-system"
+      },
+      "prompt": "Reply with exactly: Hello world.",
+      "resources": {},
+      "type": "ai"
+    }
+  },
+  "expected_answer": "Hello world.",
+  "limits": {
+    "provider_requests": 5,
+    "retries": 0
+  }
+}

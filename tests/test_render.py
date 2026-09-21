@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tests.fixtures import PROMPT_TEXT, acceptance_block, write_agent, write_json  # noqa: E402
+from tests.fixtures import PROMPT_TEXT, acceptance_block, write_agent, write_json, write_native_agent  # noqa: E402
 from tools import agentctl  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -31,6 +31,83 @@ class RenderTestCase(unittest.TestCase):
 
     def render(self, environment="trial", name="out.yaml"):
         return agentctl.render_agent(self.agent, environment, self.root / name)
+
+    def test_native_agent_renders_all_resources_and_hashes_its_inline_prompt(self):
+        native = write_native_agent(self.root / "native")
+        result = agentctl.render_agent(native, "trial", self.root / "native.yaml")
+        rendered = json.loads((self.root / "native.yaml").read_text(encoding="utf-8"))
+        self.assertEqual([item["kind"] for item in rendered["items"]], ["Agent", "Provider"])
+        self.assertNotIn("ConfigMap", {item["kind"] for item in rendered["items"]})
+        self.assertEqual(result["prompt_digest"],
+                         agentctl.sha256_hex(b"Reply briefly and in plain text."))
+        self.assertTrue(all(item["metadata"]["namespace"] == "trial-namespace" for item in rendered["items"]))
+
+    def test_native_resource_changes_move_the_digest(self):
+        native = write_native_agent(self.root / "native")
+        baseline = agentctl.render_agent(native, "trial", self.root / "native.yaml")["bundle_digest"]
+        provider = json.loads((native / "resources" / "provider.yaml").read_text(encoding="utf-8"))
+        provider["spec"]["defaultModel"] = "another-model"
+        write_json(native / "resources" / "provider.yaml", provider)
+        self.assertNotEqual(agentctl.render_agent(native, "trial", self.root / "changed.yaml")["bundle_digest"],
+                            baseline)
+
+    def test_adding_a_resource_file_moves_the_digest(self):
+        native = write_native_agent(self.root / "native")
+        baseline = agentctl.render_agent(native, "trial", self.root / "native.yaml")["bundle_digest"]
+        write_json(native / "resources" / "settings.yaml",
+                   {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "hello-settings"}})
+        self.assertNotEqual(agentctl.render_agent(native, "trial", self.root / "added.yaml")["bundle_digest"],
+                            baseline)
+
+    def test_resource_directory_rejects_misplaced_files_and_subdirectories(self):
+        for relative in ("resources/provider.yml", "resources/nested/provider.yaml"):
+            with self.subTest(relative=relative):
+                native = write_native_agent(self.root / relative.replace("/", "-"))
+                path = native / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("not accepted\n", encoding="utf-8")
+                with self.assertRaises(agentctl.BundleError):
+                    agentctl.render_agent(native, "trial", self.root / "never.yaml")
+
+    def test_prompt_directory_rejects_nested_files(self):
+        native = write_native_agent(self.root / "native")
+        nested = native / "prompts" / "nested" / "extra.md"
+        nested.parent.mkdir(parents=True)
+        nested.write_text("not accepted\n", encoding="utf-8")
+        with self.assertRaises(agentctl.BundleError):
+            agentctl.render_agent(native, "trial", self.root / "never.yaml")
+
+    def test_resources_require_at_least_one_yaml_file(self):
+        native = write_native_agent(self.root / "native-empty")
+        for path in (native / "resources").iterdir():
+            path.unlink()
+        with self.assertRaises(agentctl.BundleError):
+            agentctl.render_agent(native, "trial", self.root / "never.yaml")
+
+    def test_resources_require_exactly_one_agent(self):
+        for mode in ("none", "two"):
+            with self.subTest(mode=mode):
+                native = write_native_agent(self.root / f"native-{mode}")
+                (native / "resources" / "agent.yaml").unlink()
+                if mode == "two":
+                    for name in ("one", "two"):
+                        write_json(native / "resources" / f"agent-{name}.yaml",
+                                   {"apiVersion": "core.orka.ai/v1alpha1", "kind": "Agent",
+                                    "metadata": {"name": name},
+                                    "spec": {"systemPrompt": {"inline": "hello"}}})
+                with self.assertRaises(agentctl.BundleError):
+                    agentctl.render_agent(native, "trial", self.root / "never.yaml")
+
+    def test_native_agent_requires_a_non_empty_inline_prompt(self):
+        for inline in (None, ""):
+            with self.subTest(inline=inline):
+                native = write_native_agent(self.root / f"native-{inline!r}")
+                agent_path = native / "resources" / "agent.yaml"
+                agent = json.loads(agent_path.read_text(encoding="utf-8"))
+                agent["spec"]["systemPrompt"] = {} if inline is None else {"inline": inline}
+                write_json(agent_path, agent)
+                with self.assertRaises(agentctl.BundleError):
+                    agentctl.render_agent(native, "trial", self.root / "never.yaml")
 
     def test_digest_is_stable_across_renders(self):
         self.assertEqual(self.render()["bundle_digest"], self.render(name="again.yaml")["bundle_digest"])
