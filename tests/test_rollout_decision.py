@@ -17,25 +17,33 @@ class RolloutDecisionTestCase(unittest.TestCase):
     def setUp(self):
         self.text = ROLLOUT.read_text(encoding="utf-8")
         self.normalized = re.sub(r"\s+", " ", self.text)
+        promotion = self.text.split("## Promotion criteria", 1)[1].split("## ", 1)[0]
+        self.promotion = re.sub(r"\s+", " ", promotion)
 
-    def test_two_approvals_are_required_unconditionally(self):
-        self.assertIn("two distinct, non-author approvals", self.normalized)
-        self.assertIn("without exception", self.normalized)
-
-    def test_no_lower_risk_classification_reduces_the_requirement(self):
-        for phrase in ("one for prompt-only", "prompt-only changes", "for its classification"):
+    def test_the_gate_is_required_but_reviews_are_not_yet_required(self):
+        for phrase in ("required `agent-gate`", "Reviews are not yet required", "single maintainer"):
             with self.subTest(phrase=phrase):
-                self.assertNotIn(phrase, self.normalized)
+                self.assertIn(phrase, self.promotion)
 
-    def test_a_code_owner_review_is_required(self):
-        self.assertIn("at least one of them from a code owner", self.normalized)
+    def test_obsolete_approval_requirements_are_absent(self):
+        for phrase in ("two distinct, non-author approvals", "at least one of them from a code owner"):
+            with self.subTest(phrase=phrase):
+                self.assertNotIn(phrase, self.promotion)
+
+    def test_codeowners_routes_changes_without_being_an_approval_requirement(self):
+        self.assertIn("`CODEOWNERS` still routes changes", self.promotion)
+        self.assertIn("is not an approval requirement", self.promotion)
 
     def test_mechanically_scored_policy_receipts_require_every_assertion_not_a_human_verdict(self):
-        self.assertNotIn("human-verdict", self.normalized)
-        self.assertIn("mechanically-scored acceptance policy", self.normalized)
-        self.assertIn("missing-toolchain-v2", self.normalized)
-        self.assertIn("there is no operator verdict to fall back on", self.normalized)
-        self.assertIn("review context was recorded for it at the time", self.normalized)
+        self.assertNotIn("human-verdict", self.promotion)
+        self.assertIn("mechanically-scored acceptance policy", self.promotion)
+        self.assertIn("missing-toolchain-v2", self.promotion)
+        self.assertIn("there is no operator verdict to fall back on", self.promotion)
+        self.assertIn("review context was recorded for it at the time", self.promotion)
+
+    def test_status_records_the_trial_promotion_and_rollback(self):
+        self.assertIn("promoted to trial", self.normalized)
+        self.assertIn("rolled back", self.normalized)
 
     def test_secret_scanning_is_described_as_operator_discipline_plus_the_gate(self):
         # The local pre-push run is not automatically enforced; only the gate run is.

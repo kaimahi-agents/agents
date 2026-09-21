@@ -19,6 +19,17 @@ both delivering a verified-exact patch with automerge left off.
 - The runtime image is recorded only as a digest, in
   `dependencies.lock.yaml`.
 
+## Trial promotion and rollback
+
+A safe-stop candidate passed its live case with 4 provider requests and was
+deployed to `trial`. The exact revert restored this version's prompt, model,
+60-request cap, and tool allow-list; memory and proposal inventories remained
+empty. The runtime selector returned from the candidate's stock npm-less image
+to this version's package-manager image, so it was restored rather than
+unchanged across the two deploy receipts. The rollback receipt also states that
+Agent identity is not restored, in-flight work would remain on its starting
+version, and no external system was involved.
+
 ## Structure
 
 - `resources/` — the Agent and RepositoryMonitor definitions.

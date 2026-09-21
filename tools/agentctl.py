@@ -927,6 +927,11 @@ def _add_cluster_arguments(parser) -> None:
 # Fixed, public-safe lifecycle receipt shape. Assertion IDs, the primary evidence filename and the
 # wording distinguishing "as deployed" from "as restored" are the only per-kind differences.
 LIFECYCLE_RECEIPT_KEYS = frozenset({"kind", "bundle_digest", "date", "verdict", "assertions", "digests", "counts"})
+ROLLBACK_LIMITATIONS = (
+    "Agent UID and generation may be new or advanced; rollback does not restore deployment identity.",
+    "In-flight work would finish on the previous version; no in-flight work was present or restored.",
+    "No external system was involved or checked.",
+)
 _LIFECYCLE = {
     "deploy": ("tools/deploy", "Apply one environment overlay and write a public-safe deploy receipt.",
                ("agent-identity-readback", "runtime-image-matches-lock", "memory-inventory-matches-baseline",
@@ -948,8 +953,14 @@ _INCOMPLETE_NOTES = ("Agent, Monitor, or prompt ConfigMap readback could not be 
 def validate_lifecycle_receipt(receipt, kind: str) -> list[str]:
     """Self-check before writing: exactly the fixed public-safe fields and assertion IDs, safe
     digests and counts, and an overall `pass` only when every assertion passed completely."""
+    expected_keys = LIFECYCLE_RECEIPT_KEYS | ({"restored", "limitations"} if kind == "rollback" else set())
+    restored = receipt.get("restored")
+    valid_restored = (isinstance(restored, dict) and set(restored) == {"model", "request-cap", "tools"}
+                      and isinstance(restored["model"], str) and bool(restored["model"])
+                      and _is_count(restored["request-cap"]) and isinstance(restored["tools"], list)
+                      and bool(restored["tools"]) and all(isinstance(tool, str) and tool for tool in restored["tools"]))
     errors = [message for ok, message in (
-        (set(receipt) == LIFECYCLE_RECEIPT_KEYS, "lifecycle receipt fields are not the fixed public-safe set"),
+        (set(receipt) == expected_keys, "lifecycle receipt fields are not the fixed public-safe set"),
         (set(receipt.get("assertions", {})) == set(_LIFECYCLE[kind][2]),
          "lifecycle receipt assertions are not the fixed public-safe set"),
         (_is_hex_digest(receipt.get("bundle_digest")), "bundle_digest must be a 64-character lowercase hex string"),
@@ -959,9 +970,37 @@ def validate_lifecycle_receipt(receipt, kind: str) -> list[str]:
         (all(is_safe_slug(name) and _is_count(value) for name, value in receipt.get("counts", {}).items()),
          "counts must map safe-slug names to non-negative integers"),
         (receipt.get("verdict") != "pass" or all_assertions_pass_and_complete(receipt.get("assertions")),
-         "overall verdict 'pass' requires every assertion to be verdict 'pass' and complete")) if not ok]
+         "overall verdict 'pass' requires every assertion to be verdict 'pass' and complete"),
+        (kind != "rollback" or valid_restored, "rollback restored contract is not the fixed public-safe shape"),
+        (kind != "rollback" or receipt.get("limitations") == list(ROLLBACK_LIMITATIONS),
+         "rollback limitations are not the fixed public-safe statements")) if not ok]
     _validate_assertions(receipt.get("assertions"), errors, "lifecycle receipt")
     return errors
+_MONITOR_SERVER_DEFAULTS = (
+    (("automerge", "requireGlobalMergeGate"), True), (("review", "event"), "COMMENT"),
+    (("review", "publish", "event"), "COMMENT"), (("review", "publish", "mode"), "summary_only"),
+    (("review", "publish", "sameHeadPolicy"), "skip"),
+    (("triggers", "github", "labels", "requireActorPermission"), "write"),
+)
+_MISSING = object()
+def _path_value(document, path):
+    value = document
+    for key in path:
+        if not isinstance(value, dict) or key not in value:
+            return _MISSING
+        value = value[key]
+    return value
+def _monitor_spec_matches(authored, live) -> bool:
+    """Accept only the API's fixed defaults when the authored monitor omits those fields."""
+    normalized = copy.deepcopy(live)
+    for path, default in _MONITOR_SERVER_DEFAULTS:
+        if _path_value(authored, path) is _MISSING and _path_value(normalized, path) == default:
+            holder = normalized
+            for key in path[:-1]:
+                holder = holder[key]
+            holder.pop(path[-1])
+    return normalized == authored
+
 def _inventory_readback(api_base_url, path, token, expected_count):
     """Compare one inventory endpoint's item *count*; the receipt records only the count, while the
     full response goes to the evidence root."""
@@ -1035,7 +1074,7 @@ def _lifecycle_cli(kind: str, argv) -> int:
             live_prompt is not None and sha256_hex(live_prompt.encode("utf-8")) == prompt_digest
             and (metadata.get("uid") and metadata.get("generation") is not None if kind == "deploy"
                  else agent_obj.get("spec") == agent_item.get("spec")
-                 and monitor_obj.get("spec") == monitor_item.get("spec")))
+                 and _monitor_spec_matches(monitor_item.get("spec"), monitor_obj.get("spec"))))
         primary_evidence = {"agent": agent_obj, "configmap": configmap, "monitor": monitor_obj}
     found = (None if runtime_configmap is None else
              _DIGEST_SUFFIX_RE.search((runtime_configmap.get("data") or {}).get(args.runtime_configmap_key) or ""))
@@ -1055,6 +1094,13 @@ def _lifecycle_cli(kind: str, argv) -> int:
                "digests": {"prompt": prompt_digest} | ({"runtime-image": observed} if observed else {}),
                "counts": {name: value for name, value in (("memory-items", memory[1]),
                                                           ("proposal-items", proposal[1])) if value is not None}}
+    if kind == "rollback":
+        agent_spec = agent_item.get("spec") or {}
+        runtime = agent_spec.get("runtime") or {}
+        receipt |= {"restored": {"model": (agent_spec.get("model") or {}).get("name"),
+                                  "request-cap": runtime.get("defaultMaxTurns"),
+                                  "tools": runtime.get("defaultAllowedTools")},
+                    "limitations": list(ROLLBACK_LIMITATIONS)}
     _require(validate_lifecycle_receipt(receipt, kind) + find_prohibited_in_document(receipt, "receipt"))
     for name, data in ((primary_file, primary_evidence), ("runtime-readback.json", {"configmap": runtime_configmap}),
                        ("memory-readback.json", memory[2]), ("proposal-readback.json", proposal[2])):

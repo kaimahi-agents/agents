@@ -43,10 +43,15 @@ def write_agent(agent_dir, *, namespace="trial-namespace", cases=(), agent_name=
     agent_dir = Path(agent_dir)
     write_json(agent_dir / "resources" / "agent.yaml",
                {"apiVersion": "core.orka.ai/v1", "kind": "Agent", "metadata": {"name": agent_name},
-                "spec": {"promptConfigMap": "system-prompt"}})
+                "spec": {"promptConfigMap": "system-prompt", "model": {"name": "test-model"},
+                         "runtime": {"defaultMaxTurns": 60,
+                                     "defaultAllowedTools": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]}}})
     write_json(agent_dir / "resources" / "monitor.yaml",
                {"apiVersion": "core.orka.ai/v1", "kind": "RepositoryMonitor",
-                "metadata": {"name": monitor_name}, "spec": {"automerge": {"enabled": automerge}}})
+                "metadata": {"name": monitor_name},
+                "spec": {"automerge": {"enabled": automerge},
+                         "review": {"publish": {"enabled": False}},
+                         "triggers": {"github": {"labels": {"enabled": False}}}}})
     (agent_dir / "prompts").mkdir(parents=True, exist_ok=True)
     (agent_dir / "prompts" / "system.md").write_text(prompt, encoding="utf-8")
     write_json(agent_dir / "dependencies.lock.yaml", {"runtimeImageDigest": RUNTIME_DIGEST})

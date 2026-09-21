@@ -38,10 +38,10 @@ _REQUIRED_LINKS = (
     "https://github.com/Azure/k8s-lint/pull/239",
     "https://github.com/Azure/k8s-lint/pull/240",
     "https://github.com/orka-agents/orka/issues/485",
-    "https://github.com/kaimahi-agents/agents/pull/1",
     "https://github.com/kaimahi-agents/agents/pull/2",
     "https://github.com/kaimahi-agents/agents/pull/3",
     "https://github.com/kaimahi-agents/agents/pull/4",
+    "https://github.com/kaimahi-agents/agents/pull/7",
 )
 
 
@@ -79,8 +79,8 @@ class ReadmeTestCase(unittest.TestCase):
                 self.assertIn(term, self.normalized)
 
     def test_pr_two_is_the_concrete_blocked_change_example(self):
-        self.assertIn("example of a blocked change", self.normalized)
-        self.assertIn("36 requests against the limit of 10", self.normalized)
+        self.assertIn("looked right and was blocked", self.normalized)
+        self.assertIn("36 requests against a limit of 10", self.normalized)
 
     def test_does_not_contain_a_local_or_internal_identifier_shape(self):
         # Any *specific* internal name (a person, a workstream ID, a local host path, an
@@ -104,8 +104,11 @@ class ReadmeTestCase(unittest.TestCase):
         # dangling reference.
         self.assertNotIn("DESIGN.md", self.text)
 
-    def test_pr_four_is_described_as_the_acceptance_rule_change(self):
-        for term in ("mechanically provable", "missing-toolchain", "acceptance rules"):
+    def test_the_four_link_story_and_remaining_gaps_are_plain(self):
+        for term in ("three assertions depended on tool-call content", "the platform redacts",
+                     "limit what an agent can do and measure outcomes", "same gate with 4 requests",
+                     "rollback receipt", "agents composed together", "memory revisioning",
+                     "more than one evaluation case per change"):
             with self.subTest(term=term):
                 self.assertIn(term, self.normalized)
 
