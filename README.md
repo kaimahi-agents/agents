@@ -1,47 +1,53 @@
-# kaimahi-agents/agents
+# agents
 
-## What this is
+Agents that run on Orka, and the tests that gate changes to them.
 
-We're trying out agents on AKS with our own repos as the test bed. This isn't
-how the team handles releases or repairs day to day.
+| Agent | What it does | Runtime | Status |
+|---|---|---|---|
+| [dependabot-repair](agents/dependabot-repair/) | Fixes failing CI on dependency update PRs | claude | tested, ran on real PRs |
 
-The agent here fixed [Azure/k8s-lint #239](https://github.com/Azure/k8s-lint/pull/239)
-and [#240](https://github.com/Azure/k8s-lint/pull/240). It only runs when you
-tell it to. Automerge is off. Its runtime has no credentials. A separate
-trusted component does the pushing. That's why we're fine publishing the
-prompt.
+## Run one
 
-The repair needs a runtime image with a package manager. Related upstream
-design: [orka-agents/orka #485](https://github.com/orka-agents/orka/issues/485),
-for gated tool installation during repository validation.
+Render the bundle, check its receipts, and apply it to an Orka namespace.
 
-## How a change gets in
+```sh
+tools/render agents/dependabot-repair trial --output /tmp/dependabot-repair.json
+tools/verify agents/dependabot-repair trial
+kubectl --context "$CONTEXT" --kubeconfig "$KUBECONFIG" apply -f /tmp/dependabot-repair.json
+```
 
-Change an agent and you need a passing test receipt for that exact version. CI
-checks it offline. CI never touches a cluster.
+The agent README lists its runtime needs and what starts it.
 
-There's one maintainer for now, so reviews aren't required. Admins can't bypass
-the gate.
+## Change one
 
-## What happened so far
+Edit one agent directory. Render it and run its required cases, then commit the
+new receipt with the change. [The full guide](docs/changing-an-agent.md)
+explains the loop and what a red gate means.
 
-- [#2](https://github.com/kaimahi-agents/agents/pull/2): A prompt tweak that
-  looked fine. Blocked at 36 requests against a limit of 10.
-- [#4](https://github.com/kaimahi-agents/agents/pull/4): Changed the pass/fail
-  rules. We were checking details Orka redacts. Now we limit what the agent can
-  do and measure the result.
-- [#3](https://github.com/kaimahi-agents/agents/pull/3): Second try. Passed in
-  4 requests.
-- [#7](https://github.com/kaimahi-agents/agents/pull/7): Rolled it back. No
-  retest needed because that version had already passed.
+## Versions and rollback
 
-Deploy receipts: [#6](https://github.com/kaimahi-agents/agents/pull/6) out and
-[#8](https://github.com/kaimahi-agents/agents/pull/8) back.
+A version is a digest of the prompt, Orka resources, dependency lock, and
+acceptance rules. Test receipts are tied to that digest. CI checks them offline
+and never talks to a cluster.
 
-The surprising part: about 12 seconds of agent time took about 15 minutes of
-setup on the first try.
+Deploy applies the rendered bundle and records what the cluster reads back.
+Rollback uses `git revert`, so the earlier digest and its receipts return. Then
+we deploy that bundle and run `tools/rollback-verify`. [Read the full
+mechanism](docs/versioning-and-rollback.md).
 
-## What's missing
+## Layout
 
-Agents don't call other agents yet. Memory isn't versioned. Each change still
-uses one test case.
+```text
+agents/
+  dependabot-repair/
+docs/
+tools/
+tests/
+```
+
+## About
+
+These agents run on our own repositories so we can try running agents on AKS;
+they are not the team's operating process. Each agent runs only when asked,
+holds no credentials in its runtime, and publishes through a separate trusted
+component, so the prompts are public.

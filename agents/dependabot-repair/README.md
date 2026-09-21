@@ -1,46 +1,46 @@
 # dependabot-repair
 
-## What it does
-
-This agent repairs CI on an existing Dependabot PR. It regenerates the
-lockfile for the requested upgrade and leaves the patch for a trusted
+Fixes failing CI on an existing dependency-update pull request. It regenerates
+the lockfile for the requested upgrade and leaves the patch for a trusted
 publisher.
 
-It fixed [Azure/k8s-lint #239](https://github.com/Azure/k8s-lint/pull/239) and
-[#240](https://github.com/Azure/k8s-lint/pull/240) on 2026-09-17. Those receipts
-are imported production evidence.
+## What it needs
 
+- Runtime: `claude` with contract `orka.harness.v2`
 - Model: `claude-haiku-4.5`
 - Request cap: 60
 - Tools: Read, Write, Edit, Bash, Glob, Grep
-- Runtime contract: `orka.harness.v2`
-- Intake: manual
-- Automerge: off
+- Runtime image: includes the repository's package manager
+- Monitor: `lint-fresh-v1`, suspended by default
 
-`dependencies.lock.yaml` records the runtime image by digest.
+The Agent runtime holds no credentials. The monitor refers to `source-read`,
+`publication-read`, `publication-write`, and `forge-access` by role name. The
+trusted monitor and publisher use those roles outside the Agent runtime.
 
-## What we tested
+The package-manager image requirement is related to
+[orka-agents/orka #485](https://github.com/orka-agents/orka/issues/485), a
+design for gated tool installation during repository validation.
 
-A safe-stop change passed with 4 provider requests. We deployed it to `trial`,
-then reverted it. The deploy and rollback receipts both passed.
+## Run it
 
-The rollback restored the prompt and Agent settings. Memory and proposal
-counts stayed at zero. It also restored the package-manager runtime image.
-Agent identity can change during a rollback. Work already running stays on the
-version it started with.
-
-## Files
-
-- `resources/`: Agent and monitor definitions
-- `prompts/system.md`: the published system prompt
-- `eval/`: cases, rules, and test receipts
-- `environments/`: trial and production overlays
-- `memory/baseline-manifest.yaml`: the empty memory baseline
-- `decisions/rollout.md`: promotion and rollback rules
-
-## Try it
+Render and check the bundle before applying it. The monitor stays suspended, so
+the Agent runs only from an explicit Task.
 
 ```sh
 tools/render agents/dependabot-repair trial --output /tmp/dependabot-repair.json
 tools/verify agents/dependabot-repair trial
+kubectl --context "$CONTEXT" --kubeconfig "$KUBECONFIG" apply -f /tmp/dependabot-repair.json
 ```
+
+## What the tests check
+
+The two required production cases cover lockfile repairs for
+[Azure/k8s-lint #239](https://github.com/Azure/k8s-lint/pull/239) and
+[#240](https://github.com/Azure/k8s-lint/pull/240). Both require a
+verified-exact patch with automerge off. Their imported receipts are tied to
+the current production digest.
+
+## Where it has run
+
+The Agent repaired both pull requests above on 2026-09-17. A later trial deploy
+and rollback also have passing readback receipts in `lifecycle/receipts/`.
