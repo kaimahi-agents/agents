@@ -8,9 +8,12 @@ A candidate change may be promoted to `production` only when:
   a required case to, against the candidate's rendered bundle digest;
 - every required case has a matching receipt with verdict `pass` and
   complete evidence for every assertion;
-- the required `agent-gate` check passes. Reviews are not yet required
-  while the repository has a single maintainer; `CODEOWNERS` still
-  routes changes but is not an approval requirement;
+- the pull request carries two distinct, non-author approvals, at
+  least one of them from a code owner. This applies to every candidate
+  change without exception: there is no prompt-only or otherwise
+  lower-risk classification that reduces the requirement to one
+  approval, because the prompt is itself part of the agent's authority
+  surface;
 - for a case bound to a mechanically-scored acceptance policy (for
   example `missing-toolchain-v2`), every one of that policy's
   assertions must independently show `pass` with complete evidence --
