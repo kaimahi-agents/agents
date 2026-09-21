@@ -5,6 +5,7 @@ Agents that run on Orka, and the tests that gate changes to them.
 | Agent | What it does | Runtime | Status |
 |---|---|---|---|
 | [dependabot-repair](agents/dependabot-repair/) | Fixes failing CI on dependency update PRs | claude | tested, ran on real PRs |
+| [hello](agents/hello/) | The smallest possible agent. Start here. | native | ran, no tests yet |
 
 ## Run one
 
@@ -49,6 +50,7 @@ mechanism](docs/versioning-and-rollback.md).
 ```text
 agents/
   dependabot-repair/
+  hello/
 docs/
 tools/
 tests/

@@ -69,6 +69,26 @@ def write_agent(agent_dir, *, namespace="trial-namespace", cases=(), agent_name=
     return agent_dir
 
 
+def write_native_agent(agent_dir, *, namespace="trial-namespace", cases=()) -> Path:
+    """Write an inline-prompt native Agent with no monitor or synthetic prompt ConfigMap."""
+    agent_dir = Path(agent_dir)
+    write_json(agent_dir / "resources" / "provider.yaml",
+               {"apiVersion": "core.orka.ai/v1alpha1", "kind": "Provider", "metadata": {"name": "hello"},
+                "spec": {"type": "openai", "defaultModel": "qwen2.5:3b"}})
+    write_json(agent_dir / "resources" / "agent.yaml",
+               {"apiVersion": "core.orka.ai/v1alpha1", "kind": "Agent", "metadata": {"name": "hello"},
+                "spec": {"providerRef": {"name": "hello"},
+                         "systemPrompt": {"inline": "Reply briefly and in plain text."}}})
+    write_json(agent_dir / "dependencies.lock.yaml", {"providerModel": "qwen2.5:3b"})
+    write_json(agent_dir / "memory" / "baseline-manifest.yaml", {"memoryEntries": [], "proposals": []})
+    (agent_dir / "eval").mkdir(parents=True, exist_ok=True)
+    (agent_dir / "eval" / "acceptance.md").write_text(acceptance_block(*cases), encoding="utf-8")
+    for environment in ("trial", "production"):
+        write_json(agent_dir / "environments" / environment / "kustomization.yaml",
+                   {"namespace": namespace, "commonLabels": {"kaimahi.dev/agent": "hello"}})
+    return agent_dir
+
+
 def evaluation_receipt(case_id: str, bundle_digest: str, **overrides) -> dict:
     receipt = {"case_id": case_id, "bundle_digest": bundle_digest, "date": "2026-09-17", "source": "imported",
                "model": "test-model", "request_count": 1, "verdict": "pass",

@@ -88,8 +88,22 @@ def _read_json(path, label: str):
 # The digest is SHA-256 over a framed byte stream: files sorted by repository-relative POSIX
 # path, each framed as `path SPACE byte-length NEWLINE`, the exact bytes, then a NEWLINE. The
 # generated bundle is an output artifact, never a digest input, so rendering cannot be circular.
-_DIGEST_PATHS = ("resources/agent.yaml", "resources/monitor.yaml", "prompts/system.md",
-                 "dependencies.lock.yaml", "eval/acceptance.md", "memory/baseline-manifest.yaml")
+_DIGEST_PATHS = ("dependencies.lock.yaml", "eval/acceptance.md", "memory/baseline-manifest.yaml")
+def _behavior_input_paths(agent_dir: Path) -> tuple[str, ...]:
+    """All authored resources/prompts plus the required lock, acceptance, and memory baseline."""
+    resource_root = agent_dir / "resources"
+    resource_entries = sorted(resource_root.iterdir()) if resource_root.is_dir() else []
+    if not resource_entries:
+        raise BundleError("resources/ must contain at least one .yaml file")
+    if any(path.is_symlink() or not path.is_file() or path.suffix != ".yaml" for path in resource_entries):
+        raise BundleError("resources/ may contain only top-level .yaml files")
+    resources = [path.relative_to(agent_dir).as_posix() for path in resource_entries]
+    prompt_root = agent_dir / "prompts"
+    prompt_entries = sorted(prompt_root.iterdir()) if prompt_root.is_dir() else []
+    if any(path.is_symlink() or not path.is_file() for path in prompt_entries):
+        raise BundleError("prompts/ may contain only top-level files")
+    prompts = [path.relative_to(agent_dir).as_posix() for path in prompt_entries]
+    return tuple(resources + prompts + list(_DIGEST_PATHS))
 def _read_required(agent_dir: Path, relative_path: str) -> bytes:
     full_path = Path(agent_dir) / relative_path
     if not full_path.is_file():
@@ -142,33 +156,51 @@ def render_agent(agent_dir: Path, environment: str, output: Path) -> dict[str, s
     if not is_allowed_environment(environment):
         raise BundleError(ENVIRONMENT_CONTRACT_MESSAGE)  # checked before any path is built
     overlay_path = f"environments/{environment}/kustomization.yaml"
-    raw = {path: _read_required(agent_dir, path) for path in (*_DIGEST_PATHS, overlay_path)}
+    input_paths = _behavior_input_paths(agent_dir)
+    raw = {path: _read_required(agent_dir, path) for path in (*input_paths, overlay_path)}
     raw.update({path: _read_required(agent_dir, path) for path in _extra_digest_paths(raw["eval/acceptance.md"])})
     hasher = hashlib.sha256()
     for relative_path, data in sorted(raw.items()):
         hasher.update(f"{relative_path} {len(data)}\n".encode("utf-8") + data + b"\n")
     # Every authored .yaml is validated before anything is rendered.
     documents = {path: load_json_object(path, raw[path]) for path in sorted(raw) if path.endswith(".yaml")}
-    resources = [documents[path] for path in ("resources/agent.yaml", "resources/monitor.yaml")]
-    for path, resource in zip(("resources/agent.yaml", "resources/monitor.yaml"), resources):
+    resource_paths = sorted(path for path in raw if path.startswith("resources/") and path.endswith(".yaml"))
+    resources = [documents[path] for path in resource_paths]
+    for path, resource in zip(resource_paths, resources):
         metadata = resource.get("metadata")
         if metadata is not None and not isinstance(metadata, dict):
             raise BundleError(f"{path}: metadata must be an object")
         _check_string_map(path, "metadata.labels", metadata.get("labels") if isinstance(metadata, dict) else None)
+    agents = [resource for resource in resources if resource.get("kind") == "Agent"]
+    if len(agents) != 1:
+        raise BundleError("resources/ must contain exactly one Agent")
     overlay = documents[overlay_path]
     if overlay.get("namespace") is not None and not isinstance(overlay["namespace"], str):
         raise BundleError(f"{overlay_path}: namespace must be a string")
     _check_string_map(overlay_path, "commonLabels", overlay.get("commonLabels"))
-    try:
-        prompt_text = raw["prompts/system.md"].decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise BundleError(f"prompts/system.md is not valid UTF-8: {exc}") from exc
+    prompt_text = None
+    if "prompts/system.md" in raw:
+        try:
+            prompt_text = raw["prompts/system.md"].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise BundleError(f"prompts/system.md is not valid UTF-8: {exc}") from exc
+    else:
+        spec = agents[0].get("spec")
+        if not isinstance(spec, dict):
+            raise BundleError("Agent spec must be an object when prompts/system.md is absent")
+        system_prompt = spec.get("systemPrompt")
+        if not isinstance(system_prompt, dict):
+            raise BundleError("Agent spec.systemPrompt must be an object when prompts/system.md is absent")
+        prompt_text = system_prompt.get("inline")
+        if not isinstance(prompt_text, str) or not prompt_text:
+            raise BundleError("Agent must use a non-empty inline prompt when prompts/system.md is absent")
     items = [_transform(resource, environment, overlay) for resource in resources]
-    items.append({"apiVersion": "v1", "kind": "ConfigMap", "data": {"system.md": prompt_text},
-                  "metadata": {"name": "system-prompt", "labels": {"kaimahi.dev/environment": environment}}})
+    if "prompts/system.md" in raw:
+        items.append({"apiVersion": "v1", "kind": "ConfigMap", "data": {"system.md": prompt_text},
+                      "metadata": {"name": "system-prompt", "labels": {"kaimahi.dev/environment": environment}}})
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(_json_text({"apiVersion": "v1", "kind": "List", "items": items}), encoding="utf-8")
-    return {"bundle_digest": hasher.hexdigest(), "prompt_digest": sha256_hex(raw["prompts/system.md"]),
+    return {"bundle_digest": hasher.hexdigest(), "prompt_digest": sha256_hex(prompt_text.encode("utf-8")),
             "bundle_path": str(output)}
 
 # --- Evaluation-receipt schema --------------------------------------------------------------
@@ -424,25 +456,34 @@ def verify_agent(agent_dir: Path, environment: str) -> list[str]:
             output = Path(tmp_dir) / "bundle.yaml"
             bundle_digest = render_agent(agent_dir, environment, output)["bundle_digest"]
             rendered = json.loads(output.read_text(encoding="utf-8"))
-        prompt_bytes = _read_required(agent_dir, "prompts/system.md")
-        resources = [load_json_object(path, _read_required(agent_dir, path))
-                     for path in ("resources/agent.yaml", "resources/monitor.yaml")]
+        input_paths = _behavior_input_paths(agent_dir)
+        prompt_bytes = (_read_required(agent_dir, "prompts/system.md")
+                        if "prompts/system.md" in input_paths else None)
+        resource_paths = sorted(path for path in input_paths if path.startswith("resources/") and path.endswith(".yaml"))
+        resources = [load_json_object(path, _read_required(agent_dir, path)) for path in resource_paths]
         cases = parse_acceptance_cases(_read_required(agent_dir, "eval/acceptance.md").decode("utf-8"))
     except BundleError as exc:
         return [f"verify failed: {exc}"]
     except UnicodeDecodeError:
         return ["verify failed: eval/acceptance.md is not valid UTF-8"]
-    errors = check_rendered_prompt_equality(rendered, prompt_bytes)
+    errors = check_rendered_prompt_equality(rendered, prompt_bytes) if prompt_bytes is not None else []
     # Real secret material is referenced from outside Git, never inlined; an offender is
     # identified by index, never by its author-supplied name.
     errors += [f"bundle resource[{index}] has prohibited kind 'Secret'"
                for index, item in enumerate(rendered.get("items", []))
                if isinstance(item, dict) and item.get("kind") == "Secret"]
     errors += find_prohibited_in_document(rendered, "rendered bundle")
-    errors += [f"{label} resource name must follow the <slug>-v<int> versioned-name convention"
-               for label, resource in zip(("agent", "monitor"), resources)
-               if not _VERSIONED_NAME_RE.match(str((resource.get("metadata") or {}).get("name", "")))]
-    errors += check_monitor_automerge_off(resources[1])
+    named = [(str(resource.get("kind", "resource")).lower(), resource) for resource in resources
+             if resource.get("kind") in {"Agent", "RepositoryMonitor"}]
+    errors += [f"{label} resource name must be a safe slug ({SAFE_SLUG_CONTRACT})"
+               for label, resource in named
+               if not is_safe_slug(str((resource.get("metadata") or {}).get("name", "")))]
+    monitors = [resource for resource in resources if resource.get("kind") == "RepositoryMonitor"]
+    if monitors:
+        errors += [f"{label} resource name must follow the <slug>-v<int> versioned-name convention"
+                   for label, resource in named
+                   if not _VERSIONED_NAME_RE.match(str((resource.get("metadata") or {}).get("name", "")))]
+    errors += [error for resource in monitors for error in check_monitor_automerge_off(resource)]
     errors += _verify_lifecycle_receipts(agent_dir)
     return errors + [error for case in cases if case["required"]  # lock presence is enforced by render_agent
                      for error in _verify_required_case(agent_dir, environment, bundle_digest, case)]
@@ -914,6 +955,9 @@ def _verify_cli(argv) -> int:
     for error in errors:
         print(error, file=sys.stderr)
     if not errors:
+        cases = parse_acceptance_cases(_read_required(args.agent_dir, "eval/acceptance.md").decode("utf-8"))
+        if not any(case["required"] for case in cases):
+            print("warning: agent has no required test cases", file=sys.stderr)
         print("verify: ok")
     return 1 if errors else 0
 def _secret_scan_cli(argv) -> int:
