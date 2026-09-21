@@ -1,0 +1,7 @@
+{
+  "namespace": "release-notes-trial",
+  "commonLabels": {
+    "environment": "trial",
+    "kaimahi.dev/agent": "release-notes"
+  }
+}
