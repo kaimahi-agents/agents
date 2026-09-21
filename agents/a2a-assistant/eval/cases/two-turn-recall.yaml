@@ -1,0 +1,26 @@
+{
+  "case_id": "two-turn-recall",
+  "protocol": "A2A 1.0 JSON-RPC",
+  "client": "official A2A Go SDK v2.5.0",
+  "turns": [
+    {
+      "prompt": "Remember the phrase cedar comet. Reply with exactly: cedar comet.",
+      "expected": "cedar comet"
+    },
+    {
+      "prompt": "What phrase did I ask you to remember? Reply with only that phrase.",
+      "same_context": true,
+      "expected": "cedar comet"
+    }
+  ],
+  "assertions": {
+    "distinct_native_tasks": 2,
+    "shared_session": true,
+    "task_type": "ai",
+    "task_phase": "Succeeded",
+    "duplicate_admission_creates_new_task": false,
+    "completed_result_survives_adapter_restart": true,
+    "tools_available": false
+  },
+  "provider_request_count": null
+}

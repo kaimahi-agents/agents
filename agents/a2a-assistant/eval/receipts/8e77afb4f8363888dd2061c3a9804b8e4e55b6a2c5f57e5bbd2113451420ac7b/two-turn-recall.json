@@ -1,0 +1,50 @@
+{
+  "case_id": "two-turn-recall",
+  "bundle_digest": "8e77afb4f8363888dd2061c3a9804b8e4e55b6a2c5f57e5bbd2113451420ac7b",
+  "date": "2026-09-17",
+  "source": "imported",
+  "model": "qwen2.5:3b",
+  "request_count": null,
+  "verdict": "pass",
+  "assertions": {
+    "duplicate-idempotency": {
+      "verdict": "pass",
+      "evidence_completeness": true,
+      "note": "Repeated admission retained the first Task identity and created no extra Task."
+    },
+    "first-answer": {
+      "verdict": "pass",
+      "evidence_completeness": true,
+      "note": "The first native AI Task succeeded with the exact answer cedar comet."
+    },
+    "no-tools": {
+      "verdict": "pass",
+      "evidence_completeness": true,
+      "note": "The as-run Agent declared an empty tool list."
+    },
+    "restart-durability": {
+      "verdict": "pass",
+      "evidence_completeness": true,
+      "note": "The completed first result remained readable after the adapter restarted."
+    },
+    "same-session-recall": {
+      "verdict": "pass",
+      "evidence_completeness": true,
+      "note": "A fresh same-context turn used the same Session and recalled cedar comet exactly."
+    },
+    "two-native-tasks": {
+      "verdict": "pass",
+      "evidence_completeness": true,
+      "note": "Two distinct type-ai Tasks reached Succeeded with correlated final deliveries."
+    }
+  },
+  "evidence_sha256": [
+    "2003882554719338a4ae355c0a510818e1a4766b057b9db53575d661d7266e92",
+    "d7da78f6b3c0d581f4059c619bed3886c44b8c30f42f6df637b69478c612c205",
+    "da96021348fb70cb9226d9a440db191808d98e47473df57d72736dcd83094d9a"
+  ],
+  "tool_calls": {
+    "total": 0,
+    "redacted": 0
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "apiVersion": "core.orka.ai/v1alpha1",
+  "kind": "Agent",
+  "metadata": {
+    "name": "a2a-native",
+    "namespace": "orka-system"
+  },
+  "spec": {
+    "providerRef": {
+      "name": "a2a-local-model"
+    },
+    "model": {
+      "name": "qwen2.5:3b",
+      "temperature": 0,
+      "maxTokens": 128
+    },
+    "systemPrompt": {
+      "inline": "Answer the user's question concisely. You have no tools."
+    },
+    "tools": []
+  }
+}
