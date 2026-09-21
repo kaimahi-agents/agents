@@ -2,8 +2,6 @@
 
 This repository is an evaluation of running agents on AKS using our own
 repositories as realistic workloads, not a team's operational process.
-It is intended to show one running agent, a change the merge gate can
-block, an evaluated promotion, and a rollback.
 
 ## The one agent with real results
 
@@ -23,24 +21,25 @@ upstream proposal for supported dependency installation is filed as
 
 Every pull request renders and verifies each changed agent, offline,
 checking that every case its acceptance rules require has a matching,
-passing receipt; the required gate never contacts a cluster. Reviews
-are not yet required because there is a single maintainer; the gate is.
-Branch protection requires zero approvals, does not require code-owner
-review, requires `agent-gate`, and applies to administrators. The PR
+passing receipt; the required gate never contacts a cluster. With a
+single maintainer, branch protection requires zero approvals, does not
+require code-owner review, requires `agent-gate`, and applies to administrators. The PR
 template asks whether a change touches prompt wording only or
 changes authority, runtime, memory, or acceptance rules. `CODEOWNERS`
 still routes every change to the `agent-maintainers` team.
 
 ## Evidence trail
 
-Each pull request's state is the record of what happened:
+- [PR 2](https://github.com/kaimahi-agents/agents/pull/2) looked right
+  and was blocked: 36 requests against a limit of 10.
+- [PR 4](https://github.com/kaimahi-agents/agents/pull/4) changed the
+  acceptance rules because three assertions depended on tool-call content
+  the platform redacts. The principle is to limit what an agent can do and
+  measure outcomes, rather than trying to watch it.
+- [PR 3](https://github.com/kaimahi-agents/agents/pull/3) was the second
+  attempt, passing the same gate with 4 requests.
+- [PR 7](https://github.com/kaimahi-agents/agents/pull/7) reverted that
+  candidate. This repository's rollback receipt records the deployed readback.
 
-- [PR 1](https://github.com/kaimahi-agents/agents/pull/1): initial
-  import of version 1 and the tooling.
-- [PR 2](https://github.com/kaimahi-agents/agents/pull/2): the example
-  of a blocked change, evaluated on 2026-09-19 with 36 requests against
-  the limit of 10.
-- [PR 3](https://github.com/kaimahi-agents/agents/pull/3): the safe-stop
-  precedence candidate, awaiting fresh evaluation under provable rules.
-- [PR 4](https://github.com/kaimahi-agents/agents/pull/4): the
-  mechanically provable missing-toolchain acceptance rules.
+This does not yet show agents composed together, memory revisioning, or more
+than one evaluation case per change.

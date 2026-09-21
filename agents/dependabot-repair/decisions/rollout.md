@@ -8,12 +8,9 @@ A candidate change may be promoted to `production` only when:
   a required case to, against the candidate's rendered bundle digest;
 - every required case has a matching receipt with verdict `pass` and
   complete evidence for every assertion;
-- the pull request carries two distinct, non-author approvals, at
-  least one of them from a code owner. This applies to every candidate
-  change without exception: there is no prompt-only or otherwise
-  lower-risk classification that reduces the requirement to one
-  approval, because the prompt is itself part of the agent's authority
-  surface;
+- the required `agent-gate` check passes. Reviews are not yet required
+  while the repository has a single maintainer; `CODEOWNERS` still
+  routes changes but is not an approval requirement;
 - for a case bound to a mechanically-scored acceptance policy (for
   example `missing-toolchain-v2`), every one of that policy's
   assertions must independently show `pass` with complete evidence --
@@ -40,6 +37,6 @@ is the enforced one. TruffleHog remains a separate external scan that
 
 ## Status
 
-Version 1 is imported production evidence (dated 2026-09-17), not yet
-evaluated by this repository's own live evaluation tooling. No
-promotion or rollback has been recorded through this repository yet.
+Version 1 is imported production evidence dated 2026-09-17. A safe-stop
+candidate was evaluated live, promoted to trial, and rolled back to this
+version. Summary deploy and rollback receipts record both readbacks.

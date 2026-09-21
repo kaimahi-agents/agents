@@ -5,6 +5,7 @@ process, so every test here replaces exactly those and exercises the real argv c
 JSON handling, guards and receipt building.
 """
 
+import copy
 import io
 import json
 import subprocess
@@ -727,10 +728,26 @@ class LifecycleCliTestCase(unittest.TestCase):
         agent_call = next(argv for argv, _ in self.kubectl.calls if self.AGENT_NAME in argv)
         self.assertEqual(agent_call[agent_call.index("-n") + 1], NAMESPACE)
 
-    def test_rollback_verify_applies_nothing(self):
+    def test_rollback_verify_applies_nothing_and_records_restored_contract_and_limits(self):
         self.run_lifecycle("rollback")
         self.assertNotIn("apply", self.kubectl.verbs())
-        self.assertEqual(self.receipt("rollback")["verdict"], "pass")
+        receipt = self.receipt("rollback")
+        self.assertEqual(receipt["verdict"], "pass")
+        self.assertEqual(receipt["restored"], {
+            "model": "test-model", "request-cap": 60,
+            "tools": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]})
+        self.assertEqual(receipt["limitations"], list(agentctl.ROLLBACK_LIMITATIONS))
+
+    def test_rollback_summary_fields_are_fixed_and_validated(self):
+        self.run_lifecycle("rollback")
+        receipt = self.receipt("rollback")
+        receipt["restored"]["request-cap"] = -1
+        receipt["limitations"] = ["author supplied"]
+        receipt["kind"] = "deploy"
+        errors = agentctl.validate_lifecycle_receipt(receipt, "rollback")
+        self.assertTrue(any("restored" in error for error in errors))
+        self.assertTrue(any("limitations" in error for error in errors))
+        self.assertTrue(any("declared kind" in error for error in errors))
 
     def test_a_lifecycle_receipt_is_public_safe(self):
         for kind in ("deploy", "rollback"):
@@ -778,6 +795,32 @@ class LifecycleCliTestCase(unittest.TestCase):
         self.kubectl.responses[("configmap", "system-prompt")] = {"data": {"system.md": "drifted\n"}}
         self.assertEqual(self.run_lifecycle("deploy")["verdict"], "fail")
         self.assertEqual(self.receipt("deploy")["assertions"]["agent-identity-readback"]["verdict"], "fail")
+
+    def test_rollback_accepts_only_the_known_server_defaulted_monitor_fields(self):
+        live = copy.deepcopy(self.items["RepositoryMonitor"]["spec"])
+        live["automerge"]["requireGlobalMergeGate"] = True
+        live["review"]["event"] = "COMMENT"
+        live["review"]["publish"].update({"event": "COMMENT", "mode": "summary_only", "sameHeadPolicy": "skip"})
+        live["triggers"]["github"]["labels"]["requireActorPermission"] = "write"
+        self.kubectl.responses[("repositorymonitors.core.orka.ai", self.MONITOR_NAME)] = {"spec": live}
+        self.assertEqual(self.run_lifecycle("rollback")["verdict"], "pass")
+
+    def test_rollback_prunes_default_only_maps_omitted_by_the_authored_monitor(self):
+        write_json(self.agent / "resources" / "monitor.yaml", {
+            "apiVersion": "core.orka.ai/v1", "kind": "RepositoryMonitor",
+            "metadata": {"name": self.MONITOR_NAME}, "spec": {"automerge": {"enabled": False}}})
+        live = {"automerge": {"enabled": False, "requireGlobalMergeGate": True},
+                "review": {"event": "COMMENT", "publish": {
+                    "event": "COMMENT", "mode": "summary_only", "sameHeadPolicy": "skip"}},
+                "triggers": {"github": {"labels": {"requireActorPermission": "write"}}}}
+        self.kubectl.responses[("repositorymonitors.core.orka.ai", self.MONITOR_NAME)] = {"spec": live}
+        self.assertEqual(self.run_lifecycle("rollback")["verdict"], "pass")
+
+    def test_rollback_rejects_an_unknown_extra_live_monitor_field(self):
+        live = copy.deepcopy(self.items["RepositoryMonitor"]["spec"])
+        live["unknownDefault"] = True
+        self.kubectl.responses[("repositorymonitors.core.orka.ai", self.MONITOR_NAME)] = {"spec": live}
+        self.assertEqual(self.run_lifecycle("rollback")["verdict"], "fail")
 
     def test_rollback_detects_drifted_live_configuration(self):
         self.kubectl.responses[("repositorymonitors.core.orka.ai", self.MONITOR_NAME)] = {

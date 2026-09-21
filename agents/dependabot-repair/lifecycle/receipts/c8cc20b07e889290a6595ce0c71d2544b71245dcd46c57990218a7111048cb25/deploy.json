@@ -1,0 +1,36 @@
+{
+  "assertions": {
+    "agent-identity-readback": {
+      "evidence_completeness": true,
+      "note": "applied Agent UID/generation present and live prompt matches the rendered prompt byte-for-byte",
+      "verdict": "pass"
+    },
+    "memory-inventory-matches-baseline": {
+      "evidence_completeness": true,
+      "note": "memory inventory count matches the recorded baseline",
+      "verdict": "pass"
+    },
+    "proposal-inventory-matches-baseline": {
+      "evidence_completeness": true,
+      "note": "proposal inventory count matches the recorded baseline",
+      "verdict": "pass"
+    },
+    "runtime-image-matches-lock": {
+      "evidence_completeness": true,
+      "note": "installation-wide runtime image selector matches dependencies.lock.yaml",
+      "verdict": "pass"
+    }
+  },
+  "bundle_digest": "c8cc20b07e889290a6595ce0c71d2544b71245dcd46c57990218a7111048cb25",
+  "counts": {
+    "memory-items": 0,
+    "proposal-items": 0
+  },
+  "date": "2026-09-21",
+  "digests": {
+    "prompt": "350cbc2d45ed66dac61a8d8d9e8cb2934e9b05a88a90a8056040df78095a49cf",
+    "runtime-image": "sha256:2264f30ca2b529a0a330684fb112c2e1554440f50d50439e8802f9b40871ae98"
+  },
+  "kind": "deploy",
+  "verdict": "pass"
+}

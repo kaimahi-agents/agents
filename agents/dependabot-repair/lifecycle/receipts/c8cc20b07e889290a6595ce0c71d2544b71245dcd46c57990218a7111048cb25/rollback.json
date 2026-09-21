@@ -1,0 +1,53 @@
+{
+  "assertions": {
+    "bundle-matches-restored": {
+      "evidence_completeness": true,
+      "note": "live Agent/Monitor configuration and prompt match the restored rendered bundle",
+      "verdict": "pass"
+    },
+    "memory-matches-restored": {
+      "evidence_completeness": true,
+      "note": "memory inventory count matches the restored baseline",
+      "verdict": "pass"
+    },
+    "proposal-matches-restored": {
+      "evidence_completeness": true,
+      "note": "proposal inventory count matches the restored baseline",
+      "verdict": "pass"
+    },
+    "runtime-matches-restored": {
+      "evidence_completeness": true,
+      "note": "installation-wide runtime image selector matches the restored dependencies.lock.yaml",
+      "verdict": "pass"
+    }
+  },
+  "bundle_digest": "c8cc20b07e889290a6595ce0c71d2544b71245dcd46c57990218a7111048cb25",
+  "counts": {
+    "memory-items": 0,
+    "proposal-items": 0
+  },
+  "date": "2026-09-21",
+  "digests": {
+    "prompt": "350cbc2d45ed66dac61a8d8d9e8cb2934e9b05a88a90a8056040df78095a49cf",
+    "runtime-image": "sha256:2264f30ca2b529a0a330684fb112c2e1554440f50d50439e8802f9b40871ae98"
+  },
+  "kind": "rollback",
+  "limitations": [
+    "Agent UID and generation may be new or advanced; rollback does not restore deployment identity.",
+    "In-flight work, had there been any, would finish on the previous version; rollback does not move it.",
+    "No external system was involved or checked."
+  ],
+  "restored": {
+    "model": "claude-haiku-4.5",
+    "request-cap": 60,
+    "tools": [
+      "Read",
+      "Write",
+      "Edit",
+      "Bash",
+      "Glob",
+      "Grep"
+    ]
+  },
+  "verdict": "pass"
+}

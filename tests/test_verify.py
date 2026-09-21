@@ -115,6 +115,13 @@ class VerifyAgentTestCase(unittest.TestCase):
         self.assertTrue(errors)
         self.assertFalse(any("passwd" in error for error in errors))
 
+    def test_committed_lifecycle_receipts_are_validated_by_the_gate(self):
+        path = self.agent / "lifecycle" / "receipts" / ("a" * 64) / "rollback.json"
+        write_json(path, {"kind": "rollback", "unexpected": True})
+        errors = self.verify()
+        self.assertTrue(any("lifecycle receipt #" in error for error in errors))
+        self.assertTrue(any("fixed public-safe set" in error for error in errors))
+
     def _write_policy_case(self, assertions):
         """Rewrite acceptance.md/policy file for a `missing-toolchain-v2` case and re-render, since
         changing acceptance.md's content moves the bundle digest."""
