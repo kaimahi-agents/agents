@@ -15,8 +15,9 @@ REPO_PR_RE = re.compile(r"https://github\.com/kaimahi-agents/agents/pull/(2|3|4|
 
 def markdown_files():
     files = [README]
-    files += sorted((ROOT / "docs").rglob("*.md")) if (ROOT / "docs").is_dir() else []
-    files += sorted(AGENTS.glob("*/README.md"))
+    for directory in (".github", "agents", "docs", "tests", "tools"):
+        root = ROOT / directory
+        files += sorted(root.rglob("*.md")) if root.is_dir() else []
     return files
 
 
