@@ -1,45 +1,47 @@
 # kaimahi-agents/agents
 
-This repository is an evaluation of running agents on AKS using our own
-repositories as realistic workloads, not a team's operational process.
+## What this is
 
-## The one agent with real results
+We're trying out agents on AKS with our own repos as the test bed. This isn't
+how the team handles releases or repairs day to day.
 
-`agents/dependabot-repair` repaired failing CI checks on two existing
-Dependabot pull requests, both still green:
-[Azure/k8s-lint#239](https://github.com/Azure/k8s-lint/pull/239) and
-[Azure/k8s-lint#240](https://github.com/Azure/k8s-lint/pull/240). The
-agent runs only on an explicit command, with automerge off and no
-credentials in its runtime, and publication is performed by a separate
-trusted component, which is why its prompt can be published here.
+The agent here fixed [Azure/k8s-lint #239](https://github.com/Azure/k8s-lint/pull/239)
+and [#240](https://github.com/Azure/k8s-lint/pull/240). It only runs when you
+tell it to. Automerge is off. Its runtime has no credentials. A separate
+trusted component does the pushing. That's why we're fine publishing the
+prompt.
 
-The repair needs a runtime image with a package manager, and an open
-upstream proposal for supported dependency installation is filed as
-[orka-agents/orka#485](https://github.com/orka-agents/orka/issues/485).
+The repair needs a runtime image with a package manager. Related upstream
+design: [orka-agents/orka #485](https://github.com/orka-agents/orka/issues/485),
+for gated tool installation during repository validation.
 
-## How a change flows
+## How a change gets in
 
-Every pull request renders and verifies each changed agent, offline,
-checking that every case its acceptance rules require has a matching,
-passing receipt; the required gate never contacts a cluster. With a
-single maintainer, branch protection requires zero approvals, does not
-require code-owner review, requires `agent-gate`, and applies to administrators. The PR
-template asks whether a change touches prompt wording only or
-changes authority, runtime, memory, or acceptance rules. `CODEOWNERS`
-still routes every change to the `agent-maintainers` team.
+Change an agent and you need a passing test receipt for that exact version. CI
+checks it offline. CI never touches a cluster.
 
-## Evidence trail
+There's one maintainer for now, so reviews aren't required. Admins can't bypass
+the gate.
 
-- [PR 2](https://github.com/kaimahi-agents/agents/pull/2) looked right
-  and was blocked: 36 requests against a limit of 10.
-- [PR 4](https://github.com/kaimahi-agents/agents/pull/4) changed the
-  acceptance rules because three assertions depended on tool-call content
-  the platform redacts. The principle is to limit what an agent can do and
-  measure outcomes, rather than trying to watch it.
-- [PR 3](https://github.com/kaimahi-agents/agents/pull/3) was the second
-  attempt, passing the same gate with 4 requests.
-- [PR 7](https://github.com/kaimahi-agents/agents/pull/7) reverted that
-  candidate. This repository's rollback receipt records the deployed readback.
+## What happened so far
 
-This does not yet show agents composed together, memory revisioning, or more
-than one evaluation case per change.
+- [#2](https://github.com/kaimahi-agents/agents/pull/2): A prompt tweak that
+  looked fine. Blocked at 36 requests against a limit of 10.
+- [#4](https://github.com/kaimahi-agents/agents/pull/4): Changed the pass/fail
+  rules. We were checking details Orka redacts. Now we limit what the agent can
+  do and measure the result.
+- [#3](https://github.com/kaimahi-agents/agents/pull/3): Second try. Passed in
+  4 requests.
+- [#7](https://github.com/kaimahi-agents/agents/pull/7): Rolled it back. No
+  retest needed because that version had already passed.
+
+Deploy receipts: [#6](https://github.com/kaimahi-agents/agents/pull/6) out and
+[#8](https://github.com/kaimahi-agents/agents/pull/8) back.
+
+The surprising part: about 12 seconds of agent time took about 15 minutes of
+setup on the first try.
+
+## What's missing
+
+Agents don't call other agents yet. Memory isn't versioned. Each change still
+uses one test case.
