@@ -1,0 +1,33 @@
+{
+  "apiVersion": "v1",
+  "items": [
+    {
+      "apiVersion": "core.orka.ai/v1alpha1",
+      "kind": "Agent",
+      "metadata": {
+        "labels": {
+          "environment": "production",
+          "kaimahi.dev/agent": "a2a-assistant",
+          "kaimahi.dev/environment": "production"
+        },
+        "name": "a2a-native",
+        "namespace": "orka-system"
+      },
+      "spec": {
+        "model": {
+          "maxTokens": 128,
+          "name": "qwen2.5:3b",
+          "temperature": 0
+        },
+        "providerRef": {
+          "name": "a2a-local-model"
+        },
+        "systemPrompt": {
+          "inline": "Answer the user's question concisely. You have no tools."
+        },
+        "tools": []
+      }
+    }
+  ],
+  "kind": "List"
+}

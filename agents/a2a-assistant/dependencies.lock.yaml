@@ -1,0 +1,8 @@
+{
+  "a2aAdapterRevision": "1fbd64ce760ac8ae97a9867661475da3794e91f1",
+  "a2aClient": "github.com/a2aproject/a2a-go/v2 v2.5.0",
+  "model": "qwen2.5:3b",
+  "modelServer": "Ollama 0.11.8",
+  "orkaRevision": "f97724a772b6c09be39749ddf01795bd0a9ce571",
+  "providerRole": "a2a-local-model"
+}

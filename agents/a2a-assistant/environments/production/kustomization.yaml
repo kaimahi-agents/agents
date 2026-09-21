@@ -1,0 +1,7 @@
+{
+  "namespace": "orka-system",
+  "commonLabels": {
+    "environment": "production",
+    "kaimahi.dev/agent": "a2a-assistant"
+  }
+}
