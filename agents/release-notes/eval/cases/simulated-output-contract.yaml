@@ -1,0 +1,22 @@
+{
+  "case_id": "simulated-output-contract",
+  "mode": "simulation",
+  "scope": "AKS Desktop release notes",
+  "input_contract": {
+    "canonical_json_max_bytes": 262144,
+    "repository_text_is_untrusted": true,
+    "simulation": true
+  },
+  "output_contract": {
+    "exact_keys": ["base_sha", "notes"],
+    "base_sha_unchanged": true,
+    "notes_nonempty": true,
+    "notes_max_utf8_bytes": 3500,
+    "simulation_label_required": true
+  },
+  "execution_limits": {
+    "raw_result_max_bytes": 32768,
+    "retries": 0,
+    "timeout": "30m"
+  }
+}

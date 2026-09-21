@@ -1,0 +1,43 @@
+{
+  "case_id": "simulated-output-contract",
+  "bundle_digest": "19958142d8e1975689fa2e79712cc58936fdd631d6daf2202a612724c995d5b4",
+  "date": "2026-09-16",
+  "source": "imported",
+  "model": "claude-haiku-4.5",
+  "request_count": null,
+  "verdict": "pass",
+  "assertions": {
+    "base-sha-unchanged": {
+      "verdict": "pass",
+      "evidence_completeness": true,
+      "note": "The validated result repeated the supplied source SHA exactly."
+    },
+    "exact-keys": {
+      "verdict": "pass",
+      "evidence_completeness": true,
+      "note": "The validated result contained only base_sha and notes."
+    },
+    "notes-byte-limit": {
+      "verdict": "pass",
+      "evidence_completeness": true,
+      "note": "The accepted notes were nonempty and below 3500 UTF-8 bytes."
+    },
+    "simulation-label": {
+      "verdict": "pass",
+      "evidence_completeness": true,
+      "note": "Direct inspection of the retained output confirmed an explicit simulation label."
+    },
+    "zero-tool-authority": {
+      "verdict": "pass",
+      "evidence_completeness": true,
+      "note": "The Task had explicit read-only and no-coordination-tool annotations and no authority fields."
+    }
+  },
+  "evidence_sha256": [
+    "d2e8765b6d6ca9e90a176b25e5831eb76bc7c1d15c9114e603f67732b87325b2"
+  ],
+  "tool_calls": {
+    "total": 0,
+    "redacted": 0
+  }
+}

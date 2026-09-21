@@ -1,0 +1,6 @@
+{
+  "model": "claude-haiku-4.5",
+  "qualification": "custom fixture, not stock Orka",
+  "runtimeContract": "orka.harness.v2",
+  "runtimeImageDigest": "sha256:b0191651470184670cdc0842cd34d4b48cb007ed9a4e9bd599d48c5d9cb71748"
+}

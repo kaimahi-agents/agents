@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 README = ROOT / "README.md"
 AGENTS = ROOT / "agents"
-ALLOWED_STATUSES = {"tested", "ran, no tests yet", "tested, ran on real PRs"}
+ALLOWED_STATUSES = {"tested", "tested in simulation", "ran, no tests yet", "tested, ran on real PRs"}
 LINK_RE = re.compile(r"(?<!!)\[[^]]+\]\(([^)]+)\)")
 TOOL_COMMAND_RE = re.compile(r"^\s*(tools/[a-z0-9-]+)\b")
 REPO_PR_RE = re.compile(r"https://github\.com/kaimahi-agents/agents/pull/(2|3|4|7)\b")

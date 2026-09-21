@@ -1,0 +1,7 @@
+{
+  "namespace": "release-notes-production",
+  "commonLabels": {
+    "environment": "production",
+    "kaimahi.dev/agent": "release-notes"
+  }
+}
