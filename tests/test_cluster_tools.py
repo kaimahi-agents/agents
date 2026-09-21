@@ -743,9 +743,11 @@ class LifecycleCliTestCase(unittest.TestCase):
         receipt = self.receipt("rollback")
         receipt["restored"]["request-cap"] = -1
         receipt["limitations"] = ["author supplied"]
+        receipt["kind"] = "deploy"
         errors = agentctl.validate_lifecycle_receipt(receipt, "rollback")
         self.assertTrue(any("restored" in error for error in errors))
         self.assertTrue(any("limitations" in error for error in errors))
+        self.assertTrue(any("declared kind" in error for error in errors))
 
     def test_a_lifecycle_receipt_is_public_safe(self):
         for kind in ("deploy", "rollback"):
@@ -800,6 +802,17 @@ class LifecycleCliTestCase(unittest.TestCase):
         live["review"]["event"] = "COMMENT"
         live["review"]["publish"].update({"event": "COMMENT", "mode": "summary_only", "sameHeadPolicy": "skip"})
         live["triggers"]["github"]["labels"]["requireActorPermission"] = "write"
+        self.kubectl.responses[("repositorymonitors.core.orka.ai", self.MONITOR_NAME)] = {"spec": live}
+        self.assertEqual(self.run_lifecycle("rollback")["verdict"], "pass")
+
+    def test_rollback_prunes_default_only_maps_omitted_by_the_authored_monitor(self):
+        write_json(self.agent / "resources" / "monitor.yaml", {
+            "apiVersion": "core.orka.ai/v1", "kind": "RepositoryMonitor",
+            "metadata": {"name": self.MONITOR_NAME}, "spec": {"automerge": {"enabled": False}}})
+        live = {"automerge": {"enabled": False, "requireGlobalMergeGate": True},
+                "review": {"event": "COMMENT", "publish": {
+                    "event": "COMMENT", "mode": "summary_only", "sameHeadPolicy": "skip"}},
+                "triggers": {"github": {"labels": {"requireActorPermission": "write"}}}}
         self.kubectl.responses[("repositorymonitors.core.orka.ai", self.MONITOR_NAME)] = {"spec": live}
         self.assertEqual(self.run_lifecycle("rollback")["verdict"], "pass")
 

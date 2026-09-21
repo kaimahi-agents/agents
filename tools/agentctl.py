@@ -982,6 +982,7 @@ def validate_lifecycle_receipt(receipt, kind: str) -> list[str]:
                       and bool(restored["tools"]) and all(isinstance(tool, str) and tool for tool in restored["tools"]))
     errors = [message for ok, message in (
         (set(receipt) == expected_keys, "lifecycle receipt fields are not the fixed public-safe set"),
+        (receipt.get("kind") == kind, "lifecycle receipt declared kind does not match its filename"),
         (set(receipt.get("assertions", {})) == set(_LIFECYCLE[kind][2]),
          "lifecycle receipt assertions are not the fixed public-safe set"),
         (_is_hex_digest(receipt.get("bundle_digest")), "bundle_digest must be a 64-character lowercase hex string"),
@@ -1012,6 +1013,14 @@ def _path_value(document, path):
             return _MISSING
         value = value[key]
     return value
+def _prune_unwritten_empty_maps(node, authored) -> None:
+    if not isinstance(node, dict):
+        return
+    for key, value in list(node.items()):
+        authored_value = authored.get(key, _MISSING) if isinstance(authored, dict) else _MISSING
+        _prune_unwritten_empty_maps(value, authored_value)
+        if value == {} and authored_value is _MISSING:
+            node.pop(key)
 def _monitor_spec_matches(authored, live) -> bool:
     """Accept only the API's fixed defaults when the authored monitor omits those fields."""
     normalized = copy.deepcopy(live)
@@ -1021,6 +1030,7 @@ def _monitor_spec_matches(authored, live) -> bool:
             for key in path[:-1]:
                 holder = holder[key]
             holder.pop(path[-1])
+    _prune_unwritten_empty_maps(normalized, authored)
     return normalized == authored
 
 def _inventory_readback(api_base_url, path, token, expected_count):
