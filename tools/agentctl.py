@@ -507,8 +507,11 @@ def _verify_lifecycle_receipts(agent_dir: Path) -> list[str]:
             continue
         current = validate_lifecycle_receipt(receipt, kind)
         current += find_prohibited_in_document(receipt, "lifecycle receipt")
-        if not _is_hex_digest(path.parent.name) or receipt.get("bundle_digest") != path.parent.name:
-            current.append("bundle_digest does not match the receipt directory")
+        recorded_digest = receipt.get("bundle_digest") if isinstance(receipt, dict) else None
+        if recorded_digest is None and isinstance(receipt, dict):
+            recorded_digest = receipt.get("coordinator_digest")
+        if not _is_hex_digest(path.parent.name) or recorded_digest != path.parent.name:
+            current.append("receipt digest does not match the receipt directory")
         errors += [f"lifecycle receipt #{index}: {error}" for error in current]
     return errors
 
@@ -1623,12 +1626,19 @@ def _add_cluster_arguments(parser) -> None:
         parser.add_argument(flag, required=True, type=Path)
     parser.add_argument("--environment", required=True, choices=ALLOWED_ENVIRONMENTS)
 
+LIFECYCLE_MODE_MONITORED_RUNTIME = "monitored-runtime"
+LIFECYCLE_MODE_NATIVE_COMPOSITION = "native-composition"
+LIFECYCLE_MODES = (LIFECYCLE_MODE_MONITORED_RUNTIME, LIFECYCLE_MODE_NATIVE_COMPOSITION)
 # Fixed, public-safe lifecycle receipt shape. Assertion IDs, the primary evidence filename and the
 # wording distinguishing "as deployed" from "as restored" are the only per-kind differences.
 LEGACY_LIFECYCLE_RECEIPT_KEYS = frozenset(
     {"kind", "bundle_digest", "date", "verdict", "assertions", "digests", "counts"})
 LIFECYCLE_RECEIPT_SCHEMA_VERSION = 2
+NATIVE_COMPOSITION_LIFECYCLE_RECEIPT_SCHEMA_VERSION = 3
 LIFECYCLE_RECEIPT_KEYS = LEGACY_LIFECYCLE_RECEIPT_KEYS | {"schema_version", "namespace"}
+NATIVE_COMPOSITION_LIFECYCLE_RECEIPT_KEYS = frozenset(
+    {"schema_version", "kind", "coordinator_digest", "child_digest", "date", "namespace",
+     "verdict", "assertions"})
 # Grandfather the one pre-schema receipt by exact canonical content. Author-controlled fields such
 # as `date` cannot turn a new receipt into a legacy one that omits readiness and namespace.
 LEGACY_LIFECYCLE_RECEIPT_DIGESTS = frozenset({
@@ -1637,6 +1647,11 @@ LEGACY_LIFECYCLE_RECEIPT_DIGESTS = frozenset({
 ROLLBACK_LIMITATIONS = (
     "Agent UID and generation may be new or advanced; rollback does not restore deployment identity.",
     "In-flight work, had there been any, would finish on the previous version; rollback does not move it.",
+    "No external system was involved or checked.",
+)
+NATIVE_COMPOSITION_ROLLBACK_LIMITATIONS = (
+    "Verification covers restored live catalogue definitions, not immutable native runtime revision binding.",
+    "Already-running work, had there been any, would continue on the previous version.",
     "No external system was involved or checked.",
 )
 _LIFECYCLE = {
@@ -1654,17 +1669,19 @@ _LIFECYCLE = {
                  "live Agent/Monitor configuration or prompt does not match the restored rendered bundle",
                  "the restored dependencies.lock.yaml", "the restored baseline"),
 }
+_NATIVE_COMPOSITION_LIFECYCLE = {
+    "deploy": ("tools/deploy", "Apply the pinned child and coordinator Agents and verify live readback.",
+               ("child-matches-rendered", "child-ready", "coordinator-matches-rendered", "coordinator-ready")),
+    "rollback": ("tools/rollback-verify", "Read live child and coordinator Agents and verify the restored pair.",
+                 ("child-matches-restored", "child-ready", "coordinator-matches-restored", "coordinator-ready")),
+}
 _INCOMPLETE_NOTES = ("Agent, Monitor, or prompt ConfigMap readback could not be established",
                      "Agent readiness readback could not be established",
                      "runtime image selector readback could not be established",
                      "memory inventory readback could not be established",
                      "proposal inventory readback could not be established")
-def validate_lifecycle_receipt(receipt, kind: str) -> list[str]:
-    """Self-check before writing: exactly the fixed public-safe fields and assertion IDs, safe
-    digests and counts, and an overall `pass` only when every assertion passed completely."""
+def _validate_monitored_lifecycle_receipt(receipt, kind: str, *, legacy: bool) -> list[str]:
     assertions = receipt.get("assertions", {})
-    canonical = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    legacy = sha256_hex(canonical) in LEGACY_LIFECYCLE_RECEIPT_DIGESTS
     base_keys = LEGACY_LIFECYCLE_RECEIPT_KEYS if legacy else LIFECYCLE_RECEIPT_KEYS
     expected_keys = base_keys | ({"restored", "limitations"} if kind == "rollback" else set())
     expected_assertions = tuple(assertion for assertion in _LIFECYCLE[kind][2]
@@ -1700,6 +1717,45 @@ def validate_lifecycle_receipt(receipt, kind: str) -> list[str]:
          "rollback limitations are not the fixed public-safe statements")) if not ok]
     _validate_assertions(receipt.get("assertions"), errors, "lifecycle receipt")
     return errors
+
+def _validate_native_composition_lifecycle_receipt(receipt, kind: str) -> list[str]:
+    assertions = receipt.get("assertions", {})
+    expected_keys = NATIVE_COMPOSITION_LIFECYCLE_RECEIPT_KEYS | ({"limitations"} if kind == "rollback" else set())
+    errors = [message for ok, message in (
+        (set(receipt) == expected_keys, "lifecycle receipt fields are not the fixed public-safe set"),
+        (receipt.get("kind") == kind, "lifecycle receipt declared kind does not match its filename"),
+        (set(assertions) == set(_NATIVE_COMPOSITION_LIFECYCLE[kind][2]),
+         "lifecycle receipt assertions are not the fixed public-safe set"),
+        (receipt.get("schema_version") == NATIVE_COMPOSITION_LIFECYCLE_RECEIPT_SCHEMA_VERSION,
+         "lifecycle receipt schema_version is unsupported"),
+        (receipt.get("namespace") is None or is_safe_slug(receipt.get("namespace")),
+         "namespace must be null or a safe slug"),
+        (receipt.get("verdict") != "pass" or isinstance(receipt.get("namespace"), str),
+         "a passing lifecycle receipt requires a readback namespace"),
+        (_is_hex_digest(receipt.get("coordinator_digest")),
+         "coordinator_digest must be a 64-character lowercase hex string"),
+        (_is_hex_digest(receipt.get("child_digest")),
+         "child_digest must be a 64-character lowercase hex string"),
+        (_is_date(receipt.get("date")), "date must be an ISO YYYY-MM-DD string"),
+        (receipt.get("verdict") != "pass" or all_assertions_pass_and_complete(assertions),
+         "overall verdict 'pass' requires every assertion to be verdict 'pass' and complete"),
+        (kind != "rollback" or receipt.get("limitations") == list(NATIVE_COMPOSITION_ROLLBACK_LIMITATIONS),
+         "rollback limitations are not the fixed public-safe statements")) if not ok]
+    _validate_assertions(receipt.get("assertions"), errors, "lifecycle receipt")
+    return errors
+
+def validate_lifecycle_receipt(receipt, kind: str) -> list[str]:
+    """Self-check before writing: exactly the fixed public-safe fields and assertion IDs, safe
+    digests, and an overall `pass` only when every assertion passed completely."""
+    if not isinstance(receipt, dict):
+        return ["lifecycle receipt must be a JSON object"]
+    canonical = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    legacy = sha256_hex(canonical) in LEGACY_LIFECYCLE_RECEIPT_DIGESTS
+    if legacy or "bundle_digest" in receipt:
+        return _validate_monitored_lifecycle_receipt(receipt, kind, legacy=legacy)
+    if "coordinator_digest" in receipt:
+        return _validate_native_composition_lifecycle_receipt(receipt, kind)
+    return _validate_monitored_lifecycle_receipt(receipt, kind, legacy=False)
 _MONITOR_SERVER_DEFAULTS = (
     (("automerge", "requireGlobalMergeGate"), True), (("review", "event"), "COMMENT"),
     (("review", "publish", "event"), "COMMENT"), (("review", "publish", "mode"), "summary_only"),
@@ -1786,14 +1842,145 @@ def _inventory_readback(api_base_url, path, token, expected_count):
     if not isinstance(items, list):
         return False, None, {"response": response}
     return len(items) == expected_count, len(items), {"response": response}
-def _lifecycle_cli(kind: str, argv) -> int:
-    """`tools/deploy` and `tools/rollback-verify`: render, cross-check the namespace, read live
-    state back, and write a public-safe receipt plus raw evidence outside Git. Deploy applies the
-    bundle and confirms the applied Agent's UID/generation and prompt; rollback-verify applies
-    nothing and confirms live configuration matches the restored definition. An unestablished
-    readback stays incomplete, which structurally prevents a pass."""
+def _add_lifecycle_mode_argument(parser, *, default=LIFECYCLE_MODE_MONITORED_RUNTIME) -> None:
+    parser.add_argument("--mode", choices=LIFECYCLE_MODES, default=default)
+
+
+def _parse_lifecycle_mode(argv) -> str:
+    parser = argparse.ArgumentParser(add_help=False)
+    _add_lifecycle_mode_argument(parser)
+    return parser.parse_known_args(argv)[0].mode
+
+
+def _rendered_agent_item(rendered_bundle, *, label: str) -> dict:
+    agents = [item for item in rendered_bundle.get("items", [])
+              if isinstance(item, dict) and item.get("kind") == "Agent"]
+    if len(agents) != 1:
+        raise CliError(f"rendered {label} bundle is missing the expected Agent resource")
+    name = (agents[0].get("metadata") or {}).get("name")
+    if not isinstance(name, str) or not name:
+        raise CliError("rendered bundle resources are missing metadata.name")
+    return agents[0]
+
+
+def _load_native_composition_rendered(args) -> dict:
+    coordinator_dir = Path(args.agent_dir)
+    graph = load_catalogue_graph(coordinator_dir.parent.parent)
+    lock = _parse_catalogue_lock(coordinator_dir / "dependencies.lock.yaml")
+    if set(lock) != {_EXPECTED_COMPOSED_CHILD}:
+        raise CliError("native composition lifecycle requires exactly the pinned hello child")
+    child_slug = graph.name_to_dir.get(_EXPECTED_COMPOSED_CHILD)
+    if child_slug is None:
+        raise CliError("the pinned hello child could not be resolved in the catalogue")
+    child_dir = coordinator_dir.parent.parent / "agents" / child_slug
+    child_digest = lock[_EXPECTED_COMPOSED_CHILD][args.environment]
+    child_result, child_rendered = _render_bundle_checked(
+        child_dir, args.environment, args.namespace, Path(args.evidence_root) / "child-bundle.yaml")
+    if child_result["bundle_digest"] != child_digest:
+        raise CliError("catalogue dependency digest does not match dependencies.lock.yaml for this environment")
+    coordinator_result, coordinator_rendered = _render_checked(args, Path(args.evidence_root) / "coordinator-bundle.yaml")
+    child_item = _rendered_agent_item(child_rendered, label="child")
+    coordinator_item = _rendered_agent_item(coordinator_rendered, label="coordinator")
+    return {
+        "child_digest": child_digest,
+        "child_item": child_item,
+        "child_name": (child_item.get("metadata") or {}).get("name"),
+        "child_path": Path(args.evidence_root) / "child-bundle.yaml",
+        "coordinator_digest": coordinator_result["bundle_digest"],
+        "coordinator_item": coordinator_item,
+        "coordinator_name": (coordinator_item.get("metadata") or {}).get("name"),
+        "coordinator_path": Path(args.evidence_root) / "coordinator-bundle.yaml",
+    }
+
+
+def _native_agent_matches_rendered(live_agent, rendered_item, expected_namespace: str):
+    if live_agent is None:
+        return None
+    metadata = live_agent.get("metadata") if isinstance(live_agent, dict) else None
+    return bool(isinstance(metadata, dict)
+                and metadata.get("namespace") == expected_namespace
+                and live_agent.get("spec") == rendered_item.get("spec"))
+
+
+def _shared_readback_namespace(*agent_objs):
+    observed = []
+    for agent_obj in agent_objs:
+        metadata = agent_obj.get("metadata") if isinstance(agent_obj, dict) else None
+        namespace = metadata.get("namespace") if isinstance(metadata, dict) else None
+        if isinstance(namespace, str):
+            observed.append(namespace)
+    return observed[0] if observed and len(set(observed)) == 1 else None
+
+
+def _native_composition_lifecycle_cli(kind: str, argv) -> int:
+    prog, description, ids = _NATIVE_COMPOSITION_LIFECYCLE[kind]
+    parser = argparse.ArgumentParser(prog=prog, description=description)
+    _add_lifecycle_mode_argument(parser, default=LIFECYCLE_MODE_NATIVE_COMPOSITION)
+    _add_cluster_arguments(parser)
+    parser.add_argument("--agent-resource-type", default="agents.core.orka.ai")
+    args = parser.parse_args(argv)
+    if not _is_date(args.date):
+        raise CliError("date must use a real YYYY-MM-DD calendar date")
+    rendered = _load_native_composition_rendered(args)
+
+    if kind == "deploy":
+        for label, path in (("child", rendered["child_path"]), ("coordinator", rendered["coordinator_path"])):
+            applied = run_kubectl(args.context, args.kubeconfig, ["apply", "-n", args.namespace, "-f", str(path)])
+            if applied.returncode != 0:
+                raise CliError(f"{label} bundle apply failed (kubectl exited {applied.returncode})")
+
+    def get(name):
+        return run_kubectl_json(args.context, args.kubeconfig, ["get", args.agent_resource_type, name, "-n", args.namespace])
+
+    child_agent = wait_for_current_agent_readback(lambda: get(rendered["child_name"]))
+    coordinator_agent = wait_for_current_agent_readback(lambda: get(rendered["coordinator_name"]))
+    for name, data in (("child-agent-readback.json", child_agent),
+                       ("coordinator-agent-readback.json", coordinator_agent)):
+        _write_json(Path(args.evidence_root) / name, data)
+    restored = "rendered" if kind == "deploy" else "restored"
+    assertions = dict(zip(ids, (
+        tri_state(_native_agent_matches_rendered(child_agent, rendered["child_item"], args.namespace),
+                  f"live child Agent spec and namespace match the {restored} pinned child",
+                  f"live child Agent spec or namespace does not match the {restored} pinned child",
+                  "child Agent readback could not be established"),
+        tri_state(_agent_ready_readback(child_agent),
+                  "child Agent Ready condition is True for the readback generation",
+                  "child Agent Ready condition is not True for the readback generation",
+                  "child Agent readiness readback could not be established"),
+        tri_state(_native_agent_matches_rendered(coordinator_agent, rendered["coordinator_item"], args.namespace),
+                  f"live coordinator Agent spec and namespace match the {restored} coordinator",
+                  f"live coordinator Agent spec or namespace does not match the {restored} coordinator",
+                  "coordinator Agent readback could not be established"),
+        tri_state(_agent_ready_readback(coordinator_agent),
+                  "coordinator Agent Ready condition is True for the readback generation",
+                  "coordinator Agent Ready condition is not True for the readback generation",
+                  "coordinator Agent readiness readback could not be established"),
+    )))
+    receipt = {
+        "schema_version": NATIVE_COMPOSITION_LIFECYCLE_RECEIPT_SCHEMA_VERSION,
+        "kind": kind,
+        "coordinator_digest": rendered["coordinator_digest"],
+        "child_digest": rendered["child_digest"],
+        "date": args.date,
+        "namespace": _shared_readback_namespace(child_agent, coordinator_agent),
+        "assertions": assertions,
+        "verdict": "pass" if all_assertions_pass_and_complete(assertions) else "fail",
+    }
+    if kind == "rollback":
+        receipt["limitations"] = list(NATIVE_COMPOSITION_ROLLBACK_LIMITATIONS)
+    _require(validate_lifecycle_receipt(receipt, kind) + find_prohibited_in_document(receipt, "receipt"))
+    _write_json(Path(args.agent_dir) / "lifecycle" / "receipts" / rendered["coordinator_digest"] / f"{kind}.json",
+                receipt)
+    sys.stdout.write(_json_text({"coordinator_digest": rendered["coordinator_digest"],
+                                 "child_digest": rendered["child_digest"],
+                                 "kind": kind, "verdict": receipt["verdict"]}))
+    return 0
+
+
+def _monitored_runtime_lifecycle_cli(kind: str, argv) -> int:
     prog, description, ids, primary_file, match_note, mismatch_note, lock_label, baseline = _LIFECYCLE[kind]
     parser = argparse.ArgumentParser(prog=prog, description=description)
+    _add_lifecycle_mode_argument(parser)
     _add_cluster_arguments(parser)
     for flag, default in (("--agent-resource-type", "agents.core.orka.ai"),
                           ("--prompt-configmap-name", "system-prompt"), ("--prompt-configmap-key", "system.md")):
@@ -1836,8 +2023,7 @@ def _lifecycle_cli(kind: str, argv) -> int:
         except KubectlError:
             return None
 
-    agent_obj = wait_for_current_agent_readback(
-        lambda: get(args.agent_resource_type, names[0]))
+    agent_obj = wait_for_current_agent_readback(lambda: get(args.agent_resource_type, names[0]))
     configmap = optional_get("configmap", args.prompt_configmap_name)
     monitor_obj = optional_get(args.monitor_resource_type, names[1]) if kind == "rollback" else None
     try:
@@ -1911,6 +2097,13 @@ def _lifecycle_cli(kind: str, argv) -> int:
     _write_json(Path(args.agent_dir) / "lifecycle" / "receipts" / bundle_digest / f"{kind}.json", receipt)
     sys.stdout.write(_json_text({"bundle_digest": bundle_digest, "kind": kind, "verdict": receipt["verdict"]}))
     return 0
+
+
+def _lifecycle_cli(kind: str, argv) -> int:
+    """`tools/deploy` and `tools/rollback-verify`: parse the lifecycle mode first, then dispatch
+    either the existing monitored-runtime flow or the native pinned-composition flow."""
+    return (_native_composition_lifecycle_cli if _parse_lifecycle_mode(argv) == LIFECYCLE_MODE_NATIVE_COMPOSITION
+            else _monitored_runtime_lifecycle_cli)(kind, argv)
 
 def _prepare_eval_inputs(args) -> dict:
     if not is_safe_slug(args.case_id):

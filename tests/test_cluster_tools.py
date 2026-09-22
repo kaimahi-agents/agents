@@ -1338,6 +1338,66 @@ class LifecycleCliTestCase(unittest.TestCase):
         self.assertEqual(len(written), 1)
         return json.loads(written[0].read_text(encoding="utf-8"))
 
+    def setup_native_composition(self):
+        self.native_root = self.root / "native-catalogue"
+        (self.native_root / "agents").mkdir(parents=True, exist_ok=True)
+        self.hello = write_native_agent(self.native_root / "agents" / "hello", namespace=NAMESPACE,
+                                        agent_name="hello", provider_name="hello")
+        pins = {environment: agentctl.render_agent(
+            self.hello, environment, self.native_root / f"hello-{environment}.json")["bundle_digest"]
+                for environment in agentctl.ALLOWED_ENVIRONMENTS}
+        self.coordinator = write_native_coordinator(
+            self.native_root / "agents" / "coordinator",
+            namespace=NAMESPACE,
+            catalogue_agents={"hello": pins},
+        )
+        self.native_evidence = self.root / "native-evidence"
+        hello_render = agentctl.render_agent(self.hello, "trial", self.native_root / "hello-probe.json")
+        coordinator_render = agentctl.render_agent(
+            self.coordinator, "trial", self.native_root / "coordinator-probe.json")
+        self.hello_digest = hello_render["bundle_digest"]
+        self.coordinator_digest = coordinator_render["bundle_digest"]
+        hello_rendered = json.loads(Path(hello_render["bundle_path"]).read_text(encoding="utf-8"))
+        coordinator_rendered = json.loads(Path(coordinator_render["bundle_path"]).read_text(encoding="utf-8"))
+        self.hello_spec = next(item["spec"] for item in hello_rendered["items"] if item["kind"] == "Agent")
+        self.coordinator_spec = next(item["spec"] for item in coordinator_rendered["items"]
+                                     if item["kind"] == "Agent")
+        self.native_kubectl = FakeKubectl({
+            ("agents.core.orka.ai", "hello"): {
+                "metadata": {"uid": "hello-agent-uid", "generation": 1, "namespace": NAMESPACE},
+                "spec": self.hello_spec,
+                "status": {"conditions": [{"type": "Ready", "status": "True", "observedGeneration": 1}]},
+            },
+            ("agents.core.orka.ai", "coordinator"): {
+                "metadata": {"uid": "coordinator-agent-uid", "generation": 1, "namespace": NAMESPACE},
+                "spec": self.coordinator_spec,
+                "status": {"conditions": [{"type": "Ready", "status": "True", "observedGeneration": 1}]},
+            },
+        })
+
+    def native_argv(self, **overrides):
+        args = {"--mode": "native-composition", "--context": "ctx", "--kubeconfig": "cred",
+                "--evidence-root": str(self.native_evidence), "--agent-dir": str(self.coordinator),
+                "--environment": "trial", "--namespace": NAMESPACE, "--date": "2026-09-17"}
+        args.update(overrides)
+        return [token for flag, value in args.items() for token in (flag, value)]
+
+    def run_native_lifecycle(self, kind, **overrides):
+        unexpected_http = lambda *a, **k: (_ for _ in ()).throw(AssertionError("unexpected HTTP readback"))
+        with mock.patch.object(agentctl.subprocess, "run", self.native_kubectl), \
+                mock.patch.object(agentctl, "http_get_json", unexpected_http), \
+                mock.patch.object(agentctl.time, "sleep"), redirect_stdout(io.StringIO()) as out:
+            agentctl._lifecycle_cli(kind, self.native_argv(**overrides))
+        return json.loads(out.getvalue())
+
+    def native_receipt_path(self, kind):
+        written = sorted((self.coordinator / "lifecycle" / "receipts").rglob(f"{kind}.json"))
+        self.assertEqual(len(written), 1)
+        return written[0]
+
+    def native_receipt(self, kind):
+        return json.loads(self.native_receipt_path(kind).read_text(encoding="utf-8"))
+
     def test_deploy_applies_the_bundle_and_records_a_passing_receipt(self):
         summary = self.run_lifecycle("deploy")
         self.assertEqual(summary["verdict"], "pass")
@@ -1351,6 +1411,14 @@ class LifecycleCliTestCase(unittest.TestCase):
         self.assertEqual(receipt["namespace"], NAMESPACE)
         self.assertEqual(receipt["digests"]["runtime-image"], RUNTIME_DIGEST)
         self.assertEqual(receipt["counts"], {"memory-items": 0, "proposal-items": 0})
+
+    def test_default_mode_still_requires_legacy_runtime_and_api_arguments(self):
+        argv = ["--context", "ctx", "--kubeconfig", "cred", "--evidence-root", str(self.evidence),
+                "--agent-dir", str(self.agent), "--environment", "trial", "--namespace", NAMESPACE,
+                "--date", "2026-09-17"]
+        with mock.patch.object(agentctl.subprocess, "run") as runner, self.assertRaises(SystemExit):
+            agentctl._lifecycle_cli("deploy", argv)
+        runner.assert_not_called()
 
     def test_runtime_selector_is_read_from_its_explicit_namespace(self):
         self.run_lifecycle("deploy")
@@ -1607,6 +1675,82 @@ class LifecycleCliTestCase(unittest.TestCase):
                          {"bundle.yaml", "identity-readback.json", "runtime-readback.json",
                           "memory-readback.json", "proposal-readback.json"})
         self.assertFalse(list(self.agent.rglob("identity-readback.json")))
+
+    def test_native_deploy_omits_legacy_arguments_applies_child_then_coordinator_and_records_digests(self):
+        self.setup_native_composition()
+        summary = self.run_native_lifecycle("deploy")
+        self.assertEqual(summary["verdict"], "pass")
+        self.assertEqual(summary["coordinator_digest"], self.coordinator_digest)
+        self.assertEqual(summary["child_digest"], self.hello_digest)
+        apply_calls = [argv for argv, _ in self.native_kubectl.calls
+                       if argv and argv[0] == "kubectl" and argv[5] == "apply"]
+        self.assertEqual([Path(argv[-1]).name for argv in apply_calls],
+                         ["child-bundle.yaml", "coordinator-bundle.yaml"])
+        receipt = self.native_receipt("deploy")
+        self.assertEqual(agentctl.validate_lifecycle_receipt(receipt, "deploy"), [])
+        self.assertEqual(self.native_receipt_path("deploy").parent.name, self.coordinator_digest)
+        self.assertEqual(receipt["coordinator_digest"], self.coordinator_digest)
+        self.assertEqual(receipt["child_digest"], self.hello_digest)
+        self.assertEqual(receipt["namespace"], NAMESPACE)
+        self.assertEqual(set(receipt["assertions"]),
+                         {"child-matches-rendered", "child-ready",
+                          "coordinator-matches-rendered", "coordinator-ready"})
+
+    def test_native_mode_validates_catalogue_pins_before_cluster_calls(self):
+        self.setup_native_composition()
+        lock = json.loads((self.coordinator / "dependencies.lock.yaml").read_text(encoding="utf-8"))
+        lock["catalogueAgents"]["hello"]["trial"] = "f" * 64
+        write_json(self.coordinator / "dependencies.lock.yaml", lock)
+        with self.assertRaises(agentctl.CliError):
+            self.run_native_lifecycle("deploy")
+        self.assertEqual([argv for argv, _ in self.native_kubectl.calls if argv and argv[0] == "kubectl"], [])
+
+    def test_native_deploy_requires_current_ready_conditions_for_both_agents(self):
+        for key, assertion in ((("agents.core.orka.ai", "hello"), "child-ready"),
+                               (("agents.core.orka.ai", "coordinator"), "coordinator-ready")):
+            with self.subTest(assertion=assertion):
+                self.setup_native_composition()
+                agent = self.native_kubectl.responses[key]
+                agent["metadata"]["generation"] = 2
+                agent["status"] = {"conditions": [{"type": "Ready", "status": "True", "observedGeneration": 1}]}
+                summary = self.run_native_lifecycle("deploy")
+                self.assertEqual(summary["verdict"], "fail")
+                self.assertEqual(self.native_receipt("deploy")["assertions"][assertion]["verdict"], "fail")
+
+    def test_native_lifecycle_compares_exact_authored_specs_and_namespace_for_both_agents(self):
+        cases = (
+            (("agents.core.orka.ai", "hello"), "child-matches-restored",
+             lambda agent: agent["spec"].update({"extra": True})),
+            (("agents.core.orka.ai", "coordinator"), "coordinator-matches-restored",
+             lambda agent: agent["metadata"].__setitem__("namespace", "other")),
+        )
+        for key, assertion, mutate in cases:
+            with self.subTest(assertion=assertion):
+                self.setup_native_composition()
+                mutate(self.native_kubectl.responses[key])
+                summary = self.run_native_lifecycle("rollback")
+                self.assertEqual(summary["verdict"], "fail")
+                self.assertEqual(self.native_receipt("rollback")["assertions"][assertion]["verdict"], "fail")
+
+    def test_native_rollback_applies_nothing_writes_external_readbacks_and_uses_fixed_assertions(self):
+        self.setup_native_composition()
+        summary = self.run_native_lifecycle("rollback")
+        self.assertEqual(summary["verdict"], "pass")
+        self.assertNotIn("apply", self.native_kubectl.verbs())
+        receipt = self.native_receipt("rollback")
+        self.assertEqual(agentctl.validate_lifecycle_receipt(receipt, "rollback"), [])
+        self.assertEqual(set(receipt["assertions"]),
+                         {"child-matches-restored", "child-ready",
+                          "coordinator-matches-restored", "coordinator-ready"})
+        self.assertEqual(receipt["limitations"], list(agentctl.NATIVE_COMPOSITION_ROLLBACK_LIMITATIONS))
+        self.assertEqual({path.name for path in self.native_evidence.iterdir()},
+                         {"child-bundle.yaml", "coordinator-bundle.yaml",
+                          "child-agent-readback.json", "coordinator-agent-readback.json"})
+        self.assertEqual(json.loads((self.native_evidence / "child-agent-readback.json").read_text(encoding="utf-8"))
+                         ["metadata"]["uid"], "hello-agent-uid")
+        self.assertEqual(json.loads((self.native_evidence / "coordinator-agent-readback.json").read_text(
+            encoding="utf-8"))["metadata"]["uid"], "coordinator-agent-uid")
+        self.assertFalse(list(self.coordinator.rglob("child-agent-readback.json")))
 
 
 if __name__ == "__main__":

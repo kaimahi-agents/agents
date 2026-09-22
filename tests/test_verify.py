@@ -47,6 +47,31 @@ COMPOSED_CASES = (
                     "parent-result-reported-refusal", "stayed-within-limits"],
      "limits": {"provider_requests": 10, "tool_calls": 1, "child_tasks": 0, "retries": 0}},
 )
+NATIVE_DEPLOY_ASSERTIONS = (
+    "child-matches-rendered", "child-ready", "coordinator-matches-rendered", "coordinator-ready",
+)
+NATIVE_ROLLBACK_ASSERTIONS = (
+    "child-matches-restored", "child-ready", "coordinator-matches-restored", "coordinator-ready",
+)
+
+
+def native_lifecycle_receipt(kind: str, coordinator_digest: str, child_digest: str, **overrides) -> dict:
+    assertion_ids = NATIVE_DEPLOY_ASSERTIONS if kind == "deploy" else NATIVE_ROLLBACK_ASSERTIONS
+    receipt = {
+        "schema_version": agentctl.NATIVE_COMPOSITION_LIFECYCLE_RECEIPT_SCHEMA_VERSION,
+        "kind": kind,
+        "coordinator_digest": coordinator_digest,
+        "child_digest": child_digest,
+        "date": "2026-09-17",
+        "namespace": "trial-namespace",
+        "verdict": "pass",
+        "assertions": {name: {"verdict": "pass", "evidence_completeness": True, "note": "n"}
+                        for name in assertion_ids},
+    }
+    if kind == "rollback":
+        receipt["limitations"] = list(agentctl.NATIVE_COMPOSITION_ROLLBACK_LIMITATIONS)
+    receipt.update(overrides)
+    return receipt
 
 
 class VerifyAgentTestCase(unittest.TestCase):
@@ -165,6 +190,70 @@ class VerifyAgentTestCase(unittest.TestCase):
         self.assertEqual(agentctl.validate_lifecycle_receipt(receipt, "deploy"), [])
         receipt["assertions"]["agent-identity-readback"]["note"] += " changed"
         self.assertTrue(agentctl.validate_lifecycle_receipt(receipt, "deploy"))
+
+    def test_native_lifecycle_receipts_are_validated_by_the_gate(self):
+        (self.root / "agents").mkdir(exist_ok=True)
+        hello = write_native_agent(self.root / "agents" / "hello", namespace="trial-namespace",
+                                   agent_name="hello", provider_name="hello")
+        pins = {environment: agentctl.render_agent(
+            hello, environment, self.root / f"hello-{environment}.json")["bundle_digest"]
+                for environment in agentctl.ALLOWED_ENVIRONMENTS}
+        coordinator = write_native_coordinator(
+            self.root / "agents" / "coordinator", namespace="trial-namespace",
+            catalogue_agents={"hello": pins},
+        )
+        bad = coordinator / "lifecycle" / "receipts" / ("a" * 64) / "deploy.json"
+        write_json(bad, {"kind": "deploy", "coordinator_digest": "a" * 64, "child_digest": "b" * 64})
+        errors = agentctl.verify_agent(coordinator, "trial")
+        self.assertTrue(any("lifecycle receipt #" in error for error in errors))
+        self.assertTrue(any("fixed public-safe set" in error for error in errors))
+
+    def test_native_receipt_schema_rejects_a_malformed_child_digest(self):
+        errors = agentctl.validate_lifecycle_receipt(
+            native_lifecycle_receipt("deploy", "c" * 64, "short"), "deploy")
+        self.assertTrue(any("child_digest" in error for error in errors))
+
+    def test_native_historical_deploy_receipt_stays_valid_after_source_rollback(self):
+        (self.root / "agents").mkdir(exist_ok=True)
+        original_child_prompt = "Reply briefly and in plain text."
+        original_coordinator_prompt = "Delegate to exactly one allowed catalogue agent when needed."
+        updated_child_prompt = "Reply exactly with the updated greeting."
+        updated_coordinator_prompt = "Delegate to hello and report the updated greeting."
+        hello = write_native_agent(self.root / "agents" / "hello", namespace="trial-namespace",
+                                   agent_name="hello", provider_name="hello", prompt=original_child_prompt)
+        original_pins = {environment: agentctl.render_agent(
+            hello, environment, self.root / f"hello-original-{environment}.json")["bundle_digest"]
+                for environment in agentctl.ALLOWED_ENVIRONMENTS}
+        coordinator = write_native_coordinator(
+            self.root / "agents" / "coordinator", namespace="trial-namespace",
+            catalogue_agents={"hello": original_pins}, prompt=original_coordinator_prompt,
+        )
+        original_digest = agentctl.render_agent(
+            coordinator, "trial", self.root / "coordinator-original.json")["bundle_digest"]
+
+        write_native_agent(self.root / "agents" / "hello", namespace="trial-namespace",
+                           agent_name="hello", provider_name="hello", prompt=updated_child_prompt)
+        updated_pins = {environment: agentctl.render_agent(
+            hello, environment, self.root / f"hello-updated-{environment}.json")["bundle_digest"]
+                for environment in agentctl.ALLOWED_ENVIRONMENTS}
+        write_native_coordinator(
+            self.root / "agents" / "coordinator", namespace="trial-namespace",
+            catalogue_agents={"hello": updated_pins}, prompt=updated_coordinator_prompt,
+        )
+        updated_digest = agentctl.render_agent(
+            coordinator, "trial", self.root / "coordinator-updated.json")["bundle_digest"]
+
+        write_native_agent(self.root / "agents" / "hello", namespace="trial-namespace",
+                           agent_name="hello", provider_name="hello", prompt=original_child_prompt)
+        write_native_coordinator(
+            self.root / "agents" / "coordinator", namespace="trial-namespace",
+            catalogue_agents={"hello": original_pins}, prompt=original_coordinator_prompt,
+        )
+        write_json(coordinator / "lifecycle" / "receipts" / updated_digest / "deploy.json",
+                   native_lifecycle_receipt("deploy", updated_digest, updated_pins["trial"]))
+        write_json(coordinator / "lifecycle" / "receipts" / original_digest / "rollback.json",
+                   native_lifecycle_receipt("rollback", original_digest, original_pins["trial"]))
+        self.assertEqual(agentctl.verify_agent(coordinator, "trial"), [])
 
     def _write_policy_case(self, assertions):
         """Rewrite acceptance.md/policy file for a `missing-toolchain-v2` case and re-render, since
