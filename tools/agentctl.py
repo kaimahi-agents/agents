@@ -454,14 +454,34 @@ class CatalogueGraph:
     reverse: dict[str, tuple[str, ...]]
 
 
+def _tracked_safe_agent_dir_names(root: Path) -> list[str] | None:
+    """Tracked safe slugs under agents/ when root is a git work tree; otherwise None."""
+    try:
+        inside = subprocess.run(["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
+                                capture_output=True)
+    except OSError:
+        return None
+    if inside.returncode != 0:
+        return None
+    listed = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--cached", "--", "agents/"],
+                            capture_output=True)
+    if listed.returncode != 0:
+        raise CliError("git agent discovery failed inside a git working tree")
+    slugs = {parts[1] for entry in listed.stdout.split(b"\0") if entry
+             for parts in [Path(entry.decode("utf-8", errors="surrogateescape")).parts]
+             if len(parts) >= 2 and parts[0] == "agents" and is_safe_slug(parts[1])}
+    return sorted(slugs)
+
+
 def _iter_safe_agent_dirs(root: Path) -> list[Path]:
     agents_root = Path(root) / "agents"
     if not agents_root.is_dir():
         raise CliError("repository root must contain agents/")
+    tracked = _tracked_safe_agent_dir_names(root)
     try:
-        return sorted([path for path in agents_root.iterdir()
-                       if path.is_dir() and not path.is_symlink() and is_safe_slug(path.name)],
-                      key=lambda path: path.name)
+        paths = ([(agents_root / name) for name in tracked] if tracked is not None else
+                 [path for path in agents_root.iterdir() if is_safe_slug(path.name)])
+        return sorted([path for path in paths if path.is_dir() and not path.is_symlink()], key=lambda path: path.name)
     except OSError as exc:
         raise CliError("could not inspect agents/") from exc
 

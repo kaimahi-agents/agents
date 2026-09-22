@@ -58,6 +58,20 @@ class CatalogueGraphTestCase(unittest.TestCase):
         self.root = Path(self.tmp.name)
         (self.root / "agents").mkdir()
 
+    def init_git_repo(self):
+        for command in (
+            ["git", "init"],
+            ["git", "config", "user.name", "Test User"],
+            ["git", "config", "user.email", "test@example.com"],
+        ):
+            completed = subprocess.run(command, cwd=self.root, capture_output=True, text=True)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def commit_all(self, message="test commit"):
+        for command in (["git", "add", "."], ["git", "commit", "-m", message]):
+            completed = subprocess.run(command, cwd=self.root, capture_output=True, text=True)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def write_native(self, slug, *, agent_name="hello") -> Path:
         return write_native_agent(self.root / "agents" / slug, namespace="orka-system",
                                   agent_name=agent_name, provider_name=agent_name)
@@ -142,6 +156,18 @@ class CatalogueGraphTestCase(unittest.TestCase):
         self.write_coordinator(catalogue_agents={"hello": {"trial": "a" * 64}})
         with self.assertRaises(agentctl.CliError):
             agentctl.load_catalogue_graph(self.root)
+
+    def test_ignored_and_untracked_safe_agent_dirs_do_not_affect_the_graph(self):
+        self.init_git_repo()
+        self.write_native("hello")
+        self.write_coordinator(catalogue_agents={"hello": {"trial": "a" * 64, "production": "b" * 64}})
+        (self.root / ".gitignore").write_text("agents/ignored/\n", encoding="utf-8")
+        self.commit_all("baseline")
+        for slug in ("ignored", "untracked"):
+            with self.subTest(slug=slug):
+                write_native_agent(self.root / "agents" / slug, agent_name="hello", provider_name="hello")
+                self.assertEqual(agentctl.expand_changed_agent_dirs(
+                    self.root, ["agents/hello/resources/agent.yaml"]), ["coordinator", "hello"])
 
 
 class DiscoverCliTestCase(unittest.TestCase):
