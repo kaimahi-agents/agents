@@ -1006,8 +1006,13 @@ def find_redacted_sequences(events, marker: str = REDACTION_MARKER) -> list[int]
 def is_provider_request_row(row) -> bool:
     """True only for a genuine provider request: a `POST` to `/v1/messages`, never a probe row."""
     return isinstance(row, dict) and row.get("method") == "POST" and row.get("path") == "/v1/messages"
-def parse_provider_log(raw_text: str) -> list[dict]:
-    """Parse a complete JSON array or JSON-lines log; malformed input is never partially counted."""
+_COMPOSED_PROVIDER_PATHS = frozenset({"/v1/responses", "/v1/chat/completions"})
+def is_composed_provider_request_row(row) -> bool:
+    """The composed evaluator counts both approved POST routes regardless of outcome."""
+    return isinstance(row, dict) and row.get("method") == "POST" and row.get("path") in _COMPOSED_PROVIDER_PATHS
+
+def _parse_provider_log_rows(raw_text: str) -> list[dict]:
+    """Parse the raw provider log without applying any policy-specific route filter."""
     stripped, rows = raw_text.strip(), []
     if stripped.startswith("["):
         try:
@@ -1025,7 +1030,15 @@ def parse_provider_log(raw_text: str) -> list[dict]:
                 rows.append(json.loads(line))
             except ValueError as exc:
                 raise CliError("provider log contains malformed JSON lines") from exc
-    return [row for row in rows if is_provider_request_row(row)]
+    return rows
+
+def parse_provider_log(raw_text: str) -> list[dict]:
+    """Parse a complete JSON array or JSON-lines log; malformed input is never partially counted."""
+    return [row for row in _parse_provider_log_rows(raw_text) if is_provider_request_row(row)]
+
+def parse_provider_log_for_composed_coordination(raw_text: str) -> list[dict]:
+    """Parse provider rows for composed coordination, counting only the two approved POST routes."""
+    return [row for row in _parse_provider_log_rows(raw_text) if is_composed_provider_request_row(row)]
 def count_provider_requests_in_window(records, window_start, window_end, *, key: str = "time") -> int:
     """Count records inside the caller-supplied inclusive window. This is the authoritative count:
     it never infers a window from Task timestamps nor substitutes a journal-derived tally."""
@@ -1035,6 +1048,110 @@ def count_provider_requests_in_window(records, window_start, window_end, *, key:
         if not isinstance(record, dict) or key not in record:
             raise CliError(f"provider record is missing required {key!r} field")
     return sum(1 for record in records if window_start <= parse_timestamp(record[key]) <= window_end)
+_CAMPAIGN_LEDGER_FILE = "campaign-ledger.json"
+_CAMPAIGN_LEDGER_KEYS = frozenset({"entries"})
+_CAMPAIGN_LEDGER_ENTRY_KEYS = frozenset({"case", "attempt", "parent_count", "child_count", "probe_count",
+                                         "cumulative_total"})
+_MAX_CAMPAIGN_TASKS = 10
+
+def _campaign_ledger_path(evidence_root) -> Path:
+    return Path(evidence_root) / _CAMPAIGN_LEDGER_FILE
+
+def _campaign_entry_total(entry) -> int:
+    return entry["parent_count"] + entry["child_count"] + entry["probe_count"]
+
+def _validate_campaign_ledger(ledger) -> list[str]:
+    if not isinstance(ledger, dict) or set(ledger) != _CAMPAIGN_LEDGER_KEYS:
+        return ["campaign ledger must be a JSON object with exactly an entries array"]
+    entries = ledger.get("entries")
+    if not isinstance(entries, list):
+        return ["campaign ledger entries must be an array"]
+    errors, attempts, cumulative = [], {}, 0
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict) or set(entry) != _CAMPAIGN_LEDGER_ENTRY_KEYS:
+            errors.append(f"campaign ledger entry #{index} has the wrong shape")
+            continue
+        case, attempt = entry.get("case"), entry.get("attempt")
+        counts = (entry.get("parent_count"), entry.get("child_count"), entry.get("probe_count"),
+                  entry.get("cumulative_total"))
+        if not is_safe_slug(case):
+            errors.append(f"campaign ledger entry #{index} has an invalid case")
+            continue
+        if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+            errors.append(f"campaign ledger entry #{index} has an invalid attempt")
+            continue
+        if not all(_is_count(value) for value in counts):
+            errors.append(f"campaign ledger entry #{index} has invalid counts")
+            continue
+        expected_attempt = attempts.get(case, 0) + 1
+        if attempt != expected_attempt:
+            errors.append(f"campaign ledger entry #{index} has a non-contiguous attempt number")
+            continue
+        cumulative += _campaign_entry_total(entry)
+        if entry["cumulative_total"] != cumulative:
+            errors.append(f"campaign ledger entry #{index} has a mismatched cumulative total")
+            continue
+        attempts[case] = attempt
+    if not errors and cumulative > _MAX_CAMPAIGN_TASKS:
+        errors.append("campaign ledger exceeds the ten-Task campaign cap")
+    return errors
+
+def _write_json_atomic(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix=path.name + ".", suffix=".tmp",
+                                     delete=False) as handle:
+        handle.write(_json_text(data))
+        temp_name = handle.name
+    os.replace(temp_name, path)
+
+def _load_campaign_ledger(evidence_root) -> dict:
+    path = _campaign_ledger_path(evidence_root)
+    if not path.exists():
+        return {"entries": []}
+    ledger = _read_json(path, _CAMPAIGN_LEDGER_FILE)
+    _require(_validate_campaign_ledger(ledger))
+    return ledger
+
+def reserve_campaign_entry(evidence_root, case_id: str, *, parent_count: int, child_count: int, probe_count: int) -> dict:
+    """Reserve projected campaign consumption before submission, failing closed above the hard cap."""
+    if not is_safe_slug(case_id):
+        raise CliError(f"case_id must be a safe slug ({SAFE_SLUG_CONTRACT})")
+    counts = {"parent_count": parent_count, "child_count": child_count, "probe_count": probe_count}
+    if not all(_is_count(value) for value in counts.values()):
+        raise CliError("campaign ledger counts must be non-negative integers")
+    ledger = _load_campaign_ledger(evidence_root)
+    attempt = 1 + max((entry["attempt"] for entry in ledger["entries"] if entry["case"] == case_id), default=0)
+    cumulative = (ledger["entries"][-1]["cumulative_total"] if ledger["entries"] else 0) + sum(counts.values())
+    if cumulative > _MAX_CAMPAIGN_TASKS:
+        raise CliError("campaign ledger would exceed the ten-Task campaign cap")
+    entry = {"case": case_id, "attempt": attempt, **counts, "cumulative_total": cumulative}
+    ledger["entries"].append(entry)
+    _write_json_atomic(_campaign_ledger_path(evidence_root), ledger)
+    return entry
+
+def reconcile_campaign_entry(evidence_root, case_id: str, attempt: int, *, parent_count: int, child_count: int,
+                             probe_count: int) -> dict:
+    """Replace one reserved entry with the actual consumed counts, never removing the attempt itself."""
+    counts = {"parent_count": parent_count, "child_count": child_count, "probe_count": probe_count}
+    if not is_safe_slug(case_id):
+        raise CliError(f"case_id must be a safe slug ({SAFE_SLUG_CONTRACT})")
+    if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+        raise CliError("campaign ledger attempt must be a positive integer")
+    if not all(_is_count(value) for value in counts.values()):
+        raise CliError("campaign ledger counts must be non-negative integers")
+    ledger = _load_campaign_ledger(evidence_root)
+    matched, cumulative = False, 0
+    for entry in ledger["entries"]:
+        if entry["case"] == case_id and entry["attempt"] == attempt:
+            entry.update(counts)
+            matched = True
+        cumulative += _campaign_entry_total(entry)
+        entry["cumulative_total"] = cumulative
+    if not matched:
+        raise CliError("campaign ledger entry was not found for reconciliation")
+    _require(_validate_campaign_ledger(ledger))
+    _write_json_atomic(_campaign_ledger_path(evidence_root), ledger)
+    return next(entry for entry in ledger["entries"] if entry["case"] == case_id and entry["attempt"] == attempt)
 def check_window_covers_task(window_start, window_end, task_start, task_end) -> list[str]:
     """Diagnostics; empty means the asserted window covers the Task exactly, with no tolerance."""
     if window_end < window_start:
@@ -1165,18 +1282,122 @@ def check_precise_report(events) -> dict:
     text = final["contentText"].lower()
     return settled(BLOCKER_PHRASE in text, "final report contained the exact blocker phrase"
                   if BLOCKER_PHRASE in text else "final report was missing the exact blocker phrase")
-def load_missing_toolchain_case(agent_dir, case_id: str, environment: str) -> dict:
-    """Bind case_id/environment to missing-toolchain-v2 in acceptance.md; refuse any other case."""
+def load_evaluation_case(agent_dir, case_id: str, environment: str) -> dict:
+    """Bind one case_id/environment pair to its closed acceptance entry."""
     text = _read_text(Path(agent_dir) / "eval" / "acceptance.md", "eval/acceptance.md")
     try:
         cases = parse_acceptance_cases(text)
     except BundleError as exc:
         raise CliError(f"eval/acceptance.md: {exc}") from exc
     case = next((c for c in cases if c["case_id"] == case_id and c["environment"] == environment), None)
-    if case is None or case.get("policy") != MISSING_TOOLCHAIN_POLICY:
+    if case is None:
+        raise CliError("case_id is not bound in eval/acceptance.md for this environment; refusing to evaluate")
+    return case
+
+def load_missing_toolchain_case(agent_dir, case_id: str, environment: str) -> dict:
+    """Bind case_id/environment to missing-toolchain-v2 in acceptance.md; refuse any other case."""
+    case = load_evaluation_case(agent_dir, case_id, environment)
+    if case.get("policy") != MISSING_TOOLCHAIN_POLICY:
         raise CliError(f"case_id is not bound to the {MISSING_TOOLCHAIN_POLICY!r} policy in eval/acceptance.md "
                        "for this environment; refusing to evaluate")
     return case
+
+def load_composed_coordination_case(agent_dir, case_id: str, environment: str) -> dict:
+    """Bind case_id/environment to composed-coordination-v1 in acceptance.md; refuse any other case."""
+    case = load_evaluation_case(agent_dir, case_id, environment)
+    if case.get("policy") != COMPOSED_COORDINATION_POLICY:
+        raise CliError(f"case_id is not bound to the {COMPOSED_COORDINATION_POLICY!r} policy in eval/acceptance.md "
+                       "for this environment; refusing to evaluate")
+    return case
+
+_DISABLE_COORDINATION_TOOL_INJECTION = "orka.ai/disable-coordination-tool-injection"
+_PARENT_TASK_LABEL = "orka.ai/parent-task"
+_PARENT_TASK_NAME_ANNOTATION = "orka.ai/parent-task-name"
+_DELEGATED_AGENT_LABEL = "orka.ai/delegated-agent"
+_EXPECTED_COMPOSED_CHILD = "hello"
+_FIXED_GREETING_CASE_ID = "fixed-greeting"
+
+def get_task_result(base_url, task_name, namespace, *, token=None) -> str:
+    """Fetch one authenticated task result as plain text."""
+    query = urllib.parse.urlencode({"namespace": namespace})
+    try:
+        response = http_get_json(f"{base_url.rstrip('/')}/api/v1/tasks/"
+                                 f"{urllib.parse.quote(task_name, safe='')}/result?{query}", token=token)
+    except HttpError as exc:
+        raise CliError("could not retrieve the authenticated Task result") from exc
+    result = response.get("result") if isinstance(response, dict) else None
+    if not isinstance(result, str):
+        raise CliError("authenticated Task result was missing a result string")
+    return result
+
+def load_fixed_greeting_expected_answer(agent_dir) -> str:
+    """Read the current child fixed-phrase contract from hello's case file."""
+    case = _read_json(Path(agent_dir) / "eval" / "cases" / f"{_FIXED_GREETING_CASE_ID}.yaml",
+                      "eval/cases/fixed-greeting.yaml")
+    answer = case.get("expected_answer") if isinstance(case, dict) else None
+    if not isinstance(answer, str) or not answer:
+        raise CliError("eval/cases/fixed-greeting.yaml must define a non-empty expected_answer")
+    return answer
+
+def task_controller_owner_uid(task) -> str | None:
+    metadata = task.get("metadata") if isinstance(task, dict) else None
+    owners = metadata.get("ownerReferences") if isinstance(metadata, dict) else None
+    if not isinstance(owners, list):
+        return None
+    matches = [owner.get("uid") for owner in owners if isinstance(owner, dict)
+               and owner.get("controller") is True and isinstance(owner.get("uid"), str) and owner.get("uid")]
+    return matches[0] if len(matches) == 1 else None
+
+def genuine_child_tasks(tasks, parent_name: str, parent_uid: str) -> list[dict]:
+    """Child identity is the parent label plus exact-name annotation plus controller owner UID."""
+    matched = []
+    for task in tasks:
+        metadata = task.get("metadata") if isinstance(task, dict) else None
+        labels = metadata.get("labels") if isinstance(metadata, dict) and isinstance(metadata.get("labels"), dict) else {}
+        annotations = (metadata.get("annotations") if isinstance(metadata, dict)
+                       and isinstance(metadata.get("annotations"), dict) else {})
+        if (labels.get(_PARENT_TASK_LABEL) == parent_name
+                and annotations.get(_PARENT_TASK_NAME_ANNOTATION) == parent_name
+                and task_controller_owner_uid(task) == parent_uid):
+            matched.append(task)
+    return matched
+
+def tool_name_from_event(event) -> str | None:
+    name = event.get("toolName") if isinstance(event, dict) else None
+    if isinstance(name, str) and name:
+        return name
+    tool = event.get("tool") if isinstance(event, dict) else None
+    name = tool.get("name") if isinstance(tool, dict) else None
+    return name if isinstance(name, str) and name else None
+
+def tool_arguments_from_event(event) -> dict | None:
+    if not isinstance(event, dict):
+        return None
+    tool = event.get("tool")
+    if isinstance(tool, dict):
+        for key in ("arguments", "input", "args"):
+            args = tool.get(key)
+            if isinstance(args, dict):
+                return args
+    for holder in (event, event.get("content") if isinstance(event.get("content"), dict) else None):
+        if isinstance(holder, dict):
+            for key in ("arguments", "input", "args"):
+                args = holder.get(key)
+                if isinstance(args, dict):
+                    return args
+    return None
+
+def tool_events_by_call_id(events) -> tuple[dict[str, list[dict]], dict[str, list[dict]]]:
+    started, terminal = {}, {}
+    for event in events:
+        if not isinstance(event, dict) or event.get("type") not in TOOL_CALL_EVENT_TYPES:
+            continue
+        tool_call_id = event.get("toolCallID")
+        if not isinstance(tool_call_id, str) or not tool_call_id:
+            continue
+        bucket = started if event.get("type") == _TOOL_CALL_STARTED_TYPE else terminal
+        bucket.setdefault(tool_call_id, []).append(event)
+    return started, terminal
 
 # --- CLI entry points -----------------------------------------------------------------------
 def _guard(name: str, run, argv) -> int:
@@ -1201,9 +1422,12 @@ def _render(agent_dir, environment, output: Path) -> dict:
 def _render_checked(args, output: Path) -> tuple[dict, dict]:
     """Render, then refuse to touch the cluster unless the bundle's namespace agrees with the
     explicit `--namespace` selector."""
-    result = _render(args.agent_dir, args.environment, output)
+    return _render_bundle_checked(args.agent_dir, args.environment, args.namespace, output)
+
+def _render_bundle_checked(agent_dir, environment: str, namespace: str, output: Path) -> tuple[dict, dict]:
+    result = _render(agent_dir, environment, output)
     rendered = json.loads(output.read_text(encoding="utf-8"))
-    _require(check_rendered_namespace(rendered, args.namespace))
+    _require(check_rendered_namespace(rendered, namespace))
     return result, rendered
 def _agent_parser(prog: str, description: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog=prog, description=description)
@@ -1550,42 +1774,28 @@ def _lifecycle_cli(kind: str, argv) -> int:
     sys.stdout.write(_json_text({"bundle_digest": bundle_digest, "kind": kind, "verdict": receipt["verdict"]}))
     return 0
 
-def _eval_cli(argv) -> int:
-    """`tools/eval`: submit exactly one Task (`create`, never `apply`, only when no other Task is
-    non-terminal and zero retries are declared), page the full journal, count authoritative
-    provider requests inside the asserted window, and write raw evidence outside Git plus a
-    receipt inside it. The verdict is five mechanical assertions, never an operator verdict;
-    `tool_calls` is informational only. `--case-id` must be bound, in `--environment`, to
-    `missing-toolchain-v2` in `eval/acceptance.md`, whose limits are the only source of bounds."""
-    parser = argparse.ArgumentParser(prog="tools/eval", description="Submit one Task, page its journal, count "
-                                     "authoritative provider requests and write an evaluation receipt.")
-    _add_cluster_arguments(parser)
-    parser.add_argument("--case-id", required=True, help="eval/cases/<case-id>.yaml identifier")
-    parser.add_argument("--model", required=True, help="model name recorded on the receipt")
-    parser.add_argument("--journal-base-url", required=True, help="base URL for the Task event-journal API")
-    for flag in ("--window-start", "--window-end"):
-        parser.add_argument(flag, required=True, help="ISO-8601 bound of the asserted capture window")
-    for flag in ("--task-manifest", "--journal-token-file", "--provider-log"):
-        parser.add_argument(flag, required=True, type=Path)
-    parser.add_argument("--source", default="live", choices=sorted(_SOURCES))
-    parser.add_argument("--max-poll-attempts", type=int, default=60)
-    parser.add_argument("--poll-interval-seconds", type=float, default=5.0)
-    args = parser.parse_args(argv)
+def _prepare_eval_inputs(args) -> dict:
     if not is_safe_slug(args.case_id):
         raise CliError(f"case_id must be a safe slug ({SAFE_SLUG_CONTRACT})")
     if not _is_date(args.date):
         raise CliError("date must use a real YYYY-MM-DD calendar date")
-    limits = load_missing_toolchain_case(args.agent_dir, args.case_id, args.environment)["limits"]
-
     evidence_dir = Path(args.evidence_root) / args.case_id
-    bundle_digest = _render_checked(args, evidence_dir / "bundle.yaml")[0]["bundle_digest"]
     journal_token = _read_text(args.journal_token_file, "--journal-token-file").strip()
     if not journal_token:
         raise CliError("--journal-token-file must contain a non-empty token")
     task_manifest = _read_json(args.task_manifest, "--task-manifest")
     task_name = task_manifest.get("metadata", {}).get("name") if isinstance(task_manifest, dict) else None
-    if not task_name:
+    if not isinstance(task_name, str) or not task_name:
         raise CliError("Task manifest is missing metadata.name")
+    return {"evidence_dir": evidence_dir, "journal_token": journal_token,
+            "task_manifest": task_manifest, "task_name": task_name}
+
+def _eval_missing_toolchain(args, case: dict) -> tuple[dict, dict]:
+    prepared = _prepare_eval_inputs(args)
+    limits, evidence_dir = case["limits"], prepared["evidence_dir"]
+    bundle_digest = _render_checked(args, evidence_dir / "bundle.yaml")[0]["bundle_digest"]
+    journal_token, task_manifest, task_name = (prepared["journal_token"], prepared["task_manifest"],
+                                               prepared["task_name"])
     _require(check_zero_retries(task_manifest))
     inventory = run_kubectl_json(args.context, args.kubeconfig, ["get", "tasks.core.orka.ai", "-A"])
     _require(check_single_task_reservation(
@@ -1616,7 +1826,6 @@ def _eval_cli(argv) -> int:
         window_errors = ["terminal Task status is missing valid start/completion timestamps"]
     count = count_provider_requests_in_window(records := parse_provider_log(
         _read_text(args.provider_log, "--provider-log")), *window)
-    # A zero count is treated as a provider-log schema mismatch, never a genuine zero-request Task.
     established = not window_errors and count > 0
     total_calls, redacted_calls = count_tool_calls(events)
     assertions = {
@@ -1642,10 +1851,346 @@ def _eval_cli(argv) -> int:
                    ("task-manifest.json", task_manifest), ("terminal-task.json", terminal_task),
                    ("journal-events.json", {"events": events, "latestSeq": latest_seq}),
                    ("provider-records.json", records))]}
+    return {"bundle_digest": bundle_digest, "case_id": args.case_id,
+            "verdict": receipt["verdict"], "request_count": receipt["request_count"]}, receipt
+
+def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict]:
+    prepared = _prepare_eval_inputs(args)
+    evidence_dir, journal_token = prepared["evidence_dir"], prepared["journal_token"]
+    task_manifest, task_name, limits = prepared["task_manifest"], prepared["task_name"], case["limits"]
+    _require(check_zero_retries(task_manifest))
+    metadata = task_manifest.get("metadata") if isinstance(task_manifest, dict) else None
+    annotations = metadata.get("annotations") if isinstance(metadata, dict) else None
+    if not isinstance(annotations, dict) or annotations.get(_DISABLE_COORDINATION_TOOL_INJECTION) != "true":
+        raise CliError("Task manifest must set orka.ai/disable-coordination-tool-injection to 'true'")
+    coordinator_dir = Path(args.agent_dir)
+    graph = load_catalogue_graph(coordinator_dir.parent.parent)
+    lock = _parse_catalogue_lock(coordinator_dir / "dependencies.lock.yaml")
+    if set(lock) != {_EXPECTED_COMPOSED_CHILD}:
+        raise CliError("composed coordination evaluation requires exactly the pinned hello child")
+    child_slug = graph.name_to_dir.get(_EXPECTED_COMPOSED_CHILD)
+    if child_slug is None:
+        raise CliError("the pinned hello child could not be resolved in the catalogue")
+    child_dir = coordinator_dir.parent.parent / "agents" / child_slug
+    expected_phrase = load_fixed_greeting_expected_answer(child_dir)
+    reserved = reserve_campaign_entry(args.evidence_root, args.case_id, parent_count=1,
+                                      child_count=limits["child_tasks"], probe_count=0)
+    child_render_result, child_rendered = _render_bundle_checked(child_dir, args.environment, args.namespace,
+                                                                 evidence_dir / "hello-bundle.yaml")
+    coordinator_render_result, coordinator_rendered = _render_checked(args, evidence_dir / "bundle.yaml")
+    bundle_digest = coordinator_render_result["bundle_digest"]
+    child_agent_item = next((item for item in child_rendered.get("items", [])
+                             if isinstance(item, dict) and item.get("kind") == "Agent"), None)
+    coordinator_agent_item = next((item for item in coordinator_rendered.get("items", [])
+                                   if isinstance(item, dict) and item.get("kind") == "Agent"), None)
+    if child_agent_item is None or coordinator_agent_item is None:
+        raise CliError("rendered bundle is missing the expected Agent resource")
+    child_agent_name = (child_agent_item.get("metadata") or {}).get("name")
+    coordinator_agent_name = (coordinator_agent_item.get("metadata") or {}).get("name")
+    if not all(isinstance(name, str) and name for name in (child_agent_name, coordinator_agent_name)):
+        raise CliError("rendered Agent resources are missing metadata.name")
+
+    def apply_bundle(path: Path) -> None:
+        applied = run_kubectl(args.context, args.kubeconfig, ["apply", "-n", args.namespace, "-f", str(path)])
+        if applied.returncode != 0:
+            raise CliError(f"bundle apply failed (kubectl exited {applied.returncode})")
+
+    def get_task(name):
+        return run_kubectl_json(args.context, args.kubeconfig, ["get", "task", name, "-n", args.namespace])
+
+    def get_agent(name):
+        return run_kubectl_json(args.context, args.kubeconfig, ["get", "agents.core.orka.ai", name, "-n", args.namespace])
+
+    apply_bundle(evidence_dir / "hello-bundle.yaml")
+    apply_bundle(evidence_dir / "bundle.yaml")
+    child_live = wait_for_current_agent_readback(
+        lambda: get_agent(child_agent_name), max_attempts=args.max_poll_attempts,
+        poll_interval_seconds=args.poll_interval_seconds)
+    coordinator_live = wait_for_current_agent_readback(
+        lambda: get_agent(coordinator_agent_name), max_attempts=args.max_poll_attempts,
+        poll_interval_seconds=args.poll_interval_seconds)
+    inventory = run_kubectl_json(args.context, args.kubeconfig, ["get", "tasks.core.orka.ai", "-A"])
+    _require(check_single_task_reservation(
+        [{"name": item.get("metadata", {}).get("name"),
+          "namespace": item.get("metadata", {}).get("namespace"),
+          "phase": item.get("status", {}).get("phase")}
+         for item in inventory.get("items", []) if isinstance(item, dict)], task_name, args.namespace))
+    submit = run_kubectl(args.context, args.kubeconfig, ["create", "-n", args.namespace, "-f", "-"],
+                         input=json.dumps(task_manifest))
+    if submit.returncode != 0:
+        raise CliError(f"Task submission failed (kubectl exited {submit.returncode})")
+
+    def live_agent_matches(live_obj, rendered_item):
+        if live_obj is None:
+            return None
+        metadata = live_obj.get("metadata") if isinstance(live_obj, dict) else None
+        return bool(isinstance(metadata, dict) and metadata.get("namespace") == args.namespace
+                    and live_obj.get("spec") == rendered_item.get("spec") and _agent_ready_readback(live_obj) is True)
+
+    def visible_event_text(event) -> str | None:
+        if not isinstance(event, dict) or find_redacted_sequences([event]):
+            return None
+        for holder in (event, event.get("content") if isinstance(event.get("content"), dict) else None):
+            if isinstance(holder, dict):
+                for key in ("contentText", "summary", "message", "text"):
+                    value = holder.get(key)
+                    if isinstance(value, str) and value:
+                        return value
+        return None
+
+    terminal_task = None
+    events, latest_seq = [], None
+    parent_result = None
+    raw_child_inventory, raw_child_items = None, None
+    child_terminal_tasks, child_results, evidence_sha256 = [], {}, []
+    try:
+        terminal_task = wait_for_terminal(
+            lambda: get_task(task_name), max_attempts=args.max_poll_attempts,
+            poll_interval_seconds=args.poll_interval_seconds)
+        try:
+            parent_result = get_task_result(args.journal_base_url, task_name, args.namespace, token=journal_token)
+        except CliError:
+            parent_result = None
+        try:
+            events, latest_seq = page_journal(args.journal_base_url, task_name, args.namespace, token=journal_token)
+        except HttpError as exc:
+            raise CliError("could not retrieve the complete event journal") from exc
+        raw_child_inventory = run_kubectl_json(
+            args.context, args.kubeconfig,
+            ["get", "tasks.core.orka.ai", "-n", args.namespace, "-l", f"{_PARENT_TASK_LABEL}={task_name}"])
+        raw_child_items = (raw_child_inventory.get("items")
+                           if isinstance(raw_child_inventory, dict) and isinstance(raw_child_inventory.get("items"), list)
+                           else None)
+        parent_uid = ((terminal_task.get("metadata") or {}).get("uid") if isinstance(terminal_task, dict) else None)
+        genuine_children = (genuine_child_tasks(raw_child_items or [], task_name, parent_uid)
+                            if isinstance(parent_uid, str) and raw_child_items is not None else [])
+        for child in genuine_children:
+            phase = (child.get("status") or {}).get("phase") if isinstance(child, dict) else None
+            child_name = (child.get("metadata") or {}).get("name") if isinstance(child, dict) else None
+            child_terminal = child if phase in TASK_TERMINAL_PHASES else wait_for_terminal(
+                lambda name=child_name: get_task(name), max_attempts=args.max_poll_attempts,
+                poll_interval_seconds=args.poll_interval_seconds)
+            child_terminal_tasks.append(child_terminal)
+            try:
+                child_results[child_name] = get_task_result(args.journal_base_url, child_name, args.namespace,
+                                                            token=journal_token)
+            except CliError:
+                pass
+        reconcile_campaign_entry(args.evidence_root, args.case_id, reserved["attempt"], parent_count=1,
+                                 child_count=len(genuine_children), probe_count=0)
+        completeness_errors = check_journal_completeness(events, latest_seq)
+        journal_complete = not completeness_errors
+        incomplete_journal_note = f"journal is incomplete: {'; '.join(completeness_errors)}"
+        window = (parse_timestamp(args.window_start), parse_timestamp(args.window_end))
+        try:
+            holders = [terminal_task, *child_terminal_tasks]
+            starts = [parse_timestamp(holder.get("status", {}).get("startTime")) for holder in holders]
+            ends = [parse_timestamp(holder.get("status", {}).get("completionTime")) for holder in holders]
+            window_errors = check_window_covers_task(window[0], window[1], min(starts), max(ends))
+        except CliError:
+            window_errors = ["Task status is missing valid start/completion timestamps"]
+        count = count_provider_requests_in_window(records := parse_provider_log_for_composed_coordination(
+            _read_text(args.provider_log, "--provider-log")), *window)
+        established = not window_errors and count > 0
+        total_calls, redacted_calls = count_tool_calls(events)
+        started_events = [event for event in events
+                          if isinstance(event, dict) and event.get("type") == _TOOL_CALL_STARTED_TYPE]
+        expected_tools = (("delegate_task", "wait_for_tasks") if args.case_id == "delegates"
+                          else ("delegate_task",))
+        started_by_id, terminal_by_id = tool_events_by_call_id(events)
+        started_names = [tool_name_from_event(event) for event in started_events]
+        delegate_started = [event for event in started_events if tool_name_from_event(event) == "delegate_task"]
+        wait_started = [event for event in started_events if tool_name_from_event(event) == "wait_for_tasks"]
+
+        def expected_call_assertion() -> dict:
+            if not journal_complete:
+                return not_evaluated(incomplete_journal_note)
+            if any(name is None for name in started_names):
+                return not_evaluated("a started tool call was missing its visible name")
+            required_counts = {name: 1 for name in expected_tools}
+            if any(started_names.count(name) != count_needed for name, count_needed in required_counts.items()):
+                return settled(False, "required delegation tool calls were not each started exactly once")
+            for event in [*delegate_started, *wait_started]:
+                tool_call_id = event.get("toolCallID")
+                if not isinstance(tool_call_id, str) or not tool_call_id:
+                    return not_evaluated("a delegation tool call was missing toolCallID")
+                if tool_arguments_from_event(event) is None:
+                    return not_evaluated("a delegation tool call was missing visible arguments")
+                if not terminal_by_id.get(tool_call_id):
+                    return settled(False, "a delegation tool call lacked a correlated terminal event")
+            note = ("delegate_task and wait_for_tasks each started once with correlated terminal events"
+                    if args.case_id == "delegates"
+                    else "delegate_task started once with a correlated terminal event")
+            return settled(True, note)
+
+        def no_unexpected_assertion() -> dict:
+            if not journal_complete:
+                return not_evaluated(incomplete_journal_note)
+            if any(name is None for name in started_names):
+                return not_evaluated("a started tool call was missing its visible name")
+            no_unexpected = all(name in expected_tools for name in started_names)
+            return settled(no_unexpected, "no unexpected tool call started" if no_unexpected
+                           else "an unexpected tool call started")
+
+        def attempted_unlisted_assertion() -> dict:
+            if not journal_complete:
+                return not_evaluated(incomplete_journal_note)
+            if len(delegate_started) != 1:
+                return settled(False, "the model did not make exactly one delegate_task call")
+            args_map = tool_arguments_from_event(delegate_started[0])
+            if args_map is None:
+                return not_evaluated("the delegate_task call arguments were redacted or omitted")
+            targeted = args_map.get("agent") == "not-allowed"
+            return settled(targeted, "delegate_task targeted the unlisted agent not-allowed" if targeted
+                           else "delegate_task did not target the fixed unlisted agent")
+
+        def worker_tool_refusal_assertion() -> dict:
+            if not journal_complete:
+                return not_evaluated(incomplete_journal_note)
+            if len(delegate_started) != 1:
+                return settled(False, "delegate_task was not the only started call")
+            tool_call_id = delegate_started[0].get("toolCallID")
+            terminal_events = terminal_by_id.get(tool_call_id, []) if isinstance(tool_call_id, str) else []
+            failed = [event for event in terminal_events if event.get("type") == "ToolCallFailed"]
+            if not failed:
+                return settled(False, "delegate_task did not fail before child creation")
+            if any(visible_event_text(event) is None for event in failed):
+                return not_evaluated("the refusal evidence was redacted or omitted")
+            return settled(True, "delegate_task was refused before any child Task was created")
+
+        retry_ok = (check_zero_retries(task_manifest) == [] and isinstance(terminal_task, dict)
+                    and terminal_task.get("status", {}).get("attempt", 1) in (None, 1)
+                    and all(check_zero_retries(child) == [] and child.get("status", {}).get("attempt", 1) in (None, 1)
+                            for child in child_terminal_tasks))
+        live_pinned_ready = (None if child_live is None or coordinator_live is None else
+                             live_agent_matches(child_live, child_agent_item)
+                             and live_agent_matches(coordinator_live, coordinator_agent_item))
+        parent_phase = (terminal_task.get("status") or {}).get("phase") if isinstance(terminal_task, dict) else None
+        parent_uid = ((terminal_task.get("metadata") or {}).get("uid") if isinstance(terminal_task, dict) else None)
+        child_inventory_known = raw_child_items is not None and isinstance(parent_uid, str)
+        assertions = {
+            "live-pinned-agents-ready": tri_state(
+                live_pinned_ready,
+                "the pinned hello and coordinator specs were live and Ready before submission",
+                "the pinned hello or coordinator spec was not live and Ready before submission",
+                "the pinned hello or coordinator readback could not be established"),
+            "parent-task-succeeded": settled(parent_phase == "Succeeded",
+                                               "the parent Task succeeded" if parent_phase == "Succeeded"
+                                               else "the parent Task did not succeed"),
+            "expected-delegation-tool-calls": expected_call_assertion(),
+            "no-unexpected-tool-calls": no_unexpected_assertion(),
+            "stayed-within-limits": ((lambda within: settled(
+                within,
+                "provider, child, tool, and retry counts stayed within limits" if within
+                else "provider, child, tool, or retry count exceeded limits"))(
+                    count <= limits["provider_requests"] and total_calls <= limits["tool_calls"]
+                    and len(genuine_children) <= limits["child_tasks"] and retry_ok)
+                if established and journal_complete and child_inventory_known else
+                not_evaluated("provider, child, tool, or retry bounds were not fully established")),
+        }
+        if args.case_id == "delegates":
+            child = child_terminal_tasks[0] if len(child_terminal_tasks) == 1 else None
+            child_name = ((child.get("metadata") or {}).get("name") if isinstance(child, dict) else None)
+            child_result = child_results.get(child_name) if isinstance(child_name, str) else None
+            child_targeted = None
+            if child is not None:
+                child_metadata = child.get("metadata") if isinstance(child, dict) else None
+                labels = child_metadata.get("labels") if isinstance(child_metadata, dict) and isinstance(child_metadata.get("labels"), dict) else {}
+                spec = child.get("spec") if isinstance(child, dict) else None
+                agent_ref = spec.get("agentRef") if isinstance(spec, dict) else None
+                child_targeted = (labels.get(_DELEGATED_AGENT_LABEL) == _EXPECTED_COMPOSED_CHILD
+                                  and isinstance(agent_ref, dict) and agent_ref.get("name") == _EXPECTED_COMPOSED_CHILD)
+            assertions |= {
+                "exactly-one-child-task": ((lambda exact: settled(
+                    exact, "exactly one genuine child Task was captured" if exact
+                    else "the genuine child Task count was not exactly one"))(len(genuine_children) == 1)
+                    if child_inventory_known else
+                    not_evaluated("genuine child Task identity could not be established")),
+                "child-targeted-hello": tri_state(child_targeted, "the genuine child targeted hello",
+                                                   "the genuine child did not target hello",
+                                                   "the genuine child targeting evidence was incomplete"),
+                "child-task-succeeded": tri_state(
+                    None if child is None else (child.get("status", {}).get("phase") == "Succeeded"),
+                    "the genuine child Task succeeded", "the genuine child Task did not succeed",
+                    "the genuine child Task terminal readback was incomplete"),
+                "child-result-contained-fixed-phrase": tri_state(
+                    None if child_result is None else expected_phrase in child_result,
+                    "the authenticated child result contained the fixed phrase",
+                    "the authenticated child result was missing the fixed phrase",
+                    "the authenticated child result could not be established"),
+                "parent-result-contained-fixed-phrase": tri_state(
+                    None if parent_result is None else expected_phrase in parent_result,
+                    "the authenticated parent result contained the fixed phrase",
+                    "the authenticated parent result was missing the fixed phrase",
+                    "the authenticated parent result could not be established"),
+            }
+        else:
+            lower = parent_result.lower() if isinstance(parent_result, str) else None
+            assertions |= {
+                "attempted-unlisted-delegation": attempted_unlisted_assertion(),
+                "worker-tool-pre-creation": worker_tool_refusal_assertion(),
+                "no-child-task-created": ((lambda none_created: settled(
+                    none_created, "no genuine child Task was created" if none_created
+                    else "a genuine child Task was created"))(len(genuine_children) == 0)
+                    if child_inventory_known else
+                    not_evaluated("genuine child Task identity could not be established")),
+                "parent-result-reported-refusal": tri_state(
+                    None if lower is None else ("refus" in lower and expected_phrase not in parent_result),
+                    "the authenticated parent result reported refusal without a fabricated child answer",
+                    "the authenticated parent result did not report refusal safely",
+                    "the authenticated parent result could not be established"),
+            }
+        evidence_sha256 = list(dict.fromkeys(
+            _write_json(evidence_dir / name, data) for name, data in (
+                ("task-manifest.json", task_manifest), ("terminal-task.json", terminal_task),
+                ("journal-events.json", {"events": events, "latestSeq": latest_seq}),
+                ("provider-records.json", records), ("hello-agent-readback.json", child_live),
+                ("coordinator-agent-readback.json", coordinator_live),
+                ("parent-result.json", {"result": parent_result}), ("child-inventory.json", raw_child_inventory),
+                ("child-tasks.json", {"items": child_terminal_tasks}), ("child-results.json", child_results))))
+        receipt = {"case_id": args.case_id, "bundle_digest": bundle_digest, "date": args.date,
+                   "source": args.source, "model": args.model,
+                   "request_count": count if established else None,
+                   "verdict": "pass" if all_assertions_pass_and_complete(assertions) else "fail",
+                   "assertions": assertions, "tool_calls": {"total": total_calls, "redacted": redacted_calls},
+                   "evidence_sha256": evidence_sha256}
+    finally:
+        if reserved:
+            run_kubectl(args.context, args.kubeconfig,
+                        ["delete", "task", task_name, "-n", args.namespace, "--ignore-not-found"])
+    return {"bundle_digest": bundle_digest, "case_id": args.case_id,
+            "verdict": receipt["verdict"], "request_count": receipt["request_count"]}, receipt
+
+def _eval_cli(argv) -> int:
+    """`tools/eval`: submit exactly one Task, dispatch to the case's closed policy mechanics,
+    write raw evidence outside Git, and write a public-safe receipt inside it."""
+    parser = argparse.ArgumentParser(prog="tools/eval", description="Submit one Task, page its journal, count "
+                                     "authoritative provider requests and write an evaluation receipt.")
+    _add_cluster_arguments(parser)
+    parser.add_argument("--case-id", required=True, help="eval/cases/<case-id>.yaml identifier")
+    parser.add_argument("--model", required=True, help="model name recorded on the receipt")
+    parser.add_argument("--journal-base-url", required=True, help="base URL for the Task event-journal API")
+    for flag in ("--window-start", "--window-end"):
+        parser.add_argument(flag, required=True, help="ISO-8601 bound of the asserted capture window")
+    for flag in ("--task-manifest", "--journal-token-file", "--provider-log"):
+        parser.add_argument(flag, required=True, type=Path)
+    parser.add_argument("--source", default="live", choices=sorted(_SOURCES))
+    parser.add_argument("--max-poll-attempts", type=int, default=60)
+    parser.add_argument("--poll-interval-seconds", type=float, default=5.0)
+    args = parser.parse_args(argv)
+    case = load_evaluation_case(args.agent_dir, args.case_id, args.environment)
+    policy = case.get("policy")
+    if policy == MISSING_TOOLCHAIN_POLICY:
+        summary, receipt = _eval_missing_toolchain(args, case)
+    elif policy == COMPOSED_COORDINATION_POLICY:
+        summary, receipt = _eval_composed_coordination(args, case)
+    else:
+        raise CliError(f"case_id is not bound to the {MISSING_TOOLCHAIN_POLICY!r} policy in eval/acceptance.md "
+                       "for this environment; refusing to evaluate")
     _require(validate_evaluation_receipt(receipt) + find_prohibited_in_document(receipt, "receipt"))
-    _write_json(Path(args.agent_dir) / "eval" / "receipts" / bundle_digest / f"{args.case_id}.json", receipt)
-    sys.stdout.write(_json_text({"bundle_digest": bundle_digest, "case_id": args.case_id,
-                                 "verdict": receipt["verdict"], "request_count": receipt["request_count"]}))
+    _write_json(Path(args.agent_dir) / "eval" / "receipts" / receipt["bundle_digest"] / f"{args.case_id}.json",
+                receipt)
+    sys.stdout.write(_json_text(summary))
     return 0
 def main_render(argv=None) -> int: return _guard("render", _render_cli, argv)
 def main_verify(argv=None) -> int: return _guard("verify", _verify_cli, argv)

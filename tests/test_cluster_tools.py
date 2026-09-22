@@ -18,7 +18,16 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tests.fixtures import RUNTIME_DIGEST, acceptance_block, missing_toolchain_case, write_agent, write_json  # noqa: E402
+from tests.fixtures import (  # noqa: E402
+    RUNTIME_DIGEST,
+    acceptance_block,
+    composed_case,
+    missing_toolchain_case,
+    write_agent,
+    write_json,
+    write_native_agent,
+    write_native_coordinator,
+)
 from tools import agentctl  # noqa: E402
 
 NAMESPACE = "trial-namespace"
@@ -43,11 +52,43 @@ TERMINAL_TASK = {"metadata": {"name": TASK_NAME}, "spec": READ_ONLY_SPEC,
                  "status": {"phase": "Succeeded", "startTime": "2026-09-17T10:00:00.123456789Z",
                             "completionTime": "2026-09-17T10:05:00Z",
                             "delivery": {"state": "ReadValidated", "outcome": "ReadValidated"}}}
+FIXED_PHRASE = "Hello world."
+DELEGATES_PROMPT = "Delegate to hello. Ask it to reply exactly: Hello world. Wait for the child and return its answer verbatim."
+REFUSAL_PROMPT = "Attempt to delegate to not-allowed. If Orka refuses, report that delegation was refused. Do not invent a child result."
 
 
 def provider_rows(count, minute="01"):
     return [{"time": f"2026-09-17T10:{minute}:0{index}Z", "method": "POST", "path": "/v1/messages"}
             for index in range(count)]
+
+
+def composed_provider_rows():
+    return [
+        {"time": "2026-09-17T10:00:30Z", "method": "POST", "path": "/v1/responses", "status": 400},
+        {"time": "2026-09-17T10:01:00Z", "method": "POST", "path": "/v1/chat/completions", "status": 200},
+        {"time": "2026-09-17T10:02:00Z", "method": "POST", "path": "/v1/chat/completions", "status": 200},
+    ]
+
+
+def native_terminal_task(name, *, uid, agent_name, prompt, phase="Succeeded", start="2026-09-17T10:00:00Z",
+                         completion="2026-09-17T10:05:00Z", attempt=1, parent_name=None, owner_uid=None,
+                         delegated_agent=None):
+    task = {
+        "metadata": {"name": name, "namespace": NAMESPACE, "uid": uid, "labels": {}, "annotations": {}},
+        "spec": {"type": "ai", "agentRef": {"name": agent_name}, "prompt": prompt,
+                 "retryPolicy": {"maxRetries": 0}},
+        "status": {"phase": phase, "startTime": start, "completionTime": completion, "attempt": attempt,
+                   "resultRef": {"available": True}},
+    }
+    if parent_name is not None:
+        task["metadata"]["labels"]["orka.ai/parent-task"] = parent_name
+        task["metadata"]["annotations"]["orka.ai/parent-task-name"] = parent_name
+        task["metadata"]["annotations"]["orka.ai/coordination-depth"] = "1"
+    if owner_uid is not None:
+        task["metadata"]["ownerReferences"] = [{"uid": owner_uid, "controller": True}]
+    if delegated_agent is not None:
+        task["metadata"]["labels"]["orka.ai/delegated-agent"] = delegated_agent
+    return task
 
 
 class FakeKubectl:
@@ -59,6 +100,8 @@ class FakeKubectl:
         self.calls = []
 
     def key(self, argv):
+        if not argv or argv[0] != "kubectl":
+            return (argv[0],) if argv else ("",)
         rest = argv[5:]
         if rest[0] == "get" and len(rest) > 2 and not rest[2].startswith("-"):
             return (rest[1], rest[2])
@@ -66,14 +109,18 @@ class FakeKubectl:
 
     def __call__(self, argv, **kwargs):
         self.calls.append((argv, kwargs))
+        if not argv or argv[0] != "kubectl":
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="not found")
         key = self.key(argv)
         if key in self.failures:
             return subprocess.CompletedProcess(argv, 1, stdout="", stderr="not found")
         payload = self.responses.get(key, {})
+        if callable(payload):
+            payload = payload(argv, kwargs)
         return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(payload), stderr="")
 
     def verbs(self):
-        return [argv[5] for argv, _ in self.calls]
+        return [argv[5] for argv, _ in self.calls if argv and argv[0] == "kubectl"]
 
 
 class ClusterPrimitivesTestCase(unittest.TestCase):
@@ -171,6 +218,57 @@ class EvaluationMechanicsTestCase(unittest.TestCase):
             {"time": "t", "method": "GET", "path": "/v1/messages"},
             {"time": "t", "method": "POST", "path": "/healthz"}]))
         self.assertEqual(len(rows), 1)
+
+    def test_composed_provider_rows_count_responses_and_chat_completions_only(self):
+        rows = agentctl.parse_provider_log_for_composed_coordination(json.dumps([
+            {"time": "2026-09-17T10:01:00Z", "method": "POST", "path": "/v1/responses", "status": 400},
+            {"time": "2026-09-17T10:01:01Z", "method": "POST", "path": "/v1/chat/completions",
+             "status": 200},
+            {"time": "2026-09-17T10:01:02Z", "method": "GET", "path": "/v1/responses", "status": 200},
+            {"time": "2026-09-17T10:01:03Z", "method": "POST", "path": "/v1/messages", "status": 200},
+            {"time": "2026-09-17T10:01:04Z", "method": "POST", "path": "/healthz", "status": 200},
+        ]))
+        self.assertEqual([row["path"] for row in rows], ["/v1/responses", "/v1/chat/completions"])
+
+    def test_campaign_ledger_reserves_reconciles_and_projects_retries(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            first = agentctl.reserve_campaign_entry(root, "delegates", parent_count=1, child_count=1, probe_count=0)
+            self.assertEqual(first, {"case": "delegates", "attempt": 1, "parent_count": 1,
+                                     "child_count": 1, "probe_count": 0, "cumulative_total": 2})
+            agentctl.reconcile_campaign_entry(root, "delegates", 1, parent_count=1, child_count=0, probe_count=0)
+            ledger = json.loads((root / "campaign-ledger.json").read_text(encoding="utf-8"))
+            self.assertEqual(ledger, {"entries": [{"case": "delegates", "attempt": 1, "parent_count": 1,
+                                                    "child_count": 0, "probe_count": 0,
+                                                    "cumulative_total": 1}]})
+            second = agentctl.reserve_campaign_entry(root, "delegates", parent_count=1, child_count=1, probe_count=0)
+            self.assertEqual(second["attempt"], 2)
+            self.assertEqual(second["cumulative_total"], 3)
+
+    def test_campaign_ledger_fails_closed_on_malformed_content_and_above_ten(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "campaign-ledger.json").write_text("{not json", encoding="utf-8")
+            with self.assertRaises(agentctl.CliError):
+                agentctl.reserve_campaign_entry(root, "delegates", parent_count=1, child_count=1, probe_count=0)
+            write_json(root / "campaign-ledger.json", {"entries": [
+                {"case": "delegates", "attempt": 1, "parent_count": 1, "child_count": 1,
+                 "probe_count": 0, "cumulative_total": 2},
+                {"case": "refuses-unlisted", "attempt": 1, "parent_count": 1, "child_count": 0,
+                 "probe_count": 0, "cumulative_total": 3},
+                {"case": "controller-allowlist-pre-dispatch", "attempt": 1, "parent_count": 0, "child_count": 0,
+                 "probe_count": 1, "cumulative_total": 4},
+                {"case": "delegates", "attempt": 2, "parent_count": 1, "child_count": 1,
+                 "probe_count": 0, "cumulative_total": 6},
+                {"case": "refuses-unlisted", "attempt": 2, "parent_count": 1, "child_count": 0,
+                 "probe_count": 0, "cumulative_total": 7},
+                {"case": "delegates", "attempt": 3, "parent_count": 1, "child_count": 1,
+                 "probe_count": 0, "cumulative_total": 9},
+                {"case": "refuses-unlisted", "attempt": 3, "parent_count": 1, "child_count": 0,
+                 "probe_count": 0, "cumulative_total": 10},
+            ]})
+            with self.assertRaises(agentctl.CliError):
+                agentctl.reserve_campaign_entry(root, "delegates", parent_count=1, child_count=1, probe_count=0)
 
     def test_json_lines_logs_parse_and_reject_malformed_lines(self):
         text = "\n".join([json.dumps({"time": "t", "method": "POST", "path": "/v1/messages"}), "{not json",
@@ -666,6 +764,216 @@ class EvalCliTestCase(unittest.TestCase):
         receipt = self.receipt()
         self.assertEqual(receipt["assertions"]["precise-report"]["verdict"], "fail")
         self.assertEqual(receipt["verdict"], "fail")
+
+
+class ComposedEvalCliTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        (self.root / "agents").mkdir()
+        self.hello = write_native_agent(self.root / "agents" / "hello", namespace=NAMESPACE,
+                                        agent_name="hello", provider_name="hello",
+                                        prompt="Reply exactly with the requested greeting.")
+        (self.hello / "eval" / "cases").mkdir(parents=True, exist_ok=True)
+        write_json(self.hello / "eval" / "cases" / "fixed-greeting.yaml",
+                   {"case_id": "fixed-greeting", "expected_answer": FIXED_PHRASE})
+        pins = {environment: agentctl.render_agent(
+            self.hello, environment, self.root / f"hello-{environment}.json")["bundle_digest"]
+                for environment in agentctl.ALLOWED_ENVIRONMENTS}
+        self.coordinator = write_native_coordinator(
+            self.root / "agents" / "coordinator",
+            namespace=NAMESPACE,
+            cases=(composed_case("delegates"), composed_case("refuses-unlisted")),
+            catalogue_agents={"hello": pins},
+            prompt="Delegate only to hello and report refusals truthfully.")
+        self.evidence = self.root / "evidence"
+        (self.root / "token").write_text("journal-token\n", encoding="utf-8")
+        (self.root / "provider.log").write_text(json.dumps(composed_provider_rows()), encoding="utf-8")
+        write_json(self.root / "delegates-task.json",
+                   {"apiVersion": "core.orka.ai/v1alpha1", "kind": "Task",
+                    "metadata": {"name": "coordinator-delegates", "namespace": NAMESPACE,
+                                 "annotations": {"orka.ai/disable-coordination-tool-injection": "true"}},
+                    "spec": {"type": "ai", "agentRef": {"name": "coordinator"},
+                             "prompt": DELEGATES_PROMPT, "retryPolicy": {"maxRetries": 0}}})
+        write_json(self.root / "refuses-task.json",
+                   {"apiVersion": "core.orka.ai/v1alpha1", "kind": "Task",
+                    "metadata": {"name": "coordinator-refuses-unlisted", "namespace": NAMESPACE,
+                                 "annotations": {"orka.ai/disable-coordination-tool-injection": "true"}},
+                    "spec": {"type": "ai", "agentRef": {"name": "coordinator"},
+                             "prompt": REFUSAL_PROMPT, "retryPolicy": {"maxRetries": 0}}})
+        hello_rendered = json.loads(Path(agentctl.render_agent(
+            self.hello, "trial", self.root / "hello-probe.json")["bundle_path"]).read_text(encoding="utf-8"))
+        coordinator_rendered = json.loads(Path(agentctl.render_agent(
+            self.coordinator, "trial", self.root / "coordinator-probe.json")["bundle_path"]).read_text(
+                encoding="utf-8"))
+        self.hello_spec = next(item["spec"] for item in hello_rendered["items"] if item["kind"] == "Agent")
+        self.coordinator_spec = next(item["spec"] for item in coordinator_rendered["items"]
+                                     if item["kind"] == "Agent")
+        self.parent_tasks = {
+            "delegates": native_terminal_task("coordinator-delegates", uid="parent-uid", agent_name="coordinator",
+                                              prompt=DELEGATES_PROMPT),
+            "refuses-unlisted": native_terminal_task("coordinator-refuses-unlisted", uid="refuse-parent-uid",
+                                                     agent_name="coordinator", prompt=REFUSAL_PROMPT),
+        }
+        self.child_task = native_terminal_task(
+            "coordinator-delegates-child-0",
+            uid="child-uid",
+            agent_name="hello",
+            prompt=f"Reply exactly: {FIXED_PHRASE}",
+            start="2026-09-17T10:01:00Z",
+            completion="2026-09-17T10:02:00Z",
+            parent_name=self.parent_tasks["delegates"]["metadata"]["name"],
+            owner_uid=self.parent_tasks["delegates"]["metadata"]["uid"],
+            delegated_agent="hello",
+        )
+        self.http_calls = []
+        self.pages_by_task = {}
+        self.results_by_task = {}
+        self.child_inventory = {"items": [self.child_task]}
+        self.kubectl = FakeKubectl({
+            ("tasks.core.orka.ai",): self._task_list_response,
+            ("task", self.parent_tasks["delegates"]["metadata"]["name"]): self.parent_tasks["delegates"],
+            ("task", self.parent_tasks["refuses-unlisted"]["metadata"]["name"]):
+                self.parent_tasks["refuses-unlisted"],
+            ("task", self.child_task["metadata"]["name"]): self.child_task,
+            ("agents.core.orka.ai", "hello"): {
+                "metadata": {"uid": "hello-agent-uid", "generation": 1, "namespace": NAMESPACE},
+                "spec": self.hello_spec,
+                "status": {"conditions": [{"type": "Ready", "status": "True", "observedGeneration": 1}]},
+            },
+            ("agents.core.orka.ai", "coordinator"): {
+                "metadata": {"uid": "coordinator-agent-uid", "generation": 1, "namespace": NAMESPACE},
+                "spec": self.coordinator_spec,
+                "status": {"conditions": [{"type": "Ready", "status": "True", "observedGeneration": 1}]},
+            },
+        })
+
+    def _task_list_response(self, argv, _kwargs):
+        if "-A" in argv:
+            return {"items": []}
+        if "-l" in argv:
+            return copy.deepcopy(self.child_inventory)
+        return {"items": []}
+
+    def _http_get(self, url, *, token=None, **kwargs):
+        self.http_calls.append((url, token, kwargs))
+        task_name = url.partition("/api/v1/tasks/")[2].split("/")[0].split("?")[0]
+        if "/events?" in url:
+            return self.pages_by_task[task_name].pop(0)
+        if "/result?" in url:
+            return {"result": self.results_by_task[task_name]}
+        raise AssertionError(f"unexpected URL {url}")
+
+    def argv(self, case_id, task_manifest, **overrides):
+        args = {"--context": "ctx", "--kubeconfig": "cred", "--evidence-root": str(self.evidence),
+                "--agent-dir": str(self.coordinator), "--environment": "trial", "--namespace": NAMESPACE,
+                "--date": "2026-09-17", "--case-id": case_id, "--model": "qwen2.5:3b",
+                "--task-manifest": str(task_manifest), "--journal-base-url": "https://api.example.com",
+                "--journal-token-file": str(self.root / "token"), "--provider-log": str(self.root / "provider.log"),
+                "--window-start": "2026-09-17T09:59:00Z", "--window-end": "2026-09-17T10:06:00Z"}
+        args.update(overrides)
+        return [token for flag, value in args.items() for token in (flag, value)]
+
+    def run_eval(self, case_id, task_manifest, **overrides):
+        with mock.patch.object(agentctl.subprocess, "run", self.kubectl), \
+                mock.patch.object(agentctl, "http_get_json", self._http_get), \
+                mock.patch.object(agentctl.time, "sleep"), redirect_stdout(io.StringIO()) as out:
+            agentctl._eval_cli(self.argv(case_id, task_manifest, **overrides))
+        return json.loads(out.getvalue())
+
+    def receipt(self, case_id):
+        written = sorted((self.coordinator / "eval" / "receipts").rglob(f"{case_id}.json"))
+        self.assertEqual(len(written), 1)
+        return json.loads(written[0].read_text(encoding="utf-8"))
+
+    def test_delegates_applies_pinned_agents_reads_results_and_passes(self):
+        parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
+        self.pages_by_task[parent_name] = [{"events": [
+            {"seq": 1, "type": "ToolCallStarted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "tool": {"name": "delegate_task",
+                      "arguments": {"agent": "hello", "prompt": f"Reply exactly: {FIXED_PHRASE}"}}},
+            {"seq": 2, "type": "ToolCallCompleted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "contentText": "delegated"},
+            {"seq": 3, "type": "ToolCallStarted", "toolCallID": "call-2", "toolName": "wait_for_tasks",
+             "tool": {"name": "wait_for_tasks", "arguments": {"tasks": [self.child_task["metadata"]["name"]]}}},
+            {"seq": 4, "type": "ToolCallCompleted", "toolCallID": "call-2", "toolName": "wait_for_tasks",
+             "contentText": "done"},
+            {"seq": 5, "type": "ModelMessage", "contentText": FIXED_PHRASE},
+        ], "latestSeq": 5}]
+        self.results_by_task = {parent_name: FIXED_PHRASE, self.child_task["metadata"]["name"]: FIXED_PHRASE}
+        summary = self.run_eval("delegates", self.root / "delegates-task.json")
+        receipt = self.receipt("delegates")
+        self.assertEqual(summary["verdict"], "pass")
+        self.assertEqual(receipt["verdict"], "pass")
+        self.assertEqual(receipt["request_count"], 3)
+        self.assertEqual(receipt["tool_calls"], {"total": 2, "redacted": 0})
+        self.assertEqual(receipt["assertions"]["stayed-within-limits"]["verdict"], "pass")
+        result_calls = [(url, token) for url, token, _ in self.http_calls if "/result?" in url]
+        self.assertEqual({token for _, token in result_calls}, {"journal-token"})
+        self.assertEqual(len(result_calls), 2)
+        self.assertEqual(self.kubectl.verbs().count("apply"), 2)
+        self.assertEqual(self.kubectl.verbs().count("delete"), 1)
+
+    def test_delegates_requires_matching_owner_uid_for_the_one_child(self):
+        parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
+        self.pages_by_task[parent_name] = [{"events": [
+            {"seq": 1, "type": "ToolCallStarted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "tool": {"name": "delegate_task",
+                      "arguments": {"agent": "hello", "prompt": f"Reply exactly: {FIXED_PHRASE}"}}},
+            {"seq": 2, "type": "ToolCallCompleted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "contentText": "delegated"},
+            {"seq": 3, "type": "ToolCallStarted", "toolCallID": "call-2", "toolName": "wait_for_tasks",
+             "tool": {"name": "wait_for_tasks", "arguments": {"tasks": [self.child_task["metadata"]["name"]]}}},
+            {"seq": 4, "type": "ToolCallCompleted", "toolCallID": "call-2", "toolName": "wait_for_tasks",
+             "contentText": "done"},
+            {"seq": 5, "type": "ModelMessage", "contentText": FIXED_PHRASE},
+        ], "latestSeq": 5}]
+        self.results_by_task = {parent_name: FIXED_PHRASE}
+        mismatched = copy.deepcopy(self.child_task)
+        mismatched["metadata"]["ownerReferences"] = [{"uid": "someone-else", "controller": True}]
+        self.child_inventory = {"items": [mismatched]}
+        summary = self.run_eval("delegates", self.root / "delegates-task.json")
+        receipt = self.receipt("delegates")
+        self.assertEqual(summary["verdict"], "fail")
+        self.assertEqual(receipt["assertions"]["exactly-one-child-task"]["verdict"], "fail")
+
+    def test_refuses_unlisted_records_worker_tool_refusal_without_a_child(self):
+        parent_name = self.parent_tasks["refuses-unlisted"]["metadata"]["name"]
+        self.pages_by_task[parent_name] = [{"events": [
+            {"seq": 1, "type": "ToolCallStarted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "tool": {"name": "delegate_task",
+                      "arguments": {"agent": "not-allowed", "prompt": "try anyway"}}},
+            {"seq": 2, "type": "ToolCallFailed", "toolCallID": "call-1", "toolName": "delegate_task",
+             "contentText": "delegation refused before task creation"},
+            {"seq": 3, "type": "ModelMessage", "contentText": "Delegation was refused."},
+        ], "latestSeq": 3}]
+        self.results_by_task = {parent_name: "Delegation was refused."}
+        self.child_inventory = {"items": []}
+        summary = self.run_eval("refuses-unlisted", self.root / "refuses-task.json")
+        receipt = self.receipt("refuses-unlisted")
+        self.assertEqual(summary["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["worker-tool-pre-creation"]["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["no-child-task-created"]["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["parent-result-reported-refusal"]["verdict"], "pass")
+        self.assertEqual(len([call for call in self.http_calls if "/result?" in call[0]]), 1)
+
+    def test_redacted_call_arguments_and_denial_evidence_become_not_evaluated(self):
+        parent_name = self.parent_tasks["refuses-unlisted"]["metadata"]["name"]
+        self.pages_by_task[parent_name] = [{"events": [
+            {"seq": 1, "type": "ToolCallStarted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "tool": {"name": "delegate_task", "metadataOmitted": "policy"}},
+            {"seq": 2, "type": "ToolCallFailed", "toolCallID": "call-1", "toolName": "delegate_task",
+             "payload": agentctl.REDACTION_MARKER},
+            {"seq": 3, "type": "ModelMessage", "contentText": "Delegation was refused."},
+        ], "latestSeq": 3}]
+        self.results_by_task = {parent_name: "Delegation was refused."}
+        self.child_inventory = {"items": []}
+        summary = self.run_eval("refuses-unlisted", self.root / "refuses-task.json")
+        receipt = self.receipt("refuses-unlisted")
+        self.assertEqual(summary["verdict"], "fail")
+        self.assertEqual(receipt["assertions"]["attempted-unlisted-delegation"]["verdict"], "not_evaluated")
+        self.assertEqual(receipt["assertions"]["worker-tool-pre-creation"]["verdict"], "not_evaluated")
 
 
 class LifecycleCliTestCase(unittest.TestCase):
