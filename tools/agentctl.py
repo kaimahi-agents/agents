@@ -1165,6 +1165,31 @@ def campaign_case_reserved(evidence_root, case_id: str) -> bool:
     if not is_safe_slug(case_id):
         raise CliError(f"case_id must be a safe slug ({SAFE_SLUG_CONTRACT})")
     return any(entry["case"] == case_id for entry in _load_campaign_ledger(evidence_root)["entries"])
+
+def _controller_allowlist_probe_evidence_digests(evidence_dir) -> list[str] | None:
+    digests = []
+    for name in _CONTROLLER_ALLOWLIST_PROBE_FILES:
+        path = Path(evidence_dir) / name
+        if not path.is_file():
+            return None
+        digests.append(sha256_hex(path.read_bytes()))
+    return digests
+
+def _load_preserved_controller_allowlist_observation(agent_dir, bundle_digest: str, case_id: str,
+                                                     evidence_dir) -> tuple[dict | None, list[str]]:
+    receipt_path = Path(agent_dir) / "eval" / "receipts" / bundle_digest / f"{case_id}.json"
+    if not receipt_path.is_file():
+        return None, []
+    receipt = _read_json(receipt_path, "existing evaluation receipt")
+    if validate_evaluation_receipt(receipt):
+        return None, []
+    observations = receipt.get("observations") if isinstance(receipt, dict) else None
+    observation = observations.get(CONTROLLER_ALLOWLIST_OBSERVATION_ID) if isinstance(observations, dict) else None
+    probe_digests = _controller_allowlist_probe_evidence_digests(evidence_dir)
+    if observation != CONTROLLER_ALLOWLIST_OBSERVATION or probe_digests is None:
+        return None, []
+    return dict(observation), probe_digests
+
 def check_window_covers_task(window_start, window_end, task_start, task_end) -> list[str]:
     """Diagnostics; empty means the asserted window covers the Task exactly, with no tolerance."""
     if window_end < window_start:
@@ -2249,12 +2274,17 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict, dict | No
                 "the authenticated parent result did not report refusal safely",
                 "the authenticated parent result could not be established"),
         }
+        probe_evidence_sha256 = []
         if not campaign_case_reserved(args.evidence_root, CONTROLLER_ALLOWLIST_OBSERVATION_ID):
             if not child_inventory_known or len(genuine_children) != 0:
                 raise CliError("controller allowlist probe requires an authoritative zero-child refusal inventory")
             observation = run_controller_allowlist_probe(
                 args, evidence_dir=evidence_dir, coordinator_live=coordinator_live,
                 refusal_parent_task=terminal_task)
+            probe_evidence_sha256 = _controller_allowlist_probe_evidence_digests(evidence_dir) or []
+        else:
+            observation, probe_evidence_sha256 = _load_preserved_controller_allowlist_observation(
+                args.agent_dir, bundle_digest, args.case_id, evidence_dir)
     evidence_sha256 = list(dict.fromkeys(
         _write_json(evidence_dir / name, data) for name, data in (
             ("task-manifest.json", task_manifest), ("terminal-task.json", terminal_task),
@@ -2264,8 +2294,7 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict, dict | No
             ("parent-result.json", {"result": parent_result}), ("child-inventory.json", raw_child_inventory),
             ("child-tasks.json", {"items": child_terminal_tasks}), ("child-results.json", child_results))))
     if observation is not None:
-        for name in _CONTROLLER_ALLOWLIST_PROBE_FILES:
-            evidence_sha256.append(sha256_hex((evidence_dir / name).read_bytes()))
+        evidence_sha256.extend(probe_evidence_sha256)
         evidence_sha256 = list(dict.fromkeys(evidence_sha256))
     receipt = {"case_id": args.case_id, "bundle_digest": bundle_digest, "date": args.date,
                "source": args.source, "model": args.model,
