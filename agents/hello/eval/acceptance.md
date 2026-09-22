@@ -1,8 +1,10 @@
 # Acceptance rules
 
-The fixed greeting case is prepared but has not been run by this repository.
-It is not required until a live receipt exists for the current digest.
+The fixed greeting case is required in `trial`. Until a receipt exists under the
+current digest's `eval/receipts/<bundle_digest>/` directory, `tools/verify
+agents/hello trial` fails with a missing-receipt diagnostic; that failure is
+the expected state before a live run is recorded.
 
 <!-- acceptance:begin -->
-{"case_id": "fixed-greeting", "environment": "trial", "case_sha256": "043d2ee098d75cb16ce3e0ac7d66c1d3da10c3531ff11c531a16746e753602cc", "required": false}
+{"case_id": "fixed-greeting", "environment": "trial", "case_sha256": "34769787e6ecd6af5ebcd42c4e55af418737065ffc281ea698642842843d0443", "required": true}
 <!-- acceptance:end -->
