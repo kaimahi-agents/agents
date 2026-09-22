@@ -1,0 +1,26 @@
+{
+  "apiVersion": "core.orka.ai/v1alpha1",
+  "kind": "Task",
+  "metadata": {
+    "generateName": "hello-",
+    "namespace": "${NAMESPACE}"
+  },
+  "spec": {
+    "type": "ai",
+    "agentRef": {
+      "name": "hello",
+      "namespace": "${NAMESPACE}"
+    },
+    "prompt": "Reply with exactly: Hello world.",
+    "ai": {
+      "providerRef": {
+        "name": "${PROVIDER}",
+        "namespace": "${NAMESPACE}"
+      },
+      "tools": []
+    },
+    "retryPolicy": {
+      "maxRetries": 0
+    }
+  }
+}

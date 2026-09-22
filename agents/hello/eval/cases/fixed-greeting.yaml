@@ -8,18 +8,31 @@
       "namespace": "orka-system"
     },
     "spec": {
+      "type": "ai",
       "agentRef": {
         "name": "hello",
         "namespace": "orka-system"
       },
       "prompt": "Reply with exactly: Hello world.",
-      "resources": {},
-      "type": "ai"
+      "ai": {
+        "providerRef": {
+          "name": "hello",
+          "namespace": "orka-system"
+        },
+        "tools": []
+      },
+      "retryPolicy": {
+        "maxRetries": 0
+      }
     }
   },
   "expected_answer": "Hello world.",
+  "assertions": {
+    "tools_available": false
+  },
   "limits": {
     "provider_requests": 5,
-    "retries": 0
+    "retries": 0,
+    "tasks": 1
   }
 }
