@@ -10,7 +10,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tests.fixtures import acceptance_block, evaluation_receipt, write_agent, write_json, write_native_agent  # noqa: E402
+from tests.fixtures import (  # noqa: E402
+    acceptance_block,
+    evaluation_receipt,
+    write_agent,
+    write_json,
+    write_native_agent,
+    write_native_coordinator,
+)
 from tools import agentctl  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -174,6 +181,75 @@ class VerifyAgentTestCase(unittest.TestCase):
         write_json(self.agent / "eval" / "receipts" / digest / "demo-case.json", receipt)
         errors = self.verify()
         self.assertTrue(any("missing valid tool_calls" in error for error in errors))
+
+
+class VerifyCatalogueDependenciesTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        (self.root / "agents").mkdir()
+
+    def write_child(self, slug="hello", *, agent_name="hello") -> Path:
+        return write_native_agent(self.root / "agents" / slug, namespace="orka-system",
+                                  agent_name=agent_name, provider_name=agent_name)
+
+    def bundle_pins(self, agent_dir: Path) -> dict[str, str]:
+        return {environment: agentctl.render_agent(
+            agent_dir, environment, self.root / f"{agent_dir.name}-{environment}.json")["bundle_digest"]
+                for environment in agentctl.ALLOWED_ENVIRONMENTS}
+
+    def write_coordinator(self, *, allowed_agents=("hello",), catalogue_agents=None) -> Path:
+        return write_native_coordinator(self.root / "agents" / "coordinator", namespace="orka-system",
+                                        allowed_agents=allowed_agents, catalogue_agents=catalogue_agents)
+
+    def test_matching_trial_and_production_catalogue_pins_verify_clean(self):
+        child = self.write_child()
+        coordinator = self.write_coordinator(catalogue_agents={"hello": self.bundle_pins(child)})
+        for environment in agentctl.ALLOWED_ENVIRONMENTS:
+            with self.subTest(environment=environment):
+                self.assertEqual(agentctl.verify_agent(coordinator, environment), [])
+
+    def test_a_stale_trial_or_production_pin_is_reported_only_for_that_environment(self):
+        child = self.write_child()
+        for environment in agentctl.ALLOWED_ENVIRONMENTS:
+            with self.subTest(environment=environment):
+                pins = self.bundle_pins(child)
+                pins[environment] = "f" * 64
+                coordinator = write_native_coordinator(
+                    self.root / "agents" / f"coordinator-{environment}", namespace="orka-system",
+                    agent_name=f"coordinator-{environment}", catalogue_agents={"hello": pins})
+                errors = agentctl.verify_agent(coordinator, environment)
+                self.assertTrue(any("catalogue" in error and "digest" in error for error in errors))
+                other_environment = next(name for name in agentctl.ALLOWED_ENVIRONMENTS if name != environment)
+                self.assertEqual(agentctl.verify_agent(coordinator, other_environment), [])
+
+    def test_added_or_removed_allowlist_entries_are_reported(self):
+        hello = self.write_child("hello", agent_name="hello")
+        other = self.write_child("other", agent_name="other")
+        cases = (
+            (("hello", "other"), {"hello": self.bundle_pins(hello)}, "added"),
+            (("hello",), {"hello": self.bundle_pins(hello), "other": self.bundle_pins(other)}, "removed"),
+        )
+        for allowed_agents, catalogue_agents, label in cases:
+            with self.subTest(case=label):
+                coordinator = write_native_coordinator(
+                    self.root / "agents" / f"coordinator-{label}", namespace="orka-system",
+                    agent_name=f"coordinator-{label}", allowed_agents=allowed_agents,
+                    catalogue_agents=catalogue_agents)
+                errors = agentctl.verify_agent(coordinator, "trial")
+                self.assertTrue(any("allowedAgents" in error and "catalogueAgents" in error for error in errors))
+
+    def test_using_a_directory_name_instead_of_a_child_resource_name_is_reported(self):
+        child = self.write_child("hello-dir", agent_name="hello")
+        coordinator = self.write_coordinator(allowed_agents=("hello-dir",),
+                                             catalogue_agents={"hello-dir": self.bundle_pins(child)})
+        errors = agentctl.verify_agent(coordinator, "trial")
+        self.assertTrue(any("resource name" in error for error in errors))
+
+    def test_a_non_coordinator_lock_without_catalogue_agents_stays_valid(self):
+        child = self.write_child()
+        self.assertEqual(agentctl.verify_agent(child, "trial"), [])
 
 
 class AcceptanceParsingTestCase(unittest.TestCase):

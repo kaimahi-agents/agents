@@ -19,6 +19,7 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 
 # --- Errors ---------------------------------------------------------------------------------
@@ -445,6 +446,187 @@ def _verify_lifecycle_receipts(agent_dir: Path) -> list[str]:
         errors += [f"lifecycle receipt #{index}: {error}" for error in current]
     return errors
 
+@dataclass(frozen=True)
+class CatalogueGraph:
+    """Safe directory slugs plus forward/reverse catalogue dependency edges."""
+    name_to_dir: dict[str, str]
+    forward: dict[str, tuple[str, ...]]
+    reverse: dict[str, tuple[str, ...]]
+
+
+def _iter_safe_agent_dirs(root: Path) -> list[Path]:
+    agents_root = Path(root) / "agents"
+    if not agents_root.is_dir():
+        raise CliError("repository root must contain agents/")
+    try:
+        return sorted([path for path in agents_root.iterdir()
+                       if path.is_dir() and not path.is_symlink() and is_safe_slug(path.name)],
+                      key=lambda path: path.name)
+    except OSError as exc:
+        raise CliError("could not inspect agents/") from exc
+
+
+def _load_authored_agent_resource(agent_dir: Path) -> dict:
+    resource_root = agent_dir / "resources"
+    try:
+        resource_paths = sorted(resource_root.iterdir()) if resource_root.is_dir() else []
+    except OSError as exc:
+        raise CliError("could not inspect authored resources") from exc
+    if not resource_paths or any(path.is_symlink() or not path.is_file() or path.suffix != ".yaml"
+                                 for path in resource_paths):
+        raise CliError("catalogue agents must keep only top-level .yaml files in resources/")
+    try:
+        resources = [load_json_object(path.relative_to(agent_dir).as_posix(), path.read_bytes())
+                     for path in resource_paths]
+    except (OSError, BundleError) as exc:
+        raise CliError("could not parse an authored Agent resource") from exc
+    agents = [resource for resource in resources if resource.get("kind") == "Agent"]
+    if len(agents) != 1:
+        raise CliError("catalogue agents must have exactly one authored Agent resource")
+    name = (agents[0].get("metadata") or {}).get("name")
+    if not is_safe_slug(name):
+        raise CliError(f"catalogue Agent resource names must be a safe slug ({SAFE_SLUG_CONTRACT})")
+    return agents[0]
+
+
+def _parse_catalogue_lock(lock_path: Path) -> dict[str, dict[str, str]]:
+    lock = _read_json(lock_path, "dependencies.lock.yaml")
+    if not isinstance(lock, dict):
+        raise CliError("dependencies.lock.yaml must decode to a JSON object")
+    catalogue_agents = lock.get("catalogueAgents")
+    if catalogue_agents is None:
+        return {}
+    if not isinstance(catalogue_agents, dict):
+        raise CliError("dependencies.lock.yaml catalogueAgents must be an object")
+    parsed = {}
+    for name, pins in catalogue_agents.items():
+        if not is_safe_slug(name):
+            raise CliError(f"catalogue dependency names must be a safe slug ({SAFE_SLUG_CONTRACT})")
+        if not isinstance(pins, dict) or set(pins) != set(ALLOWED_ENVIRONMENTS) or not all(
+                _is_hex_digest(pins.get(environment)) for environment in ALLOWED_ENVIRONMENTS):
+            raise CliError("dependencies.lock.yaml catalogueAgents entries must have exactly trial and production "
+                           "64-character lowercase hex digests")
+        parsed[name] = {environment: pins[environment] for environment in ALLOWED_ENVIRONMENTS}
+    return parsed
+
+
+def _parse_allowed_agent_names(agent: dict) -> tuple[bool, tuple[str, ...]]:
+    spec = agent.get("spec")
+    coordination = spec.get("coordination") if isinstance(spec, dict) else None
+    if coordination is None:
+        return False, ()
+    if not isinstance(coordination, dict):
+        raise CliError("Agent spec.coordination must be an object")
+    enabled = coordination.get("enabled") is True
+    allowed = coordination.get("allowedAgents")
+    if allowed is None:
+        return enabled, ()
+    if not isinstance(allowed, list):
+        raise CliError("coordinator allowedAgents must be a list of same-namespace name-only entries")
+    names = []
+    for entry in allowed:
+        if not (isinstance(entry, dict) and set(entry) == {"name"} and is_safe_slug(entry.get("name"))):
+            raise CliError("coordinator allowedAgents must use same-namespace name-only safe slugs")
+        names.append(entry["name"])
+    if len(set(names)) != len(names):
+        raise CliError("coordinator allowedAgents must not repeat an Agent name")
+    return enabled, tuple(sorted(names))
+
+
+def load_catalogue_graph(root: Path) -> CatalogueGraph:
+    """Map rendered Agent resource names to safe directory slugs plus forward/reverse edges."""
+    name_to_dir, dir_to_name, locks, enabled_map, allowed_map = {}, {}, {}, {}, {}
+    for agent_dir in _iter_safe_agent_dirs(root):
+        agent = _load_authored_agent_resource(agent_dir)
+        name = (agent.get("metadata") or {}).get("name")
+        if name in name_to_dir:
+            raise CliError("catalogue graph contains duplicate Agent resource names")
+        enabled, allowed = _parse_allowed_agent_names(agent)
+        slug = agent_dir.name
+        name_to_dir[name], dir_to_name[slug] = slug, name
+        locks[slug], enabled_map[slug], allowed_map[slug] = _parse_catalogue_lock(
+            agent_dir / "dependencies.lock.yaml"), enabled, allowed
+    forward = {slug: set() for slug in dir_to_name}
+    reverse = {slug: set() for slug in dir_to_name}
+    for slug in sorted(dir_to_name):
+        allowed_names, lock_names = set(allowed_map[slug]), set(locks[slug])
+        if allowed_names or lock_names:
+            if not enabled_map[slug]:
+                raise CliError("catalogue dependency locks require coordination.enabled to be true")
+            if allowed_names != lock_names:
+                raise CliError("coordinator allowedAgents must exactly match dependencies.lock.yaml catalogueAgents")
+        for name in sorted(lock_names):
+            child_slug = name_to_dir.get(name)
+            if child_slug is None:
+                if name in dir_to_name and dir_to_name[name] != name:
+                    raise CliError("catalogue dependencies must use child Agent resource names, not directory names")
+                raise CliError("catalogue dependency graph references an unknown child Agent")
+            forward[slug].add(child_slug)
+            reverse[child_slug].add(slug)
+    state = {}
+    def visit(slug: str) -> None:
+        if state.get(slug) == 1:
+            raise CliError("catalogue dependency graph contains a cycle")
+        if state.get(slug) == 2:
+            return
+        state[slug] = 1
+        for child_slug in sorted(forward[slug]):
+            visit(child_slug)
+        state[slug] = 2
+    for slug in sorted(forward):
+        visit(slug)
+    return CatalogueGraph(name_to_dir=name_to_dir,
+                          forward={slug: tuple(sorted(children)) for slug, children in forward.items()},
+                          reverse={slug: tuple(sorted(parents)) for slug, parents in reverse.items()})
+
+
+def expand_changed_agent_dirs(root: Path, changed_paths) -> list[str]:
+    """Discover changed agent directories, then add the transitive reverse-dependency closure."""
+    changed = discover_changed_agent_dirs(changed_paths)
+    if not changed:
+        return []
+    graph, expanded, queue = load_catalogue_graph(root), set(changed), list(changed)
+    while queue:
+        slug = queue.pop(0)
+        for parent in graph.reverse.get(slug, ()):  # missing slugs stay direct-only (for example, deletions)
+            if parent not in expanded:
+                expanded.add(parent)
+                queue.append(parent)
+    return sorted(expanded)
+
+
+def verify_catalogue_dependencies(agent_dir: Path, environment: str) -> list[str]:
+    """Verify the current environment's pinned catalogue child digests for one coordinating Agent."""
+    agent_dir = Path(agent_dir)
+    try:
+        agent = _load_authored_agent_resource(agent_dir)
+        _, allowed = _parse_allowed_agent_names(agent)
+        lock = _parse_catalogue_lock(agent_dir / "dependencies.lock.yaml")
+    except CliError as exc:
+        return [str(exc)]
+    if not allowed and not lock:
+        return []
+    try:
+        graph = load_catalogue_graph(agent_dir.parent.parent)
+    except CliError as exc:
+        return [str(exc)]
+    errors = []
+    for name, pins in sorted(lock.items()):
+        child_slug = graph.name_to_dir.get(name)
+        if child_slug is None:
+            continue
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                digest = render_agent(agent_dir.parent / child_slug, environment,
+                                      Path(tmp_dir) / "bundle.yaml")["bundle_digest"]
+        except BundleError as exc:
+            errors.append("catalogue dependency could not be rendered for digest verification")
+            continue
+        if digest != pins[environment]:
+            errors.append("catalogue dependency digest does not match dependencies.lock.yaml for this environment")
+    return errors
+
+
 def verify_agent(agent_dir: Path, environment: str) -> list[str]:
     """Verify one agent directory for one environment, entirely offline. Returns non-sensitive
     diagnostics, never raising for an ordinary policy violation."""
@@ -484,6 +666,7 @@ def verify_agent(agent_dir: Path, environment: str) -> list[str]:
                    for label, resource in named
                    if not _VERSIONED_NAME_RE.match(str((resource.get("metadata") or {}).get("name", "")))]
     errors += [error for resource in monitors for error in check_monitor_automerge_off(resource)]
+    errors += verify_catalogue_dependencies(agent_dir, environment)
     errors += _verify_lifecycle_receipts(agent_dir)
     return errors + [error for case in cases if case["required"]  # lock presence is enforced by render_agent
                      for error in _verify_required_case(agent_dir, environment, bundle_digest, case)]
@@ -974,9 +1157,12 @@ def _secret_scan_cli(argv) -> int:
         print("secret-scan: ok")
     return 1 if findings else 0
 def _discover_cli(argv) -> int:
-    argparse.ArgumentParser(prog="tools/discover-changed-agents", description="Read changed repository-relative "
-                            "paths on stdin; print the changed agent directory names.").parse_args(argv)
-    for name in discover_changed_agent_dirs(sys.stdin.read().splitlines()):
+    parser = argparse.ArgumentParser(prog="tools/discover-changed-agents", description="Read changed repository-"
+                                     "relative paths on stdin; print the changed agent directory names.")
+    parser.add_argument("--root", type=Path, default=Path.cwd(), help="repository root (default: current working "
+                        "directory)")
+    args = parser.parse_args(argv)
+    for name in expand_changed_agent_dirs(args.root, sys.stdin.read().splitlines()):
         print(name)
     return 0
 def _add_cluster_arguments(parser) -> None:

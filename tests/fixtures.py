@@ -69,23 +69,55 @@ def write_agent(agent_dir, *, namespace="trial-namespace", cases=(), agent_name=
     return agent_dir
 
 
-def write_native_agent(agent_dir, *, namespace="trial-namespace", cases=()) -> Path:
+def write_native_agent(agent_dir, *, namespace="trial-namespace", cases=(), agent_name="hello",
+                       provider_name="hello", prompt="Reply briefly and in plain text.") -> Path:
     """Write an inline-prompt native Agent with no monitor or synthetic prompt ConfigMap."""
     agent_dir = Path(agent_dir)
     write_json(agent_dir / "resources" / "provider.yaml",
-               {"apiVersion": "core.orka.ai/v1alpha1", "kind": "Provider", "metadata": {"name": "hello"},
+               {"apiVersion": "core.orka.ai/v1alpha1", "kind": "Provider",
+                "metadata": {"name": provider_name},
                 "spec": {"type": "openai", "defaultModel": "qwen2.5:3b"}})
     write_json(agent_dir / "resources" / "agent.yaml",
-               {"apiVersion": "core.orka.ai/v1alpha1", "kind": "Agent", "metadata": {"name": "hello"},
-                "spec": {"providerRef": {"name": "hello"},
-                         "systemPrompt": {"inline": "Reply briefly and in plain text."}}})
+               {"apiVersion": "core.orka.ai/v1alpha1", "kind": "Agent",
+                "metadata": {"name": agent_name},
+                "spec": {"providerRef": {"name": provider_name},
+                         "systemPrompt": {"inline": prompt}}})
     write_json(agent_dir / "dependencies.lock.yaml", {"providerModel": "qwen2.5:3b"})
     write_json(agent_dir / "memory" / "baseline-manifest.yaml", {"memoryEntries": [], "proposals": []})
     (agent_dir / "eval").mkdir(parents=True, exist_ok=True)
     (agent_dir / "eval" / "acceptance.md").write_text(acceptance_block(*cases), encoding="utf-8")
     for environment in ("trial", "production"):
         write_json(agent_dir / "environments" / environment / "kustomization.yaml",
-                   {"namespace": namespace, "commonLabels": {"kaimahi.dev/agent": "hello"}})
+                   {"namespace": namespace, "commonLabels": {"kaimahi.dev/agent": agent_name}})
+    return agent_dir
+
+
+def write_native_coordinator(agent_dir, *, namespace="trial-namespace", cases=(), agent_name="coordinator",
+                             provider_name="hello", allowed_agents=("hello",), catalogue_agents=None,
+                             prompt="Delegate to exactly one allowed catalogue agent when needed.") -> Path:
+    """Write a native coordinating Agent with explicit delegation tools and promotion pins."""
+    agent_dir = Path(agent_dir)
+    pins = catalogue_agents or {
+        name: {"trial": "a" * 64, "production": "b" * 64} for name in allowed_agents
+    }
+    write_json(agent_dir / "resources" / "agent.yaml",
+               {"apiVersion": "core.orka.ai/v1alpha1", "kind": "Agent",
+                "metadata": {"name": agent_name},
+                "spec": {"providerRef": {"name": provider_name},
+                         "systemPrompt": {"inline": prompt},
+                         "coordination": {"enabled": True,
+                                          "allowedAgents": [{"name": name} for name in allowed_agents],
+                                          "maxDepth": 1,
+                                          "maxConcurrentChildren": 1},
+                         "tools": [{"name": "delegate_task", "enabled": True},
+                                   {"name": "wait_for_tasks", "enabled": True}]}})
+    write_json(agent_dir / "dependencies.lock.yaml", {"catalogueAgents": pins})
+    write_json(agent_dir / "memory" / "baseline-manifest.yaml", {"memoryEntries": [], "proposals": []})
+    (agent_dir / "eval").mkdir(parents=True, exist_ok=True)
+    (agent_dir / "eval" / "acceptance.md").write_text(acceptance_block(*cases), encoding="utf-8")
+    for environment in ("trial", "production"):
+        write_json(agent_dir / "environments" / environment / "kustomization.yaml",
+                   {"namespace": namespace, "commonLabels": {"kaimahi.dev/agent": agent_name}})
     return agent_dir
 
 
