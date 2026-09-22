@@ -220,6 +220,25 @@ class VerifyAgentTestCase(unittest.TestCase):
         write_json(self.agent / "eval" / "receipts" / digest / "refuses-unlisted.json", receipt)
         self.assertEqual(self.verify(), [])
 
+    def test_a_legacy_required_refusal_case_rejects_observations(self):
+        case = required_case(case_id="refuses-unlisted", digest=CASE_DIGEST, required=True)
+        (self.agent / "eval" / "acceptance.md").write_text(acceptance_block(case), encoding="utf-8")
+        case_path = self.agent / "eval" / "cases" / "refuses-unlisted.yaml"
+        case_path.write_text(CASE_TEXT, encoding="utf-8")
+        digest = agentctl.render_agent(self.agent, "trial", self.root / "probe-legacy-refusal.yaml")["bundle_digest"]
+        refusal = composed_case("refuses-unlisted")
+        receipt = evaluation_receipt(
+            "refuses-unlisted",
+            digest,
+            assertions={name: {"verdict": "pass", "evidence_completeness": True, "note": "n"}
+                        for name in refusal["assertions"]},
+            tool_calls={"total": refusal["limits"]["tool_calls"], "redacted": 0},
+            observations=CONTROLLER_ALLOWLIST_PRE_DISPATCH,
+        )
+        write_json(self.agent / "eval" / "receipts" / digest / "refuses-unlisted.json", receipt)
+        errors = self.verify()
+        self.assertTrue(any("observations" in error for error in errors))
+
 
 class VerifyCatalogueDependenciesTestCase(unittest.TestCase):
     def setUp(self):

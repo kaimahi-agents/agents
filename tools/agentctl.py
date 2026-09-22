@@ -445,6 +445,9 @@ def parse_acceptance_cases(acceptance_text: str) -> list[dict]:
                 raise BundleError(f"acceptance.md case #{len(cases)} (line {number}): {_policy_shape_error(case['policy'])}")
         cases.append(case)
     return cases
+def _case_allows_observations(case: dict, receipt: dict) -> bool:
+    return bool(case.get("policy") == COMPOSED_COORDINATION_POLICY and _receipt_allows_observations(receipt))
+
 def _verify_required_case(agent_dir: Path, environment: str, bundle_digest: str, case: dict) -> list[str]:
     """One required case needs a case file matching acceptance.md's declared hash and, in this
     environment, a schema-valid, pattern-free, passing receipt under the current digest."""
@@ -471,6 +474,8 @@ def _verify_required_case(agent_dir: Path, environment: str, bundle_digest: str,
                          "matching the current rendered bundle digest"]
     for receipt_path, receipt in matching:
         schema_errors = validate_evaluation_receipt(receipt)
+        if "observations" in receipt and not _case_allows_observations(case, receipt):
+            schema_errors.append("observations are allowed only when the acceptance case is bound to the fixed composed refusal policy shape")
         errors += [f"{receipt_path.name}: {error}"
                    for error in schema_errors + find_prohibited_in_document(receipt, "receipt")]
         if not schema_errors and receipt["verdict"] != "pass":
