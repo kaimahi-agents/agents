@@ -991,7 +991,15 @@ def _add_cluster_arguments(parser) -> None:
 
 # Fixed, public-safe lifecycle receipt shape. Assertion IDs, the primary evidence filename and the
 # wording distinguishing "as deployed" from "as restored" are the only per-kind differences.
-LIFECYCLE_RECEIPT_KEYS = frozenset({"kind", "bundle_digest", "date", "verdict", "assertions", "digests", "counts"})
+LEGACY_LIFECYCLE_RECEIPT_KEYS = frozenset(
+    {"kind", "bundle_digest", "date", "verdict", "assertions", "digests", "counts"})
+LIFECYCLE_RECEIPT_SCHEMA_VERSION = 2
+LIFECYCLE_RECEIPT_KEYS = LEGACY_LIFECYCLE_RECEIPT_KEYS | {"schema_version", "namespace"}
+# Grandfather the one pre-schema receipt by exact canonical content. Author-controlled fields such
+# as `date` cannot turn a new receipt into a legacy one that omits readiness and namespace.
+LEGACY_LIFECYCLE_RECEIPT_DIGESTS = frozenset({
+    "dc7e8a66cdfce1fb2c2fde116d39d996d0b2aa6d0dc069b66e97d73487862ba4",
+})
 ROLLBACK_LIMITATIONS = (
     "Agent UID and generation may be new or advanced; rollback does not restore deployment identity.",
     "In-flight work, had there been any, would finish on the previous version; rollback does not move it.",
@@ -999,26 +1007,35 @@ ROLLBACK_LIMITATIONS = (
 )
 _LIFECYCLE = {
     "deploy": ("tools/deploy", "Apply one environment overlay and write a public-safe deploy receipt.",
-               ("agent-identity-readback", "runtime-image-matches-lock", "memory-inventory-matches-baseline",
-                "proposal-inventory-matches-baseline"), "identity-readback.json",
+               ("agent-identity-readback", "agent-ready", "runtime-image-matches-lock",
+                "memory-inventory-matches-baseline", "proposal-inventory-matches-baseline"),
+               "identity-readback.json",
                "applied Agent UID/generation present and live prompt matches the rendered prompt byte-for-byte",
                "applied Agent identity or live prompt content does not match the rendered bundle",
                "dependencies.lock.yaml", "the recorded baseline"),
     "rollback": ("tools/rollback-verify", "Verify live cluster state matches the intended restored definition.",
-                 ("bundle-matches-restored", "runtime-matches-restored", "memory-matches-restored",
-                  "proposal-matches-restored"), "bundle-readback.json",
+                 ("bundle-matches-restored", "agent-ready", "runtime-matches-restored",
+                  "memory-matches-restored", "proposal-matches-restored"), "bundle-readback.json",
                  "live Agent/Monitor configuration and prompt match the restored rendered bundle",
                  "live Agent/Monitor configuration or prompt does not match the restored rendered bundle",
                  "the restored dependencies.lock.yaml", "the restored baseline"),
 }
 _INCOMPLETE_NOTES = ("Agent, Monitor, or prompt ConfigMap readback could not be established",
+                     "Agent readiness readback could not be established",
                      "runtime image selector readback could not be established",
                      "memory inventory readback could not be established",
                      "proposal inventory readback could not be established")
 def validate_lifecycle_receipt(receipt, kind: str) -> list[str]:
     """Self-check before writing: exactly the fixed public-safe fields and assertion IDs, safe
     digests and counts, and an overall `pass` only when every assertion passed completely."""
-    expected_keys = LIFECYCLE_RECEIPT_KEYS | ({"restored", "limitations"} if kind == "rollback" else set())
+    assertions = receipt.get("assertions", {})
+    canonical = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    legacy = sha256_hex(canonical) in LEGACY_LIFECYCLE_RECEIPT_DIGESTS
+    base_keys = LEGACY_LIFECYCLE_RECEIPT_KEYS if legacy else LIFECYCLE_RECEIPT_KEYS
+    expected_keys = base_keys | ({"restored", "limitations"} if kind == "rollback" else set())
+    expected_assertions = tuple(assertion for assertion in _LIFECYCLE[kind][2]
+                                if not legacy or assertion != "agent-ready")
+    namespace = receipt.get("namespace")
     restored = receipt.get("restored")
     valid_restored = (isinstance(restored, dict) and set(restored) == {"model", "request-cap", "tools"}
                       and isinstance(restored["model"], str) and bool(restored["model"])
@@ -1027,8 +1044,14 @@ def validate_lifecycle_receipt(receipt, kind: str) -> list[str]:
     errors = [message for ok, message in (
         (set(receipt) == expected_keys, "lifecycle receipt fields are not the fixed public-safe set"),
         (receipt.get("kind") == kind, "lifecycle receipt declared kind does not match its filename"),
-        (set(receipt.get("assertions", {})) == set(_LIFECYCLE[kind][2]),
+        (set(assertions) == set(expected_assertions),
          "lifecycle receipt assertions are not the fixed public-safe set"),
+        (legacy or receipt.get("schema_version") == LIFECYCLE_RECEIPT_SCHEMA_VERSION,
+         "lifecycle receipt schema_version is unsupported"),
+        (legacy or namespace is None or is_safe_slug(namespace),
+         "namespace must be null or a safe slug"),
+        (legacy or receipt.get("verdict") != "pass" or isinstance(namespace, str),
+         "a passing lifecycle receipt requires a readback namespace"),
         (_is_hex_digest(receipt.get("bundle_digest")), "bundle_digest must be a 64-character lowercase hex string"),
         (_is_date(receipt.get("date")), "date must be an ISO YYYY-MM-DD string"),
         (all(is_safe_slug(name) and _is_image_digest(value) for name, value in receipt.get("digests", {}).items()),
@@ -1076,6 +1099,45 @@ def _monitor_spec_matches(authored, live) -> bool:
             holder.pop(path[-1])
     _prune_unwritten_empty_maps(normalized, authored)
     return normalized == authored
+
+def _current_agent_ready_condition(agent_obj):
+    if not isinstance(agent_obj, dict):
+        return None
+    metadata, status = agent_obj.get("metadata"), agent_obj.get("status")
+    generation = metadata.get("generation") if isinstance(metadata, dict) else None
+    conditions = status.get("conditions") if isinstance(status, dict) else None
+    if (not isinstance(generation, int) or isinstance(generation, bool) or generation < 1
+            or not isinstance(conditions, list)):
+        return None
+    return next((condition for condition in conditions
+                 if isinstance(condition, dict) and condition.get("type") == "Ready"
+                 and isinstance(condition.get("observedGeneration"), int)
+                 and not isinstance(condition["observedGeneration"], bool)
+                 and condition["observedGeneration"] > 0
+                 and condition["observedGeneration"] == generation), None)
+
+def _agent_ready_readback(agent_obj):
+    """Return tri-state readiness from the live Agent's current-generation Ready condition."""
+    if agent_obj is None:
+        return None
+    condition = _current_agent_ready_condition(agent_obj)
+    return condition is not None and condition.get("status") == "True"
+
+def wait_for_current_agent_readback(read_fn, *, sleep_fn=None, max_attempts: int = 10,
+                                    poll_interval_seconds: float = 0.5):
+    """Boundedly wait for reconciliation to publish a current-generation Ready condition."""
+    sleep = sleep_fn or time.sleep
+    latest = None
+    for attempt in range(max_attempts):
+        try:
+            latest = read_fn()
+        except KubectlError:
+            pass
+        if _current_agent_ready_condition(latest) is not None:
+            return latest
+        if attempt + 1 < max_attempts:
+            sleep(poll_interval_seconds)
+    return latest
 
 def _inventory_readback(api_base_url, path, token, expected_count):
     """Compare one inventory endpoint's item *count*; the receipt records only the count, while the
@@ -1134,53 +1196,84 @@ def _lifecycle_cli(kind: str, argv) -> int:
     def get(resource_type, name):
         return run_kubectl_json(args.context, args.kubeconfig, ["get", resource_type, name, "-n", args.namespace])
 
+    def optional_get(resource_type, name):
+        try:
+            return get(resource_type, name)
+        except KubectlError:
+            return None
+
+    agent_obj = wait_for_current_agent_readback(
+        lambda: get(args.agent_resource_type, names[0]))
+    configmap = optional_get("configmap", args.prompt_configmap_name)
+    monitor_obj = optional_get(args.monitor_resource_type, names[1]) if kind == "rollback" else None
     try:
-        agent_obj, configmap = get(args.agent_resource_type, names[0]), get("configmap", args.prompt_configmap_name)
-        monitor_obj = get(args.monitor_resource_type, names[1]) if kind == "rollback" else None
         runtime_configmap = run_kubectl_json(
             args.context, args.kubeconfig,
             ["get", "configmap", args.runtime_configmap_name, "-n", args.runtime_namespace])
     except KubectlError:
-        agent_obj = configmap = monitor_obj = runtime_configmap = None
-    primary_matched, primary_evidence = None, {}
-    if configmap is not None:
-        live_prompt = (configmap.get("data") or {}).get(args.prompt_configmap_key)
-        metadata = agent_obj.get("metadata") or {}
-        primary_matched = bool(
-            live_prompt is not None and sha256_hex(live_prompt.encode("utf-8")) == prompt_digest
-            and (metadata.get("uid") and metadata.get("generation") is not None if kind == "deploy"
-                 else agent_obj.get("spec") == agent_item.get("spec")
-                 and _monitor_spec_matches(monitor_item.get("spec"), monitor_obj.get("spec"))))
-        primary_evidence = {"agent": agent_obj, "configmap": configmap, "monitor": monitor_obj}
-    found = (None if runtime_configmap is None else
-             _DIGEST_SUFFIX_RE.search((runtime_configmap.get("data") or {}).get(args.runtime_configmap_key) or ""))
+        runtime_configmap = None
+    metadata = agent_obj.get("metadata") if isinstance(agent_obj, dict) else None
+    readback_namespace = metadata.get("namespace") if isinstance(metadata, dict) else None
+    primary_matched = None
+    primary_evidence = {"agent": agent_obj, "configmap": configmap, "monitor": monitor_obj}
+    primary_available = (agent_obj is not None and configmap is not None
+                         and (kind == "deploy" or monitor_obj is not None))
+    if primary_available:
+        primary_matched = False
+        if isinstance(agent_obj, dict) and isinstance(configmap, dict) \
+                and (kind == "deploy" or isinstance(monitor_obj, dict)):
+            config_data = configmap.get("data")
+            live_prompt = config_data.get(args.prompt_configmap_key) if isinstance(config_data, dict) else None
+            metadata = agent_obj.get("metadata") or {}
+            generation = metadata.get("generation") if isinstance(metadata, dict) else None
+            identity_present = (isinstance(metadata, dict) and bool(metadata.get("uid"))
+                                and isinstance(generation, int) and not isinstance(generation, bool))
+            primary_matched = bool(
+                readback_namespace == args.namespace
+                and isinstance(live_prompt, str)
+                and sha256_hex(live_prompt.encode("utf-8")) == prompt_digest
+                and (identity_present if kind == "deploy"
+                     else agent_obj.get("spec") == agent_item.get("spec")
+                     and _monitor_spec_matches(monitor_item.get("spec"), monitor_obj.get("spec"))))
+    runtime_data = runtime_configmap.get("data") if isinstance(runtime_configmap, dict) else None
+    runtime_value = runtime_data.get(args.runtime_configmap_key) if isinstance(runtime_data, dict) else ""
+    found = _DIGEST_SUFFIX_RE.search(runtime_value) if isinstance(runtime_value, str) else None
     observed = found.group(0) if found else None
     memory = _inventory_readback(args.api_base_url, "/memories", token, len(manifest.get("memoryEntries", [])))
     proposal = _inventory_readback(args.api_base_url, "/memory-proposals", token, len(manifest.get("proposals", [])))
     assertions = dict(zip(ids, (
         tri_state(primary_matched, match_note, mismatch_note, _INCOMPLETE_NOTES[0]),
+        tri_state(_agent_ready_readback(agent_obj),
+                  "Agent Ready condition is True for the readback generation",
+                  "Agent Ready condition is not True for the readback generation", _INCOMPLETE_NOTES[1]),
         *(tri_state(matched, f"{subject} matches {reference}", f"{subject} does not match {reference}", note)
           for matched, subject, reference, note in (
               (None if runtime_configmap is None else observed == lock_digest,
-               "installation-wide runtime image selector", lock_label, _INCOMPLETE_NOTES[1]),
-              (memory[0], "memory inventory count", baseline, _INCOMPLETE_NOTES[2]),
-              (proposal[0], "proposal inventory count", baseline, _INCOMPLETE_NOTES[3]))))))
-    receipt = {"kind": kind, "bundle_digest": bundle_digest, "date": args.date, "assertions": assertions,
+               "installation-wide runtime image selector", lock_label, _INCOMPLETE_NOTES[2]),
+              (memory[0], "memory inventory count", baseline, _INCOMPLETE_NOTES[3]),
+              (proposal[0], "proposal inventory count", baseline, _INCOMPLETE_NOTES[4]))))))
+    for name, data in ((primary_file, primary_evidence), ("runtime-readback.json", {"configmap": runtime_configmap}),
+                       ("memory-readback.json", memory[2]), ("proposal-readback.json", proposal[2])):
+        _write_json(Path(args.evidence_root) / name, data)
+    receipt = {"schema_version": LIFECYCLE_RECEIPT_SCHEMA_VERSION,
+               "kind": kind, "bundle_digest": bundle_digest, "date": args.date,
+               "namespace": readback_namespace, "assertions": assertions,
                "verdict": "pass" if all_assertions_pass_and_complete(assertions) else "fail",
                "digests": {"prompt": prompt_digest} | ({"runtime-image": observed} if observed else {}),
                "counts": {name: value for name, value in (("memory-items", memory[1]),
                                                           ("proposal-items", proposal[1])) if value is not None}}
     if kind == "rollback":
-        agent_spec = (agent_obj.get("spec") or {}) if isinstance(agent_obj, dict) else {}
-        runtime = agent_spec.get("runtime") or {}
-        receipt |= {"restored": {"model": (agent_spec.get("model") or {}).get("name"),
+        agent_spec = agent_obj.get("spec") if isinstance(agent_obj, dict) else None
+        agent_spec = agent_spec if isinstance(agent_spec, dict) else {}
+        model = agent_spec.get("model")
+        runtime = agent_spec.get("runtime")
+        model = model if isinstance(model, dict) else {}
+        runtime = runtime if isinstance(runtime, dict) else {}
+        receipt |= {"restored": {"model": model.get("name"),
                                   "request-cap": runtime.get("defaultMaxTurns"),
                                   "tools": runtime.get("defaultAllowedTools")},
                     "limitations": list(ROLLBACK_LIMITATIONS)}
     _require(validate_lifecycle_receipt(receipt, kind) + find_prohibited_in_document(receipt, "receipt"))
-    for name, data in ((primary_file, primary_evidence), ("runtime-readback.json", {"configmap": runtime_configmap}),
-                       ("memory-readback.json", memory[2]), ("proposal-readback.json", proposal[2])):
-        _write_json(Path(args.evidence_root) / name, data)
     _write_json(Path(args.agent_dir) / "lifecycle" / "receipts" / bundle_digest / f"{kind}.json", receipt)
     sys.stdout.write(_json_text({"bundle_digest": bundle_digest, "kind": kind, "verdict": receipt["verdict"]}))
     return 0

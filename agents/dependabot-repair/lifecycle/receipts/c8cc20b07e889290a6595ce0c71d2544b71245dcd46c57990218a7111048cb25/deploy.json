@@ -5,6 +5,11 @@
       "note": "applied Agent UID/generation present and live prompt matches the rendered prompt byte-for-byte",
       "verdict": "pass"
     },
+    "agent-ready": {
+      "evidence_completeness": true,
+      "note": "Agent Ready condition is True for the readback generation",
+      "verdict": "pass"
+    },
     "memory-inventory-matches-baseline": {
       "evidence_completeness": true,
       "note": "memory inventory count matches the recorded baseline",
@@ -26,11 +31,13 @@
     "memory-items": 0,
     "proposal-items": 0
   },
-  "date": "2026-09-21",
+  "date": "2026-09-22",
   "digests": {
     "prompt": "350cbc2d45ed66dac61a8d8d9e8cb2934e9b05a88a90a8056040df78095a49cf",
     "runtime-image": "sha256:2264f30ca2b529a0a330684fb112c2e1554440f50d50439e8802f9b40871ae98"
   },
   "kind": "deploy",
+  "namespace": "trial",
+  "schema_version": 2,
   "verdict": "pass"
 }
