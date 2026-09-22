@@ -18,6 +18,14 @@ A changed agent can merge only when every required case has a passing receipt
 for the new digest. CI renders the bundle and checks those receipts offline. It
 never contacts a cluster.
 
+For coordinating native agents, `dependencies.lock.yaml.catalogueAgents` is a
+catalogue/promotion pin, not immutable runtime binding: CI rerenders each
+pinned child per environment, requires the coordinator lock to match
+`allowedAgents`, and expands the reverse-dependent gate so a changed child also
+re-verifies every pinned coordinator that depends on it. That proves the
+catalogue pair is promoted together, but not that an already-running native
+Task is frozen to one child revision.
+
 ## Deploy and roll back
 
 `tools/deploy` applies the rendered bundle. It reads the Agent, prompt, runtime

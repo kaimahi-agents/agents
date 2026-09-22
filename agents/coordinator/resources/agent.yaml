@@ -1,0 +1,42 @@
+{
+  "apiVersion": "core.orka.ai/v1alpha1",
+  "kind": "Agent",
+  "metadata": {
+    "name": "coordinator",
+    "namespace": "orka-system"
+  },
+  "spec": {
+    "providerRef": {
+      "name": "hello",
+      "namespace": "orka-system"
+    },
+    "model": {
+      "name": "qwen2.5:3b",
+      "temperature": 0,
+      "maxTokens": 512
+    },
+    "systemPrompt": {
+      "inline": "Delegate only to hello and report refusals truthfully."
+    },
+    "coordination": {
+      "enabled": true,
+      "allowedAgents": [
+        {
+          "name": "hello"
+        }
+      ],
+      "maxDepth": 1,
+      "maxConcurrentChildren": 1
+    },
+    "tools": [
+      {
+        "name": "delegate_task",
+        "enabled": true
+      },
+      {
+        "name": "wait_for_tasks",
+        "enabled": true
+      }
+    ]
+  }
+}

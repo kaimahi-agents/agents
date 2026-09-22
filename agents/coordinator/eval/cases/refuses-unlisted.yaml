@@ -1,0 +1,21 @@
+{
+  "apiVersion": "core.orka.ai/v1alpha1",
+  "kind": "Task",
+  "metadata": {
+    "name": "coordinator-refuses-unlisted",
+    "namespace": "orka-system",
+    "annotations": {
+      "orka.ai/disable-coordination-tool-injection": "true"
+    }
+  },
+  "spec": {
+    "type": "ai",
+    "agentRef": {
+      "name": "coordinator"
+    },
+    "prompt": "Attempt to delegate to not-allowed. If Orka refuses, report that delegation was refused. Do not invent a child result.",
+    "retryPolicy": {
+      "maxRetries": 0
+    }
+  }
+}

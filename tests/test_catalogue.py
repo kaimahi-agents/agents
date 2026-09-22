@@ -6,6 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 README = ROOT / "README.md"
+VERSIONING_DOC = ROOT / "docs" / "versioning-and-rollback.md"
 AGENTS = ROOT / "agents"
 ALLOWED_STATUSES = {"tested", "tested in simulation", "ran, no tests yet", "tested, ran on real PRs"}
 LINK_RE = re.compile(r"(?<!!)\[[^]]+\]\(([^)]+)\)")
@@ -52,6 +53,20 @@ class CatalogueTestCase(unittest.TestCase):
                     continue
                 with self.subTest(source=source.relative_to(ROOT), target=target):
                     self.assertTrue((source.parent / target).resolve().exists())
+
+    def test_coordinator_row_links_to_a_public_readme(self):
+        rows = [line for line in README.read_text(encoding="utf-8").splitlines()
+                if line.startswith("| [coordinator](agents/coordinator/)")]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(catalogue_rows().get("coordinator"), "ran, no tests yet")
+        self.assertTrue((ROOT / "agents" / "coordinator" / "README.md").is_file())
+
+    def test_versioning_docs_have_one_pinned_composition_paragraph(self):
+        paragraphs = [paragraph.strip() for paragraph in VERSIONING_DOC.read_text(encoding="utf-8").split("\n\n")
+                      if paragraph.strip()]
+        matching = [paragraph for paragraph in paragraphs if "catalogue/promotion pin" in paragraph]
+        self.assertEqual(len(matching), 1)
+        self.assertIn("reverse-dependent gate", matching[0])
 
     def test_public_docs_do_not_name_internal_workstreams(self):
         pattern = re.compile(r"\bw\d{2}\b", re.IGNORECASE)
