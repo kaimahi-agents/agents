@@ -132,6 +132,14 @@ class VerifyAgentTestCase(unittest.TestCase):
         self.assertTrue(any("lifecycle receipt #" in error for error in errors))
         self.assertTrue(any("fixed public-safe set" in error for error in errors))
 
+    def test_only_the_exact_grandfathered_lifecycle_receipt_uses_the_legacy_schema(self):
+        path = REAL_AGENT / "lifecycle" / "receipts" / (
+            "50be51a4de3e857436fcebd244192d37590ea51f64d19a91216a2cfc13e532b8/deploy.json")
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(agentctl.validate_lifecycle_receipt(receipt, "deploy"), [])
+        receipt["assertions"]["agent-identity-readback"]["note"] += " changed"
+        self.assertTrue(agentctl.validate_lifecycle_receipt(receipt, "deploy"))
+
     def _write_policy_case(self, assertions):
         """Rewrite acceptance.md/policy file for a `missing-toolchain-v2` case and re-render, since
         changing acceptance.md's content moves the bundle digest."""

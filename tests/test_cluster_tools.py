@@ -682,8 +682,10 @@ class LifecycleCliTestCase(unittest.TestCase):
         self.items = {item["kind"]: item for item in rendered["items"]}
         self.prompt = self.items["ConfigMap"]["data"]["system.md"]
         self.kubectl = FakeKubectl({
-            ("agents.core.orka.ai", self.AGENT_NAME): {"metadata": {"uid": "u-1", "generation": 1},
-                                                       "spec": self.items["Agent"]["spec"]},
+            ("agents.core.orka.ai", self.AGENT_NAME): {
+                "metadata": {"uid": "u-1", "generation": 1, "namespace": NAMESPACE},
+                "spec": self.items["Agent"]["spec"],
+                "status": {"conditions": [{"type": "Ready", "status": "True", "observedGeneration": 1}]}},
             ("repositorymonitors.core.orka.ai", self.MONITOR_NAME): {"spec": self.items["RepositoryMonitor"]["spec"]},
             ("configmap", "system-prompt"): {"data": {"system.md": self.prompt}},
             ("configmap", "runtime-selector"): {"data": {"image": RUNTIME_IMAGE}}})
@@ -700,7 +702,7 @@ class LifecycleCliTestCase(unittest.TestCase):
     def run_lifecycle(self, kind, **overrides):
         with mock.patch.object(agentctl.subprocess, "run", self.kubectl), \
                 mock.patch.object(agentctl, "http_get_json", lambda *a, **k: {"items": []}), \
-                redirect_stdout(io.StringIO()) as out:
+                mock.patch.object(agentctl.time, "sleep"), redirect_stdout(io.StringIO()) as out:
             agentctl._lifecycle_cli(kind, self.argv(**overrides))
         return json.loads(out.getvalue())
 
@@ -716,8 +718,10 @@ class LifecycleCliTestCase(unittest.TestCase):
         receipt = self.receipt("deploy")
         self.assertEqual(agentctl.validate_lifecycle_receipt(receipt, "deploy"), [])
         self.assertEqual(set(receipt["assertions"]),
-                         {"agent-identity-readback", "runtime-image-matches-lock",
+                         {"agent-identity-readback", "agent-ready", "runtime-image-matches-lock",
                           "memory-inventory-matches-baseline", "proposal-inventory-matches-baseline"})
+        self.assertEqual(receipt["schema_version"], 2)
+        self.assertEqual(receipt["namespace"], NAMESPACE)
         self.assertEqual(receipt["digests"]["runtime-image"], RUNTIME_DIGEST)
         self.assertEqual(receipt["counts"], {"memory-items": 0, "proposal-items": 0})
 
@@ -727,6 +731,104 @@ class LifecycleCliTestCase(unittest.TestCase):
         self.assertEqual(runtime_call[runtime_call.index("-n") + 1], "runtime-system")
         agent_call = next(argv for argv, _ in self.kubectl.calls if self.AGENT_NAME in argv)
         self.assertEqual(agent_call[agent_call.index("-n") + 1], NAMESPACE)
+
+    def test_agent_readiness_requires_a_current_true_ready_condition(self):
+        for generation, conditions in (
+                (1, []),
+                (1, [{"type": "Ready", "status": "False", "observedGeneration": 1}]),
+                (1, [{"type": "Ready", "status": "True", "observedGeneration": 0}]),
+                (1, [{"type": "Ready", "status": "True", "observedGeneration": True}]),
+                (0, [{"type": "Ready", "status": "True", "observedGeneration": 0}]),
+                (True, [{"type": "Ready", "status": "True", "observedGeneration": True}])):
+            with self.subTest(conditions=conditions):
+                self.setUp()
+                agent = self.kubectl.responses[("agents.core.orka.ai", self.AGENT_NAME)]
+                agent["metadata"]["generation"] = generation
+                agent["status"] = {"conditions": conditions}
+                self.assertEqual(self.run_lifecycle("deploy")["verdict"], "fail")
+                self.assertEqual(self.receipt("deploy")["assertions"]["agent-ready"]["verdict"], "fail")
+
+    def test_readiness_poll_waits_for_the_current_generation(self):
+        responses = iter((
+            {"metadata": {"generation": 2}, "status": {"conditions": [
+                {"type": "Ready", "status": "True", "observedGeneration": 1}]}},
+            {"metadata": {"generation": 2}, "status": {"conditions": [
+                {"type": "Ready", "status": "True", "observedGeneration": 2}]}}))
+        sleeps = []
+        observed = agentctl.wait_for_current_agent_readback(
+            lambda: next(responses), sleep_fn=sleeps.append, max_attempts=2, poll_interval_seconds=0.25)
+        self.assertEqual(observed["status"]["conditions"][0]["observedGeneration"], 2)
+        self.assertEqual(sleeps, [0.25])
+
+    def test_readiness_poll_preserves_the_last_successful_readback(self):
+        stale = {"metadata": {"generation": 2, "namespace": NAMESPACE}, "status": {"conditions": [
+            {"type": "Ready", "status": "True", "observedGeneration": 1}]}}
+        reads = iter((stale, agentctl.KubectlError("failed")))
+        def read():
+            observed = next(reads)
+            if isinstance(observed, Exception):
+                raise observed
+            return observed
+        self.assertEqual(agentctl.wait_for_current_agent_readback(
+            read, sleep_fn=lambda _: None, max_attempts=2), stale)
+
+    def test_agent_readback_namespace_is_recorded_and_must_match(self):
+        self.kubectl.responses[("agents.core.orka.ai", self.AGENT_NAME)]["metadata"]["namespace"] = "other"
+        self.assertEqual(self.run_lifecycle("deploy")["verdict"], "fail")
+        receipt = self.receipt("deploy")
+        self.assertEqual(receipt["namespace"], "other")
+        self.assertEqual(receipt["assertions"]["agent-identity-readback"]["verdict"], "fail")
+
+    def test_failed_agent_readback_records_no_namespace_and_incomplete_readiness(self):
+        self.kubectl.failures.add(("agents.core.orka.ai", self.AGENT_NAME))
+        self.assertEqual(self.run_lifecycle("deploy")["verdict"], "fail")
+        receipt = self.receipt("deploy")
+        self.assertIsNone(receipt["namespace"])
+        self.assertEqual(receipt["assertions"]["agent-ready"]["verdict"], "not_evaluated")
+        self.assertFalse(receipt["assertions"]["agent-ready"]["evidence_completeness"])
+
+    def test_runtime_readback_failure_does_not_erase_agent_readiness_or_namespace(self):
+        self.kubectl.failures.add(("configmap", "runtime-selector"))
+        self.assertEqual(self.run_lifecycle("deploy")["verdict"], "fail")
+        receipt = self.receipt("deploy")
+        self.assertEqual(receipt["namespace"], NAMESPACE)
+        self.assertEqual(receipt["assertions"]["agent-ready"]["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["runtime-image-matches-lock"]["verdict"], "not_evaluated")
+
+    def test_prompt_readback_failure_preserves_agent_readiness_evidence(self):
+        self.kubectl.failures.add(("configmap", "system-prompt"))
+        self.assertEqual(self.run_lifecycle("deploy")["verdict"], "fail")
+        receipt = self.receipt("deploy")
+        self.assertEqual(receipt["assertions"]["agent-ready"]["verdict"], "pass")
+        evidence = json.loads((self.evidence / "identity-readback.json").read_text(encoding="utf-8"))
+        self.assertEqual(evidence["agent"]["metadata"]["uid"], "u-1")
+        self.assertIsNone(evidence["configmap"])
+
+    def test_malformed_readback_is_evidence_for_a_failure_not_a_crash(self):
+        self.kubectl.responses[("agents.core.orka.ai", self.AGENT_NAME)] = ["not", "an", "object"]
+        self.kubectl.responses[("configmap", "runtime-selector")] = "not-an-object"
+        self.assertEqual(self.run_lifecycle("deploy")["verdict"], "fail")
+        receipt = self.receipt("deploy")
+        self.assertEqual(receipt["assertions"]["agent-ready"]["verdict"], "fail")
+        evidence = json.loads((self.evidence / "identity-readback.json").read_text(encoding="utf-8"))
+        self.assertEqual(evidence["agent"], ["not", "an", "object"])
+
+    def test_malformed_rollback_contract_writes_a_failing_receipt(self):
+        agent = self.kubectl.responses[("agents.core.orka.ai", self.AGENT_NAME)]
+        agent["spec"] = {"model": "not-an-object", "runtime": "not-an-object"}
+        self.assertEqual(self.run_lifecycle("rollback")["verdict"], "fail")
+        receipt = self.receipt("rollback")
+        self.assertIsNone(receipt["restored"]["model"])
+        self.assertIsNone(receipt["restored"]["request-cap"])
+        self.assertIsNone(receipt["restored"]["tools"])
+
+    def test_invalid_readback_namespace_still_writes_raw_evidence(self):
+        agent = self.kubectl.responses[("agents.core.orka.ai", self.AGENT_NAME)]
+        agent["metadata"]["namespace"] = ["not", "a", "string"]
+        with self.assertRaises(agentctl.CliError):
+            self.run_lifecycle("deploy")
+        evidence = json.loads((self.evidence / "identity-readback.json").read_text(encoding="utf-8"))
+        self.assertEqual(evidence["agent"]["metadata"]["uid"], "u-1")
 
     def test_rollback_verify_applies_nothing_and_records_restored_contract_and_limits(self):
         self.run_lifecycle("rollback")
@@ -749,6 +851,15 @@ class LifecycleCliTestCase(unittest.TestCase):
         self.assertTrue(any("limitations" in error for error in errors))
         self.assertTrue(any("declared kind" in error for error in errors))
 
+    def test_new_receipt_cannot_opt_out_of_readiness_by_removing_new_fields(self):
+        self.run_lifecycle("deploy")
+        receipt = self.receipt("deploy")
+        receipt.pop("namespace")
+        receipt.pop("schema_version")
+        receipt["assertions"].pop("agent-ready")
+        receipt["date"] = "2026-09-20"
+        self.assertTrue(agentctl.validate_lifecycle_receipt(receipt, "deploy"))
+
     def test_a_lifecycle_receipt_is_public_safe(self):
         for kind in ("deploy", "rollback"):
             with self.subTest(kind=kind):
@@ -757,7 +868,7 @@ class LifecycleCliTestCase(unittest.TestCase):
                 receipt = self.receipt(kind)
                 self.assertEqual(agentctl.find_prohibited_in_document(receipt, "receipt"), [])
                 serialized = json.dumps(receipt)
-                for leaked in ("ctx", "cred", NAMESPACE, str(self.root), RUNTIME_IMAGE):
+                for leaked in ("ctx", "cred", str(self.root), RUNTIME_IMAGE):
                     self.assertNotIn(leaked, serialized)
 
     def test_both_commands_cross_check_the_rendered_namespace(self):
