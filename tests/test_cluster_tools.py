@@ -19,6 +19,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tests.fixtures import (  # noqa: E402
+    CONTROLLER_ALLOWLIST_PRE_DISPATCH,
     RUNTIME_DIGEST,
     acceptance_block,
     composed_case,
@@ -835,12 +836,34 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.pages_by_task = {}
         self.results_by_task = {}
         self.child_inventory = {"items": [self.child_task]}
+        self.probe_agent_name = "coordinator-refuses-probe-agent"
+        self.probe_task_name = "coordinator-refuses-probe-task"
+        self.probe_agent = {
+            "metadata": {"uid": "probe-agent-uid", "generation": 1, "namespace": NAMESPACE},
+            "spec": {"providerRef": {"name": "hello"},
+                     "systemPrompt": {"inline": "Controller allowlist probe."}},
+            "status": {"conditions": [{"type": "Ready", "status": "True", "observedGeneration": 1}]},
+        }
+        self.probe_task = native_terminal_task(
+            self.probe_task_name,
+            uid="probe-task-uid",
+            agent_name=self.probe_agent_name,
+            prompt="Controller allowlist probe.",
+            phase="Failed",
+            start="2026-09-17T10:05:30Z",
+            completion="2026-09-17T10:05:31Z",
+            parent_name=self.parent_tasks["refuses-unlisted"]["metadata"]["name"],
+        )
+        self.probe_task["status"] |= {"jobName": "", "jobUID": "",
+                                        "message": "agent \"coordinator-refuses-probe-agent\" not in parent's allowedAgents"}
         self.kubectl = FakeKubectl({
             ("tasks.core.orka.ai",): self._task_list_response,
             ("task", self.parent_tasks["delegates"]["metadata"]["name"]): self.parent_tasks["delegates"],
             ("task", self.parent_tasks["refuses-unlisted"]["metadata"]["name"]):
                 self.parent_tasks["refuses-unlisted"],
             ("task", self.child_task["metadata"]["name"]): self.child_task,
+            ("task", self.probe_task_name): self.probe_task,
+            ("jobs.batch",): {"items": []},
             ("agents.core.orka.ai", "hello"): {
                 "metadata": {"uid": "hello-agent-uid", "generation": 1, "namespace": NAMESPACE},
                 "spec": self.hello_spec,
@@ -851,6 +874,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
                 "spec": self.coordinator_spec,
                 "status": {"conditions": [{"type": "Ready", "status": "True", "observedGeneration": 1}]},
             },
+            ("agents.core.orka.ai", self.probe_agent_name): self.probe_agent,
         })
 
     def _task_list_response(self, argv, _kwargs):
@@ -1013,6 +1037,203 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.assertEqual(summary["verdict"], "fail")
         self.assertEqual(receipt["assertions"]["attempted-unlisted-delegation"]["verdict"], "not_evaluated")
         self.assertEqual(receipt["assertions"]["worker-tool-pre-creation"]["verdict"], "not_evaluated")
+
+    def test_controller_allowlist_probe_runs_once_with_refusal_evidence_and_cleanup(self):
+        parent_name = self.parent_tasks["refuses-unlisted"]["metadata"]["name"]
+        self.pages_by_task[parent_name] = [{"events": [
+            {"seq": 1, "type": "ToolCallStarted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "tool": {"name": "delegate_task",
+                      "arguments": {"agent": "not-allowed", "prompt": "try anyway"}}},
+            {"seq": 2, "type": "ToolCallFailed", "toolCallID": "call-1", "toolName": "delegate_task",
+             "contentText": "delegation refused before task creation"},
+            {"seq": 3, "type": "ModelMessage", "contentText": "Delegation was refused."},
+        ], "latestSeq": 3}]
+        self.results_by_task = {parent_name: "Delegation was refused."}
+        self.child_inventory = {"items": []}
+
+        summary = self.run_eval("refuses-unlisted", self.root / "refuses-task.json")
+        receipt = self.receipt("refuses-unlisted")
+
+        self.assertEqual(summary["verdict"], "pass")
+        self.assertEqual(receipt.get("observations"), CONTROLLER_ALLOWLIST_PRE_DISPATCH)
+        self.assertTrue((self.evidence / "refuses-unlisted" / "controller-allowlist-probe-task.json").is_file())
+        self.assertTrue((self.evidence / "refuses-unlisted" / "controller-allowlist-probe-jobs.json").is_file())
+        ledger = json.loads((self.evidence / "campaign-ledger.json").read_text(encoding="utf-8"))
+        self.assertEqual(ledger, {"entries": [
+            {"case": "refuses-unlisted", "attempt": 1, "parent_count": 1,
+             "child_count": 0, "actual_child_count": 0, "probe_count": 0, "cumulative_total": 1},
+            {"case": "controller-allowlist-pre-dispatch", "attempt": 1, "parent_count": 0,
+             "child_count": 0, "probe_count": 1, "cumulative_total": 2},
+        ]})
+
+        create_inputs = [json.loads(kwargs["input"]) for argv, kwargs in self.kubectl.calls
+                         if argv and argv[0] == "kubectl" and argv[5] == "create"]
+        self.assertEqual(len(create_inputs), 2)
+        probe_manifest = create_inputs[1]
+        self.assertEqual(probe_manifest["spec"]["agentRef"]["name"], self.probe_agent_name)
+        self.assertEqual(probe_manifest["metadata"]["labels"]["orka.ai/parent-task"], parent_name)
+        self.assertEqual(probe_manifest["metadata"]["annotations"]["orka.ai/parent-task-name"], parent_name)
+        self.assertEqual(probe_manifest["metadata"]["annotations"]["orka.ai/coordination-depth"], "1")
+        self.assertNotIn("ownerReferences", probe_manifest["metadata"])
+        delete_calls = [argv for argv, _ in self.kubectl.calls if argv and argv[0] == "kubectl" and argv[5] == "delete"]
+        self.assertEqual(delete_calls[-3:], [
+            ["kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "task", self.probe_task_name,
+             "-n", NAMESPACE, "--ignore-not-found"],
+            ["kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "agents.core.orka.ai",
+             self.probe_agent_name, "-n", NAMESPACE, "--ignore-not-found"],
+            ["kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "task", parent_name,
+             "-n", NAMESPACE, "--ignore-not-found"],
+        ])
+
+    def test_controller_allowlist_probe_is_skipped_after_a_prior_probe_reservation(self):
+        parent_name = self.parent_tasks["refuses-unlisted"]["metadata"]["name"]
+        write_json(self.evidence / "campaign-ledger.json", {"entries": [{
+            "case": "controller-allowlist-pre-dispatch", "attempt": 1, "parent_count": 0,
+            "child_count": 0, "probe_count": 1, "cumulative_total": 1,
+        }]})
+        self.pages_by_task[parent_name] = [{"events": [
+            {"seq": 1, "type": "ToolCallStarted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "tool": {"name": "delegate_task",
+                      "arguments": {"agent": "not-allowed", "prompt": "try anyway"}}},
+            {"seq": 2, "type": "ToolCallFailed", "toolCallID": "call-1", "toolName": "delegate_task",
+             "contentText": "delegation refused before task creation"},
+            {"seq": 3, "type": "ModelMessage", "contentText": "Delegation was refused."},
+        ], "latestSeq": 3}]
+        self.results_by_task = {parent_name: "Delegation was refused."}
+        self.child_inventory = {"items": []}
+
+        summary = self.run_eval("refuses-unlisted", self.root / "refuses-task.json")
+        receipt = self.receipt("refuses-unlisted")
+
+        self.assertEqual(summary["verdict"], "pass")
+        self.assertNotIn("observations", receipt)
+        self.assertEqual(self.kubectl.verbs().count("apply"), 2)
+        self.assertEqual(self.kubectl.verbs().count("create"), 1)
+        self.assertEqual(self.kubectl.verbs().count("delete"), 1)
+        ledger = json.loads((self.evidence / "campaign-ledger.json").read_text(encoding="utf-8"))
+        self.assertEqual(ledger, {"entries": [
+            {"case": "controller-allowlist-pre-dispatch", "attempt": 1, "parent_count": 0,
+             "child_count": 0, "probe_count": 1, "cumulative_total": 1},
+            {"case": "refuses-unlisted", "attempt": 1, "parent_count": 1,
+             "child_count": 0, "actual_child_count": 0, "probe_count": 0, "cumulative_total": 2},
+        ]})
+
+
+class ControllerAllowlistProbeTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.evidence_root = self.root / "evidence"
+        self.evidence_dir = self.evidence_root / "refuses-unlisted"
+        self.parent_task = native_terminal_task(
+            "coordinator-refuses-unlisted",
+            uid="refuse-parent-uid",
+            agent_name="coordinator",
+            prompt=REFUSAL_PROMPT,
+        )
+        self.coordinator = {
+            "metadata": {"uid": "coordinator-agent-uid", "generation": 1, "namespace": NAMESPACE},
+            "spec": self._coordinator_spec(),
+            "status": {"conditions": [{"type": "Ready", "status": "True", "observedGeneration": 1}]},
+        }
+        self.args = type("ProbeArgs", (), {
+            "context": "ctx", "kubeconfig": "cred", "namespace": NAMESPACE,
+            "evidence_root": self.evidence_root, "max_poll_attempts": 2, "poll_interval_seconds": 0.1,
+        })()
+        self.kubectl = FakeKubectl()
+
+    def _coordinator_spec(self):
+        return {
+            "providerRef": {"name": "hello"},
+            "systemPrompt": {"inline": "Delegate only to hello and report refusals truthfully."},
+            "coordination": {"enabled": True, "allowedAgents": [{"name": "hello"}],
+                              "maxDepth": 1, "maxConcurrentChildren": 1},
+            "tools": [{"name": "delegate_task", "enabled": True},
+                      {"name": "wait_for_tasks", "enabled": True}],
+        }
+
+    def _configure_probe_success(self):
+        probe_agent_name = "coordinator-refuses-probe-agent"
+        probe_task_name = "coordinator-refuses-probe-task"
+        self.kubectl.responses[("agents.core.orka.ai", probe_agent_name)] = {
+            "metadata": {"uid": "probe-agent-uid", "generation": 1, "namespace": NAMESPACE},
+            "spec": {"providerRef": {"name": "hello"},
+                     "systemPrompt": {"inline": "Controller allowlist probe."}},
+            "status": {"conditions": [{"type": "Ready", "status": "True", "observedGeneration": 1}]},
+        }
+        probe_task = native_terminal_task(
+            probe_task_name,
+            uid="probe-task-uid",
+            agent_name=probe_agent_name,
+            prompt="Controller allowlist probe.",
+            phase="Failed",
+            parent_name=self.parent_task["metadata"]["name"],
+        )
+        probe_task["status"] |= {"jobName": "", "jobUID": "",
+                                  "message": "agent \"coordinator-refuses-probe-agent\" not in parent's allowedAgents"}
+        self.kubectl.responses[("task", probe_task_name)] = probe_task
+        self.kubectl.responses[("jobs.batch",)] = {"items": []}
+        return probe_agent_name, probe_task_name
+
+    def _run_probe(self):
+        with mock.patch.object(agentctl.subprocess, "run", self.kubectl), \
+                mock.patch.object(agentctl.time, "sleep"):
+            return agentctl.run_controller_allowlist_probe(
+                self.args, evidence_dir=self.evidence_dir, coordinator_live=self.coordinator,
+                refusal_parent_task=self.parent_task)
+
+    def test_controller_allowlist_probe_returns_the_fixed_observation_and_cleans_up(self):
+        probe_agent_name, probe_task_name = self._configure_probe_success()
+        observation = self._run_probe()
+        self.assertEqual(observation, CONTROLLER_ALLOWLIST_PRE_DISPATCH["controller-allowlist-pre-dispatch"])
+        self.assertTrue((self.evidence_dir / "controller-allowlist-probe-task.json").is_file())
+        self.assertTrue((self.evidence_dir / "controller-allowlist-probe-jobs.json").is_file())
+        ledger = json.loads((self.evidence_root / "campaign-ledger.json").read_text(encoding="utf-8"))
+        self.assertEqual(ledger, {"entries": [{
+            "case": "controller-allowlist-pre-dispatch", "attempt": 1, "parent_count": 0,
+            "child_count": 0, "probe_count": 1, "cumulative_total": 1,
+        }]})
+        delete_calls = [argv for argv, _ in self.kubectl.calls if argv and argv[0] == "kubectl" and argv[5] == "delete"]
+        self.assertEqual(delete_calls, [
+            ["kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "task", probe_task_name,
+             "-n", NAMESPACE, "--ignore-not-found"],
+            ["kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "agents.core.orka.ai",
+             probe_agent_name, "-n", NAMESPACE, "--ignore-not-found"],
+        ])
+
+    def test_controller_allowlist_probe_failures_still_clean_up_and_keep_budget_consumed(self):
+        for scenario in ("agent-apply", "agent-not-ready", "task-create", "task-not-allowlist-failure",
+                         "job-created"):
+            with self.subTest(scenario=scenario):
+                self.setUp()
+                probe_agent_name, probe_task_name = self._configure_probe_success()
+                if scenario == "agent-apply":
+                    self.kubectl.failures.add(("apply",))
+                elif scenario == "agent-not-ready":
+                    self.kubectl.responses[("agents.core.orka.ai", probe_agent_name)]["status"] = {
+                        "conditions": [{"type": "Ready", "status": "False", "observedGeneration": 1}]}
+                elif scenario == "task-create":
+                    self.kubectl.failures.add(("create",))
+                elif scenario == "task-not-allowlist-failure":
+                    self.kubectl.responses[("task", probe_task_name)]["status"]["message"] = "different failure"
+                elif scenario == "job-created":
+                    self.kubectl.responses[("jobs.batch",)] = {"items": [{"metadata": {"name": "job-1"}}]}
+                with self.assertRaises(agentctl.CliError):
+                    self._run_probe()
+                ledger = json.loads((self.evidence_root / "campaign-ledger.json").read_text(encoding="utf-8"))
+                self.assertEqual(ledger, {"entries": [{
+                    "case": "controller-allowlist-pre-dispatch", "attempt": 1, "parent_count": 0,
+                    "child_count": 0, "probe_count": 1, "cumulative_total": 1,
+                }]})
+                delete_calls = [argv for argv, _ in self.kubectl.calls
+                                if argv and argv[0] == "kubectl" and argv[5] == "delete"]
+                self.assertEqual(delete_calls[-2:], [
+                    ["kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "task", probe_task_name,
+                     "-n", NAMESPACE, "--ignore-not-found"],
+                    ["kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "agents.core.orka.ai",
+                     probe_agent_name, "-n", NAMESPACE, "--ignore-not-found"],
+                ])
 
 
 class LifecycleCliTestCase(unittest.TestCase):

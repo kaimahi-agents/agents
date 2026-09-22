@@ -1160,6 +1160,11 @@ def reconcile_campaign_entry(evidence_root, case_id: str, attempt: int, *, paren
     _require(_validate_campaign_ledger(ledger))
     _write_json_atomic(_campaign_ledger_path(evidence_root), ledger)
     return next(entry for entry in ledger["entries"] if entry["case"] == case_id and entry["attempt"] == attempt)
+
+def campaign_case_reserved(evidence_root, case_id: str) -> bool:
+    if not is_safe_slug(case_id):
+        raise CliError(f"case_id must be a safe slug ({SAFE_SLUG_CONTRACT})")
+    return any(entry["case"] == case_id for entry in _load_campaign_ledger(evidence_root)["entries"])
 def check_window_covers_task(window_start, window_end, task_start, task_end) -> list[str]:
     """Diagnostics; empty means the asserted window covers the Task exactly, with no tolerance."""
     if window_end < window_start:
@@ -1321,9 +1326,22 @@ def load_composed_coordination_case(agent_dir, case_id: str, environment: str) -
 _DISABLE_COORDINATION_TOOL_INJECTION = "orka.ai/disable-coordination-tool-injection"
 _PARENT_TASK_LABEL = "orka.ai/parent-task"
 _PARENT_TASK_NAME_ANNOTATION = "orka.ai/parent-task-name"
+_COORDINATION_DEPTH_ANNOTATION = "orka.ai/coordination-depth"
+_TASK_LABEL = "orka.ai/task"
 _DELEGATED_AGENT_LABEL = "orka.ai/delegated-agent"
 _EXPECTED_COMPOSED_CHILD = "hello"
 _FIXED_GREETING_CASE_ID = "fixed-greeting"
+_CONTROLLER_ALLOWLIST_PROBE_AGENT = "coordinator-refuses-probe-agent"
+_CONTROLLER_ALLOWLIST_PROBE_TASK = "coordinator-refuses-probe-task"
+_CONTROLLER_ALLOWLIST_PROBE_PROMPT = "Controller allowlist probe."
+_CONTROLLER_ALLOWLIST_FAILURE_FRAGMENT = "not in parent's allowedAgents"
+_CONTROLLER_ALLOWLIST_PROBE_FILES = (
+    "controller-allowlist-probe-agent-manifest.json",
+    "controller-allowlist-probe-agent-readback.json",
+    "controller-allowlist-probe-task-manifest.json",
+    "controller-allowlist-probe-task.json",
+    "controller-allowlist-probe-jobs.json",
+)
 
 def get_task_result(base_url, task_name, namespace, *, token=None) -> str:
     """Fetch one authenticated task result as plain text."""
@@ -1406,6 +1424,93 @@ def tool_events_by_call_id(events) -> tuple[dict[str, list[dict]], dict[str, lis
         bucket = started if event.get("type") == _TOOL_CALL_STARTED_TYPE else terminal
         bucket.setdefault(tool_call_id, []).append(event)
     return started, terminal
+
+def run_controller_allowlist_probe(args, *, evidence_dir: Path, coordinator_live, refusal_parent_task) -> dict:
+    metadata = coordinator_live.get("metadata") if isinstance(coordinator_live, dict) else None
+    spec = coordinator_live.get("spec") if isinstance(coordinator_live, dict) else None
+    provider_ref = spec.get("providerRef") if isinstance(spec, dict) else None
+    provider_name = provider_ref.get("name") if isinstance(provider_ref, dict) else None
+    parent_metadata = refusal_parent_task.get("metadata") if isinstance(refusal_parent_task, dict) else None
+    parent_name = parent_metadata.get("name") if isinstance(parent_metadata, dict) else None
+    if not isinstance(provider_name, str) or not provider_name:
+        raise CliError("controller allowlist probe requires a live coordinator providerRef.name")
+    if not isinstance(parent_name, str) or not parent_name:
+        raise CliError("controller allowlist probe requires the completed refusal parent name")
+    reserve_campaign_entry(args.evidence_root, CONTROLLER_ALLOWLIST_OBSERVATION_ID,
+                           parent_count=0, child_count=0, probe_count=1)
+    evidence_dir = Path(evidence_dir)
+    probe_agent_manifest = {
+        "apiVersion": "core.orka.ai/v1alpha1",
+        "kind": "Agent",
+        "metadata": {"name": _CONTROLLER_ALLOWLIST_PROBE_AGENT, "namespace": args.namespace},
+        "spec": {"providerRef": {"name": provider_name},
+                  "systemPrompt": {"inline": _CONTROLLER_ALLOWLIST_PROBE_PROMPT}},
+    }
+    probe_task_manifest = {
+        "apiVersion": "core.orka.ai/v1alpha1",
+        "kind": "Task",
+        "metadata": {
+            "name": _CONTROLLER_ALLOWLIST_PROBE_TASK,
+            "namespace": args.namespace,
+            "labels": {_PARENT_TASK_LABEL: parent_name},
+            "annotations": {_PARENT_TASK_NAME_ANNOTATION: parent_name,
+                             _COORDINATION_DEPTH_ANNOTATION: "1"},
+        },
+        "spec": {"type": "ai", "agentRef": {"name": _CONTROLLER_ALLOWLIST_PROBE_AGENT},
+                 "prompt": _CONTROLLER_ALLOWLIST_PROBE_PROMPT,
+                 "retryPolicy": {"maxRetries": 0}},
+    }
+    _write_json(evidence_dir / _CONTROLLER_ALLOWLIST_PROBE_FILES[0], probe_agent_manifest)
+    _write_json(evidence_dir / _CONTROLLER_ALLOWLIST_PROBE_FILES[2], probe_task_manifest)
+    try:
+        applied = run_kubectl(args.context, args.kubeconfig,
+                              ["apply", "-n", args.namespace,
+                               "-f", str(evidence_dir / _CONTROLLER_ALLOWLIST_PROBE_FILES[0])])
+        if applied.returncode != 0:
+            raise CliError(f"controller allowlist probe Agent apply failed (kubectl exited {applied.returncode})")
+        probe_agent = wait_for_current_agent_readback(
+            lambda: run_kubectl_json(args.context, args.kubeconfig,
+                                     ["get", "agents.core.orka.ai", _CONTROLLER_ALLOWLIST_PROBE_AGENT,
+                                      "-n", args.namespace]),
+            max_attempts=args.max_poll_attempts, poll_interval_seconds=args.poll_interval_seconds)
+        _write_json(evidence_dir / _CONTROLLER_ALLOWLIST_PROBE_FILES[1], probe_agent)
+        if _agent_ready_readback(probe_agent) is not True:
+            raise CliError("controller allowlist probe target Agent did not become Ready")
+        submit = run_kubectl(args.context, args.kubeconfig, ["create", "-n", args.namespace, "-f", "-"],
+                             input=json.dumps(probe_task_manifest))
+        if submit.returncode != 0:
+            raise CliError(f"controller allowlist probe Task submission failed (kubectl exited {submit.returncode})")
+        probe_task = wait_for_terminal(
+            lambda: run_kubectl_json(args.context, args.kubeconfig,
+                                     ["get", "task", _CONTROLLER_ALLOWLIST_PROBE_TASK, "-n", args.namespace]),
+            max_attempts=args.max_poll_attempts, poll_interval_seconds=args.poll_interval_seconds)
+        _write_json(evidence_dir / _CONTROLLER_ALLOWLIST_PROBE_FILES[3], probe_task)
+        jobs = run_kubectl_json(args.context, args.kubeconfig,
+                                ["get", "jobs.batch", "-n", args.namespace,
+                                 "-l", f"{_TASK_LABEL}={_CONTROLLER_ALLOWLIST_PROBE_TASK}"])
+        _write_json(evidence_dir / _CONTROLLER_ALLOWLIST_PROBE_FILES[4], jobs)
+        status = probe_task.get("status") if isinstance(probe_task, dict) else None
+        phase = status.get("phase") if isinstance(status, dict) else None
+        message = status.get("message") if isinstance(status, dict) else None
+        if phase != "Failed":
+            raise CliError("controller allowlist probe Task did not fail before dispatch")
+        if not isinstance(message, str) or _CONTROLLER_ALLOWLIST_FAILURE_FRAGMENT not in message:
+            raise CliError("controller allowlist probe Task did not fail at the controller allowlist check")
+        if isinstance(status, dict) and status.get("jobName") not in (None, ""):
+            raise CliError("controller allowlist probe Task recorded a Job name")
+        if isinstance(status, dict) and status.get("jobUID") not in (None, ""):
+            raise CliError("controller allowlist probe Task recorded a Job UID")
+        items = jobs.get("items") if isinstance(jobs, dict) else None
+        if not isinstance(items, list) or items:
+            raise CliError("controller allowlist probe observed worker Jobs despite pre-dispatch refusal")
+        return dict(CONTROLLER_ALLOWLIST_OBSERVATION)
+    finally:
+        run_kubectl(args.context, args.kubeconfig,
+                    ["delete", "task", _CONTROLLER_ALLOWLIST_PROBE_TASK, "-n", args.namespace,
+                     "--ignore-not-found"])
+        run_kubectl(args.context, args.kubeconfig,
+                    ["delete", "agents.core.orka.ai", _CONTROLLER_ALLOWLIST_PROBE_AGENT, "-n", args.namespace,
+                     "--ignore-not-found"])
 
 # --- CLI entry points -----------------------------------------------------------------------
 def _guard(name: str, run, argv) -> int:
@@ -2080,7 +2185,6 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict, dict | No
         "parent-task-succeeded": settled(parent_phase == "Succeeded",
                                           "the parent Task succeeded" if parent_phase == "Succeeded"
                                           else "the parent Task did not succeed"),
-        "expected-delegation-tool-calls": expected_call_assertion(),
         "no-unexpected-tool-calls": no_unexpected_assertion(),
         "stayed-within-limits": ((lambda within: settled(
             within,
@@ -2091,6 +2195,7 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict, dict | No
             if established and journal_complete and child_inventory_known else
             not_evaluated("provider, child, tool, or retry bounds were not fully established")),
     }
+    observation = None
     if args.case_id == "delegates":
         child = child_terminal_tasks[0] if len(child_terminal_tasks) == 1 else None
         child_name = ((child.get("metadata") or {}).get("name") if isinstance(child, dict) else None)
@@ -2104,6 +2209,7 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict, dict | No
             child_targeted = (labels.get(_DELEGATED_AGENT_LABEL) == _EXPECTED_COMPOSED_CHILD
                               and isinstance(agent_ref, dict) and agent_ref.get("name") == _EXPECTED_COMPOSED_CHILD)
         assertions |= {
+            "expected-delegation-tool-calls": expected_call_assertion(),
             "exactly-one-child-task": ((lambda exact: settled(
                 exact, "exactly one genuine child Task was captured" if exact
                 else "the genuine child Task count was not exactly one"))(len(genuine_children) == 1)
@@ -2143,6 +2249,12 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict, dict | No
                 "the authenticated parent result did not report refusal safely",
                 "the authenticated parent result could not be established"),
         }
+        if not campaign_case_reserved(args.evidence_root, CONTROLLER_ALLOWLIST_OBSERVATION_ID):
+            if not child_inventory_known or len(genuine_children) != 0:
+                raise CliError("controller allowlist probe requires an authoritative zero-child refusal inventory")
+            observation = run_controller_allowlist_probe(
+                args, evidence_dir=evidence_dir, coordinator_live=coordinator_live,
+                refusal_parent_task=terminal_task)
     evidence_sha256 = list(dict.fromkeys(
         _write_json(evidence_dir / name, data) for name, data in (
             ("task-manifest.json", task_manifest), ("terminal-task.json", terminal_task),
@@ -2151,12 +2263,18 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict, dict | No
             ("coordinator-agent-readback.json", coordinator_live),
             ("parent-result.json", {"result": parent_result}), ("child-inventory.json", raw_child_inventory),
             ("child-tasks.json", {"items": child_terminal_tasks}), ("child-results.json", child_results))))
+    if observation is not None:
+        for name in _CONTROLLER_ALLOWLIST_PROBE_FILES:
+            evidence_sha256.append(sha256_hex((evidence_dir / name).read_bytes()))
+        evidence_sha256 = list(dict.fromkeys(evidence_sha256))
     receipt = {"case_id": args.case_id, "bundle_digest": bundle_digest, "date": args.date,
                "source": args.source, "model": args.model,
                "request_count": count if established else None,
                "verdict": "pass" if all_assertions_pass_and_complete(assertions) else "fail",
                "assertions": assertions, "tool_calls": {"total": total_calls, "redacted": redacted_calls},
                "evidence_sha256": evidence_sha256}
+    if observation is not None:
+        receipt["observations"] = {CONTROLLER_ALLOWLIST_OBSERVATION_ID: observation}
     cleanup = {"task_name": task_name, "namespace": args.namespace} if reserved else None
     return {"bundle_digest": bundle_digest, "case_id": args.case_id,
             "verdict": receipt["verdict"], "request_count": receipt["request_count"]}, receipt, cleanup
