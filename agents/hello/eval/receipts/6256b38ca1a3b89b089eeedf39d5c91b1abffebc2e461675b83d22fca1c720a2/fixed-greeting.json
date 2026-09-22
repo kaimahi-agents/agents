@@ -4,7 +4,7 @@
   "date": "2026-09-22",
   "source": "live",
   "model": "qwen2.5:3b",
-  "request_count": 2,
+  "request_count": 3,
   "verdict": "pass",
   "assertions": {
     "single-task": {
@@ -35,18 +35,19 @@
     "bounded-requests": {
       "verdict": "pass",
       "evidence_completeness": true,
-      "note": "Exactly 2 completion POSTs were observed in the bounded evidence window, within the limit of 5."
+      "note": "3 total provider requests in the bounded window (2 successful chat completions, 1 rejected responses call), within the limit of 5."
     }
   },
   "evidence_sha256": [
     "367e140b1cb5595d44ec4272ac5e08c729b9ee957ae306983a806ac21a00e21a",
     "39fa2bbaee0909558ee233a9b5864cb541c66743147fc83f676544e95ef40e6a",
     "72b8853653aff94f7dc64c25496f2622e26668a443fa4572ee3884a99ee22271",
+    "2adeae0d9cc9b23fdbdff60c85f6406df0dbdf5799ace445ea51954e9121ed37",
     "a1da6abc6f212cb13df94119e324a29e976f8fdb74eede6d3b7b5b0e2b7671e4",
     "6867d10136a3d7408937fae02e60488f1dcbd634ed2ef1812ecf09689e6c63e9",
     "5471f1d4a822af4d7a251201e46ec7a79d4532ebec4103105c923e7abb66cc7d",
     "823019d029aa3de7053e8bfb4c200aa8a2bb22194a29fef082db243c4bf16be6",
-    "4f98442cba9dae548080747d8897d56e907573712952a258d2d5fa61c9eccc57",
+    "6e8adf8fd07dabee426f31667fcd6a59a7eafa2d59ccb595eaf67bbcb924d8d6",
     "7cc0c3c277918b465588cd7ac118bf71757f1daf6748de17db9075c7f338e90c",
     "e6e60f8e1f1945119d2fcdce629b946d8cfffe58490c09b0bc7c6486c75b8bf7",
     "4fb3e10b669aa65c95427fc3767afd858d23be159e918c6fc1e6d49a4ffab6d9"
