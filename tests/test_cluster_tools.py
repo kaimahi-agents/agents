@@ -230,20 +230,24 @@ class EvaluationMechanicsTestCase(unittest.TestCase):
         ]))
         self.assertEqual([row["path"] for row in rows], ["/v1/responses", "/v1/chat/completions"])
 
-    def test_campaign_ledger_reserves_reconciles_and_projects_retries(self):
+    def test_campaign_ledger_reconciliation_is_monotonic_and_projects_retries(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             first = agentctl.reserve_campaign_entry(root, "delegates", parent_count=1, child_count=1, probe_count=0)
             self.assertEqual(first, {"case": "delegates", "attempt": 1, "parent_count": 1,
                                      "child_count": 1, "probe_count": 0, "cumulative_total": 2})
-            agentctl.reconcile_campaign_entry(root, "delegates", 1, parent_count=1, child_count=0, probe_count=0)
+            reconciled = agentctl.reconcile_campaign_entry(root, "delegates", 1, parent_count=1, child_count=0,
+                                                           probe_count=0)
+            self.assertEqual(reconciled["cumulative_total"], 2)
+            self.assertEqual(reconciled["child_count"], 1)
+            self.assertEqual(reconciled["actual_child_count"], 0)
             ledger = json.loads((root / "campaign-ledger.json").read_text(encoding="utf-8"))
             self.assertEqual(ledger, {"entries": [{"case": "delegates", "attempt": 1, "parent_count": 1,
-                                                    "child_count": 0, "probe_count": 0,
-                                                    "cumulative_total": 1}]})
+                                                    "child_count": 1, "actual_child_count": 0,
+                                                    "probe_count": 0, "cumulative_total": 2}]})
             second = agentctl.reserve_campaign_entry(root, "delegates", parent_count=1, child_count=1, probe_count=0)
             self.assertEqual(second["attempt"], 2)
-            self.assertEqual(second["cumulative_total"], 3)
+            self.assertEqual(second["cumulative_total"], 4)
 
     def test_campaign_ledger_fails_closed_on_malformed_content_and_above_ten(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -914,6 +918,41 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.assertEqual(len(result_calls), 2)
         self.assertEqual(self.kubectl.verbs().count("apply"), 2)
         self.assertEqual(self.kubectl.verbs().count("delete"), 1)
+        ledger = json.loads((self.evidence / "campaign-ledger.json").read_text(encoding="utf-8"))
+        self.assertEqual(ledger, {"entries": [{"case": "delegates", "attempt": 1, "parent_count": 1,
+                                                "child_count": 1, "actual_child_count": 1,
+                                                "probe_count": 0, "cumulative_total": 2}]})
+
+    def test_failure_after_evidence_capture_preserves_root_and_monotonic_budget(self):
+        parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
+        self.pages_by_task[parent_name] = [{"events": [
+            {"seq": 1, "type": "ToolCallStarted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "tool": {"name": "delegate_task",
+                      "arguments": {"agent": "hello", "prompt": f"Reply exactly: {FIXED_PHRASE}"}}},
+            {"seq": 2, "type": "ToolCallCompleted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "contentText": "delegated"},
+            {"seq": 3, "type": "ToolCallStarted", "toolCallID": "call-2", "toolName": "wait_for_tasks",
+             "tool": {"name": "wait_for_tasks", "arguments": {"tasks": [self.child_task["metadata"]["name"]]}}},
+            {"seq": 4, "type": "ToolCallCompleted", "toolCallID": "call-2", "toolName": "wait_for_tasks",
+             "contentText": "done"},
+            {"seq": 5, "type": "ModelMessage", "contentText": FIXED_PHRASE},
+        ], "latestSeq": 5}]
+        self.results_by_task = {parent_name: FIXED_PHRASE, self.child_task["metadata"]["name"]: FIXED_PHRASE}
+        original_write_json = agentctl._write_json
+
+        def fail_on_receipt(path, data):
+            if Path(path).name == "delegates.json":
+                raise agentctl.CliError("synthetic receipt write failure")
+            return original_write_json(path, data)
+
+        with mock.patch.object(agentctl, "_write_json", fail_on_receipt), self.assertRaises(agentctl.CliError):
+            self.run_eval("delegates", self.root / "delegates-task.json")
+        delete_calls = [argv for argv, _ in self.kubectl.calls if argv and argv[0] == "kubectl" and argv[5] == "delete"]
+        self.assertEqual(delete_calls, [])
+        ledger = json.loads((self.evidence / "campaign-ledger.json").read_text(encoding="utf-8"))
+        self.assertEqual(ledger, {"entries": [{"case": "delegates", "attempt": 1, "parent_count": 1,
+                                                "child_count": 1, "actual_child_count": 1,
+                                                "probe_count": 0, "cumulative_total": 2}]})
 
     def test_delegates_requires_matching_owner_uid_for_the_one_child(self):
         parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
