@@ -6,20 +6,23 @@ Agents that run on Orka, and the tests that gate changes to them.
 |---|---|---|---|
 | [a2a-assistant](agents/a2a-assistant/) | A no-tools assistant exercised over A2A | native | tested |
 | [dependabot-repair](agents/dependabot-repair/) | Fixes failing CI on dependency update PRs | claude | tested, ran on real PRs |
-| [hello](agents/hello/) | The smallest possible agent. Start here. | native | ran, no tests yet |
-| [release-notes](agents/release-notes/) | Drafts bounded AKS Desktop release notes | claude | tested in simulation |
+| [hello](agents/hello/) | The smallest possible agent. Start here. | native | tested |
+| [release-notes](agents/release-notes/) | Drafts release notes from a list of merged changes | claude | tested in simulation |
 
 ## Run one
 
-Render the bundle, install it, and submit an explicit Task for that Agent.
+Render the bundle, install it, and submit an explicit Task for `hello`, the
+catalogue's front door. You need a Ready native Provider, `envsubst`, and
+`CONTEXT`/`KUBECONFIG` set.
 
 ```sh
-tools/render agents/dependabot-repair trial --output /tmp/dependabot-repair.json
-kubectl --context "$CONTEXT" --kubeconfig "$KUBECONFIG" apply -f /tmp/dependabot-repair.json
-kubectl --context "$CONTEXT" --kubeconfig "$KUBECONFIG" create -f "$TASK_MANIFEST"
+tools/render agents/hello trial --output /tmp/hello.json
+kubectl --context "$CONTEXT" --kubeconfig "$KUBECONFIG" apply -f /tmp/hello.json
+NAMESPACE=orka-system PROVIDER=hello envsubst '${NAMESPACE} ${PROVIDER}' < agents/hello/examples/task.yaml | kubectl --context "$CONTEXT" --kubeconfig "$KUBECONFIG" create -f -
 ```
 
-The agent README lists its runtime and Task requirements.
+See the [hello README](agents/hello/) for its Provider requirements and how to
+read the Task's result.
 
 ## Change one
 
