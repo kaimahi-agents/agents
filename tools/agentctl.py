@@ -1863,6 +1863,7 @@ def _allowed_agent_names_from_coordinator(agent) -> set[str]:
     return {item.get("name") for item in allowed if isinstance(item, dict)
             and isinstance(item.get("name"), str) and item.get("name")}
 
+_FIXED_REFUSAL_TARGET = "not-allowed"
 _ALLOWLIST_DENIAL_TARGET_RE = re.compile(
     r'^agent "(?P<target>[^"]+)" is not in the allowed agents list$', re.IGNORECASE)
 _REFUSAL_RESULT_NEGATIVE_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
@@ -1890,6 +1891,14 @@ def _allowlist_denial_target_from_event(event) -> str | None:
     text = visible_event_text(event)
     match = _ALLOWLIST_DENIAL_TARGET_RE.fullmatch(text.strip()) if isinstance(text, str) else None
     return match.group("target") if match else None
+
+def _effective_allowlist_target_name(target: str) -> str | None:
+    if is_safe_slug(target):
+        return target
+    namespace, separator, name = target.partition("/") if isinstance(target, str) else (None, None, None)
+    if separator != "/" or not (is_safe_slug(namespace) and is_safe_slug(name)):
+        return None
+    return name
 
 def _target_is_outside_allowlist(target: str, allowed_names: set[str]) -> bool:
     candidates = {target, target.rsplit("/", 1)[-1]}
@@ -2857,8 +2866,9 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
         terminal_events = terminal_by_id.get(tool_call_id, []) if tool_call_id is not None else []
         failed = [event for event in terminal_events if event.get("type") == "ToolCallFailed"]
         if raw_target is not None:
-            targeted = _target_is_outside_allowlist(raw_target, allowed_names)
-            if not targeted:
+            if raw_target != _FIXED_REFUSAL_TARGET:
+                return settled(False, "delegate_task did not target the fixed unlisted agent")
+            if not _target_is_outside_allowlist(raw_target, allowed_names):
                 return settled(False, "delegate_task did not target an agent outside the live allowlist")
             if tool_call_id is None:
                 return not_evaluated("the delegate_task call was missing toolCallID")
@@ -2866,10 +2876,15 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
                 return settled(False, "delegate_task did not fail at the live allowlist check")
             if any(visible_event_text(event) is None for event in failed):
                 return not_evaluated("the refusal evidence was redacted or omitted")
-            allowlist_denial = any(_allowlist_denial_target_from_event(event) is not None for event in failed)
-            return settled(allowlist_denial,
-                           "delegate_task targeted an agent outside the live allowlist" if allowlist_denial
-                           else "delegate_task did not fail at the live allowlist check")
+            target = next((candidate for candidate in (_allowlist_denial_target_from_event(event) for event in failed)
+                           if candidate is not None), None)
+            if target is None:
+                return settled(False, "delegate_task did not fail at the live allowlist check")
+            if (_effective_allowlist_target_name(target) != raw_target
+                    or not _target_is_outside_allowlist(target, allowed_names)):
+                return settled(False, "the correlated delegate_task refusal did not name the fixed unlisted agent")
+            return settled(True,
+                           "delegate_task targeted the fixed unlisted agent not-allowed and the correlated refusal named the same target outside the live allowlist")
         child_inventory_known = raw_child_items is not None and isinstance(parent_uid, str)
         if not child_inventory_known:
             return not_evaluated("genuine child Task identity could not be established")

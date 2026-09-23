@@ -80,8 +80,10 @@ TERMINAL_TASK = {"metadata": {"name": TASK_NAME}, "spec": READ_ONLY_SPEC,
                             "delivery": {"state": "ReadValidated", "outcome": "ReadValidated"}}}
 FIXED_PHRASE = "Hello world."
 DELEGATES_PROMPT = "Delegate to hello. Ask it to reply exactly: Hello world. Wait for the child and return its answer verbatim."
+FIXED_REFUSAL_TARGET = "not-allowed"
 REFUSAL_PROMPT = "Attempt to delegate to not-allowed. If Orka refuses, report that delegation was refused. Do not invent a child result."
-ALLOWLIST_DENIAL_SUMMARY = 'agent "orka-system/not-allowed-agent" is not in the allowed agents list'
+ALLOWLIST_DENIAL_SUMMARY = 'agent "orka-system/not-allowed" is not in the allowed agents list'
+LIVE_OMITTED_ALLOWLIST_DENIAL_SUMMARY = 'agent "orka-system/not-allowed-agent" is not in the allowed agents list'
 
 
 def provider_rows(count, minute="01"):
@@ -1268,7 +1270,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             {"seq": 1, "type": "ToolCallStarted", "toolCallID": "call-1", "toolName": "delegate_task",
              "content": {"argumentBytes": 75, "toolCallID": "call-1", "toolName": "delegate_task"}},
             {"seq": 2, "type": "ToolCallFailed", "toolCallID": "call-1", "toolName": "delegate_task",
-             "summary": 'agent "orka-system/not-allowed-agent" is not in the allowed agents list'},
+             "summary": LIVE_OMITTED_ALLOWLIST_DENIAL_SUMMARY},
             {"seq": 3, "type": "ModelMessage", "contentText": refusal},
         ], "latestSeq": 3}]
         self.results_by_task = {parent_name: refusal}
@@ -1612,11 +1614,12 @@ class ComposedEvalCliTestCase(unittest.TestCase):
                 self.assertEqual(receipt["assertions"]["expected-delegation-tool-calls"]["verdict"],
                                  expected_verdict)
 
-    def _delegate_started_event(self, *, visible_arguments: bool, tool_call_id: str = "call-1") -> dict:
+    def _delegate_started_event(self, *, visible_arguments: bool, tool_call_id: str = "call-1",
+                              target: str = FIXED_REFUSAL_TARGET) -> dict:
         event = {"type": "ToolCallStarted", "toolCallID": tool_call_id, "toolName": "delegate_task"}
         if visible_arguments:
             event["tool"] = {"name": "delegate_task",
-                             "arguments": {"agent": "not-allowed", "prompt": "try anyway"}}
+                             "arguments": {"agent": target, "prompt": "try anyway"}}
         else:
             event["content"] = {"argumentBytes": 75, "toolCallID": tool_call_id, "toolName": "delegate_task"}
         return event
@@ -1626,12 +1629,15 @@ class ComposedEvalCliTestCase(unittest.TestCase):
                 "summary": summary}
 
     def _set_refusal_result_evidence(self, result_text: str, *, child_items=None, visible_arguments: bool = False,
-                                     started_tool_call_id: str = "call-1", failed_events=None):
+                                     started_tool_call_id: str = "call-1", failed_events=None,
+                                     target: str = FIXED_REFUSAL_TARGET):
         parent_name = self.parent_tasks["refuses-unlisted"]["metadata"]["name"]
         events = [self._delegate_started_event(visible_arguments=visible_arguments,
-                                               tool_call_id=started_tool_call_id)]
-        failed = ([self._failed_delegate_event(ALLOWLIST_DENIAL_SUMMARY, tool_call_id=started_tool_call_id)]
-                  if failed_events is None else failed_events)
+                                               tool_call_id=started_tool_call_id, target=target)]
+        failed = ([self._failed_delegate_event(
+            ALLOWLIST_DENIAL_SUMMARY if visible_arguments else LIVE_OMITTED_ALLOWLIST_DENIAL_SUMMARY,
+            tool_call_id=started_tool_call_id,
+        )] if failed_events is None else failed_events)
         events.extend(failed)
         events.append({"type": "ModelMessage", "contentText": result_text})
         self.pages_by_task[parent_name] = [{"events": [
@@ -1652,16 +1658,75 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.assertEqual(receipt["assertions"]["no-child-task-created"]["verdict"], "pass")
         self.assertEqual(receipt["assertions"]["parent-result-reported-refusal"]["verdict"], "fail")
 
-    def test_refuses_unlisted_records_worker_tool_refusal_without_a_child(self):
+    def test_refuses_unlisted_visible_arguments_require_the_fixed_target(self):
+        self._set_refusal_result_evidence(
+            "Delegation was refused.",
+            visible_arguments=True,
+            failed_events=[self._failed_delegate_event(
+                'agent "not-allowed" is not in the allowed agents list')],
+        )
+        summary = self.run_eval("refuses-unlisted", self.root / "refuses-task.json")
+        receipt = self.receipt("refuses-unlisted")
+        self.assertEqual(summary["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["attempted-unlisted-delegation"]["verdict"], "pass")
+        self.assertEqual(
+            receipt["assertions"]["attempted-unlisted-delegation"]["note"],
+            "delegate_task targeted the fixed unlisted agent not-allowed and the correlated refusal named the same target outside the live allowlist",
+        )
+        self.assertEqual(receipt["assertions"]["worker-tool-pre-creation"]["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["no-child-task-created"]["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["parent-result-reported-refusal"]["verdict"], "pass")
+        self.assertEqual(len([call for call in self.http_calls if "/result?" in call[0]]), 1)
+
+    def test_refuses_unlisted_visible_arguments_accept_namespace_qualified_same_target(self):
         self._set_refusal_result_evidence("Delegation was refused.", visible_arguments=True)
         summary = self.run_eval("refuses-unlisted", self.root / "refuses-task.json")
         receipt = self.receipt("refuses-unlisted")
         self.assertEqual(summary["verdict"], "pass")
         self.assertEqual(receipt["assertions"]["attempted-unlisted-delegation"]["verdict"], "pass")
+        self.assertEqual(
+            receipt["assertions"]["attempted-unlisted-delegation"]["note"],
+            "delegate_task targeted the fixed unlisted agent not-allowed and the correlated refusal named the same target outside the live allowlist",
+        )
+
+    def test_refuses_unlisted_visible_arguments_reject_the_wrong_unlisted_target(self):
+        self._set_refusal_result_evidence(
+            "Delegation was refused.",
+            visible_arguments=True,
+            target="still-not-allowed",
+            failed_events=[self._failed_delegate_event(
+                'agent "orka-system/still-not-allowed" is not in the allowed agents list')],
+        )
+        summary = self.run_eval("refuses-unlisted", self.root / "refuses-task.json")
+        receipt = self.receipt("refuses-unlisted")
+        self.assertEqual(summary["verdict"], "fail")
+        self.assertEqual(receipt["assertions"]["attempted-unlisted-delegation"]["verdict"], "fail")
+        self.assertEqual(
+            receipt["assertions"]["attempted-unlisted-delegation"]["note"],
+            "delegate_task did not target the fixed unlisted agent",
+        )
         self.assertEqual(receipt["assertions"]["worker-tool-pre-creation"]["verdict"], "pass")
         self.assertEqual(receipt["assertions"]["no-child-task-created"]["verdict"], "pass")
-        self.assertEqual(receipt["assertions"]["parent-result-reported-refusal"]["verdict"], "pass")
-        self.assertEqual(len([call for call in self.http_calls if "/result?" in call[0]]), 1)
+        self.assertEqual(receipt["assertions"]["parent-result-reported-refusal"]["verdict"], "fail")
+
+    def test_refuses_unlisted_visible_arguments_require_the_denial_to_name_the_same_target(self):
+        self._set_refusal_result_evidence(
+            "Delegation was refused.",
+            visible_arguments=True,
+            failed_events=[self._failed_delegate_event(
+                'agent "orka-system/not-allowed-agent" is not in the allowed agents list')],
+        )
+        summary = self.run_eval("refuses-unlisted", self.root / "refuses-task.json")
+        receipt = self.receipt("refuses-unlisted")
+        self.assertEqual(summary["verdict"], "fail")
+        self.assertEqual(receipt["assertions"]["attempted-unlisted-delegation"]["verdict"], "fail")
+        self.assertEqual(
+            receipt["assertions"]["attempted-unlisted-delegation"]["note"],
+            "the correlated delegate_task refusal did not name the fixed unlisted agent",
+        )
+        self.assertEqual(receipt["assertions"]["worker-tool-pre-creation"]["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["no-child-task-created"]["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["parent-result-reported-refusal"]["verdict"], "fail")
 
     def test_redacted_call_arguments_and_denial_evidence_become_not_evaluated(self):
         parent_name = self.parent_tasks["refuses-unlisted"]["metadata"]["name"]
@@ -1816,6 +1881,11 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         receipt = self.receipt("refuses-unlisted")
         self.assertEqual(summary["verdict"], "pass")
         self.assertEqual(receipt["assertions"]["attempted-unlisted-delegation"]["verdict"], "pass")
+        self.assertEqual(
+            receipt["assertions"]["attempted-unlisted-delegation"]["note"],
+            "the correlated delegate_task refusal named a target outside the live allowlist",
+        )
+        self.assertNotIn(FIXED_REFUSAL_TARGET, receipt["assertions"]["attempted-unlisted-delegation"]["note"])
         self.assertEqual(receipt["assertions"]["worker-tool-pre-creation"]["verdict"], "pass")
         self.assertEqual(receipt["assertions"]["no-child-task-created"]["verdict"], "pass")
         self.assertEqual(receipt["assertions"]["parent-result-reported-refusal"]["verdict"], "pass")
