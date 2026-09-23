@@ -25,7 +25,6 @@ from tests.fixtures import (  # noqa: E402
     REFUSAL_DENIAL_CASE_ID,
     REFUSAL_REPORT_CASE_ID,
     REFUSAL_REQUESTED_AGENT,
-    REFUSAL_SOURCE_CASE_ID,
     RUNTIME_DIGEST,
     acceptance_block,
     composed_case,
@@ -1007,6 +1006,21 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             cases.append(composed_case(case_id, case_sha256=agentctl.sha256_hex(path.read_bytes())))
         (self.coordinator / "eval" / "acceptance.md").write_text(acceptance_block(*cases), encoding="utf-8")
 
+    def _rewrite_split_refusal_case(self, case_id, *, requested_agent=REFUSAL_REQUESTED_AGENT, task_manifest=None):
+        path = self.coordinator / "eval" / "cases" / f"{case_id}.yaml"
+        write_json(path, refusal_case_payload(
+            copy.deepcopy(self.case_tasks["refuses-unlisted"] if task_manifest is None else task_manifest),
+            requested_agent=requested_agent,
+        ))
+        acceptance_cases = agentctl.parse_acceptance_cases(
+            (self.coordinator / "eval" / "acceptance.md").read_text(encoding="utf-8"))
+        rewritten = [
+            ({**case, "case_sha256": agentctl.sha256_hex(path.read_bytes())}
+             if case["case_id"] == case_id else case)
+            for case in acceptance_cases
+        ]
+        (self.coordinator / "eval" / "acceptance.md").write_text(acceptance_block(*rewritten), encoding="utf-8")
+
     def _refresh_hello_fixed_greeting_acceptance(self, *, raw_bytes=None, case_id="fixed-greeting",
                                                  environment="trial"):
         case_path = self.hello / "eval" / "cases" / "fixed-greeting.yaml"
@@ -1462,25 +1476,6 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         receipt.pop("dependency_digests", None)
         agentctl._write_json(path, receipt)
         return receipt
-
-    def _write_importable_refusal_source_receipt(self):
-        denial = copy.deepcopy(self.denial_receipt())
-        report = self.report_receipt()
-        denial["case_id"] = REFUSAL_SOURCE_CASE_ID
-        denial["assertions"] = {
-            "live-pinned-agents-ready": denial["assertions"]["live-pinned-agents-ready"],
-            "parent-task-succeeded": denial["assertions"]["parent-task-succeeded"],
-            "attempted-unlisted-delegation": denial["assertions"]["attempted-unlisted-delegation"],
-            "worker-tool-pre-creation": denial["assertions"]["worker-tool-pre-creation"],
-            "no-child-task-created": denial["assertions"]["no-child-task-created"],
-            "no-unexpected-tool-calls": denial["assertions"]["no-unexpected-tool-calls"],
-            "parent-result-reported-refusal": report["assertions"]["parent-result-reported-refusal"],
-            "stayed-within-limits": denial["assertions"]["stayed-within-limits"],
-        }
-        denial["verdict"] = "pass"
-        path = self.coordinator / "eval" / "receipts" / denial["bundle_digest"] / f"{REFUSAL_SOURCE_CASE_ID}.json"
-        agentctl._write_json(path, denial)
-        return denial
 
     def test_delegates_applies_pinned_agents_reads_results_and_passes(self):
         parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
@@ -2447,61 +2442,40 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         )
         self.assertEqual(sorted((self.coordinator / "eval" / "receipts").rglob("*.json")), receipts_before)
 
-    def test_imported_reuse_migrates_delegates_to_the_new_digest_without_cluster_side_effects(self):
-        first_summary = self.seed_delegate_evidence()
-        raw_hashes = {
-            path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
-            for path in sorted(self.evidence.rglob("*") ) if path.is_file()
-        }
-        saved_bundle = (self.evidence / "delegates" / "bundle.yaml").read_text(encoding="utf-8")
-        policy_path = self.coordinator / "eval" / "policies" / "composed-coordination.md"
-        policy_path.write_text(policy_path.read_text(encoding="utf-8") + "policy drift\n", encoding="utf-8")
-        current = agentctl.render_agent(self.coordinator, "trial", self.root / "current-delegates.json")
-        self.assertNotEqual(current["bundle_digest"], first_summary["bundle_digest"])
-        self.assertEqual((self.root / "current-delegates.json").read_text(encoding="utf-8"), saved_bundle)
-        summary = self._run_reuse_eval("delegates", **{"--source": "imported"})
-        receipt = self.receipt("delegates", current["bundle_digest"])
-        self.assertEqual(summary["bundle_digest"], current["bundle_digest"])
-        self.assertEqual(summary["verdict"], "pass")
-        self.assertEqual(receipt["source"], "imported")
-        self.assertEqual(receipt["bundle_digest"], current["bundle_digest"])
-        self.assertEqual(receipt["verdict"], "pass")
-        self.assertEqual(
-            {path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
-             for path in sorted(self.evidence.rglob("*")) if path.is_file()},
-            raw_hashes,
+    def test_reuse_evidence_rejects_source_imported_without_side_effects(self):
+        self.seed_refusal_evidence()
+        self._assert_reuse_failure_preserves_bytes(
+            self.reuse_eval_argv(**{"--source": "imported"}),
+            "eval failed: --reuse-evidence requires --source live",
         )
 
-    def test_imported_reuse_migrates_split_refusal_from_the_old_source_case(self):
-        first_summary = self.seed_refusal_evidence()
-        self._write_importable_refusal_source_receipt()
-        raw_hashes = {
-            path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
-            for path in sorted(self.evidence.rglob("*")) if path.is_file()
-        }
-        saved_bundle = (self.evidence / "refuses-unlisted" / "bundle.yaml").read_text(encoding="utf-8")
-        policy_path = self.coordinator / "eval" / "policies" / "composed-coordination.md"
-        policy_path.write_text(policy_path.read_text(encoding="utf-8") + "policy drift\n", encoding="utf-8")
-        current = agentctl.render_agent(self.coordinator, "trial", self.root / "current-refusal.json")
-        self.assertNotEqual(current["bundle_digest"], first_summary["bundle_digest"])
-        self.assertEqual((self.root / "current-refusal.json").read_text(encoding="utf-8"), saved_bundle)
-        summary = self._run_reuse_eval(REFUSAL_DENIAL_CASE_ID, **{"--source": "imported"})
-        denial = self.denial_receipt(current["bundle_digest"])
-        report = self.report_receipt(current["bundle_digest"])
-        self.assertEqual(summary["bundle_digest"], current["bundle_digest"])
-        self.assertEqual(summary["verdict"], "pass")
-        self.assertEqual(denial["source"], "imported")
-        self.assertEqual(report["source"], "imported")
-        self.assertEqual(denial["bundle_digest"], current["bundle_digest"])
-        self.assertEqual(report["bundle_digest"], current["bundle_digest"])
-        self.assertEqual(denial["verdict"], "pass")
-        self.assertEqual(report["verdict"], "fail")
-        self.assertEqual(denial.get("observations"), CONTROLLER_ALLOWLIST_PRE_DISPATCH)
-        self.assertNotIn("observations", report)
-        self.assertEqual(
-            {path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
-             for path in sorted(self.evidence.rglob("*")) if path.is_file()},
-            raw_hashes,
+    def test_imported_reuse_migration_helpers_are_removed(self):
+        for name in (
+                "_validate_importable_source_receipt",
+                "_find_importable_source_receipt",
+                "_require_importable_composed_evidence"):
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(agentctl, name))
+
+    def test_live_refusal_split_case_sources_must_keep_identical_task_manifests_before_side_effects(self):
+        drifted = copy.deepcopy(self.case_tasks["refuses-unlisted"])
+        drifted["spec"]["prompt"] = "Delegate to someone else."
+        self._rewrite_split_refusal_case(REFUSAL_REPORT_CASE_ID, task_manifest=drifted)
+        code, out, err = self.run_eval_main(REFUSAL_DENIAL_CASE_ID, self.root / "refuses-task.json")
+        self._assert_rejected_before_side_effects(
+            code, out, err,
+            message=("eval failed: committed split refusal case files must bind identical requested_agent and "
+                     "task_manifest"),
+            forbidden=("Delegate to someone else.",),
+        )
+
+    def test_reuse_refusal_split_case_sources_must_keep_identical_requested_agents(self):
+        self.seed_refusal_evidence()
+        self._rewrite_split_refusal_case(REFUSAL_REPORT_CASE_ID, requested_agent="other-agent")
+        self._assert_reuse_failure_preserves_bytes(
+            self.reuse_eval_argv(),
+            "eval failed: committed split refusal case files must bind identical requested_agent and task_manifest",
+            forbidden=("other-agent",),
         )
 
     def test_failed_prior_receipt_does_not_preserve_controller_observation(self):

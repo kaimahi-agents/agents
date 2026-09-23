@@ -393,14 +393,6 @@ COMPOSED_LIMITS = {
     COMPOSED_REFUSAL_DENIAL_CASE_ID: {"provider_requests": 10, "tool_calls": 1, "child_tasks": 0, "retries": 0},
     COMPOSED_REFUSAL_REPORT_CASE_ID: {"provider_requests": 10, "tool_calls": 1, "child_tasks": 0, "retries": 0},
 }
-LEGACY_COMPOSED_SOURCE_ASSERTIONS = {
-    "delegates": COMPOSED_ASSERTIONS["delegates"],
-    COMPOSED_REFUSAL_SOURCE_CASE_ID: frozenset({
-        "live-pinned-agents-ready", "parent-task-succeeded", "attempted-unlisted-delegation",
-        "worker-tool-pre-creation", "no-child-task-created", "no-unexpected-tool-calls",
-        "parent-result-reported-refusal", "stayed-within-limits",
-    }),
-}
 COMPOSED_COORDINATION_CASES = {
     case_id: {"assertions": COMPOSED_ASSERTIONS[case_id], "limits": COMPOSED_LIMITS[case_id]}
     for case_id in COMPOSED_ASSERTIONS
@@ -1331,68 +1323,6 @@ def _load_existing_live_reuse_anchor_receipt(agent_dir, bundle_digest: str, case
     return receipt if not validate_evaluation_receipt(candidate) else None
 
 
-def _validate_fixed_controller_observation(observations, errors: list[str]) -> None:
-    if not isinstance(observations, dict) or set(observations) != {CONTROLLER_ALLOWLIST_OBSERVATION_ID}:
-        errors.append("observations must contain only the fixed controller observation")
-        return
-    observation = observations[CONTROLLER_ALLOWLIST_OBSERVATION_ID]
-    if (not isinstance(observation, dict) or set(observation) != _ASSERTION_KEYS
-            or observation.get("verdict") != CONTROLLER_ALLOWLIST_OBSERVATION["verdict"]
-            or observation.get("evidence_completeness") is not CONTROLLER_ALLOWLIST_OBSERVATION["evidence_completeness"]
-            or observation.get("note") != CONTROLLER_ALLOWLIST_OBSERVATION["note"]):
-        errors.append("observations must use the fixed controller observation verdict, completeness, and note")
-
-
-def _validate_importable_source_receipt(receipt, source_case_id: str,
-                                        expected_dependency_digests: dict[str, str]) -> list[str]:
-    if not isinstance(receipt, dict):
-        return ["source receipt must be a JSON object"]
-    errors = [f"unknown evaluation receipt key at entry #{index} (allowed: {sorted(EVALUATION_RECEIPT_KEYS)})"
-              for index, key in enumerate(receipt) if key not in EVALUATION_RECEIPT_KEYS]
-    missing = EVALUATION_RECEIPT_REQUIRED_KEYS - set(receipt)
-    if missing:
-        return errors + [f"missing required evaluation receipt key: {key!r}" for key in sorted(missing)]
-    errors += [message for key, check, message in _EVALUATION_CHECKS if not check(receipt[key])]
-    if receipt.get("case_id") != source_case_id or receipt.get("source") != "live" or receipt.get("verdict") != "pass":
-        errors.append("source receipt must be a passing live receipt for the committed composed source case")
-    if not is_valid_tool_calls(receipt.get("tool_calls")):
-        errors.append("source receipt is missing valid tool_calls info required by the composed policy")
-    _validate_assertions(receipt["assertions"], errors, "source receipt")
-    if set(receipt.get("assertions", {})) != set(LEGACY_COMPOSED_SOURCE_ASSERTIONS[source_case_id]):
-        errors.append("source receipt assertions do not match the expected composed source case assertion set")
-    dependency_digests = receipt.get("dependency_digests")
-    if dependency_digests != expected_dependency_digests:
-        errors.append("source receipt dependency_digests do not match the current pinned child digest")
-    observations = receipt.get("observations")
-    if source_case_id == COMPOSED_REFUSAL_SOURCE_CASE_ID:
-        if observations is not None:
-            _validate_fixed_controller_observation(observations, errors)
-    elif "observations" in receipt:
-        errors.append("source receipt observations are allowed only for the legacy composed refusal source case")
-    evidence = receipt["evidence_sha256"]
-    if not isinstance(evidence, list) or not evidence or not all(map(_is_hex_digest, evidence)):
-        errors.append("evidence_sha256 must be a non-empty array of 64-character lowercase hex SHA-256 digests")
-    elif len(set(evidence)) != len(evidence):
-        errors.append("evidence_sha256 must not repeat a digest")
-    if receipt["verdict"] == "pass" and not all_assertions_pass_and_complete(receipt["assertions"]):
-        errors.append("overall verdict 'pass' requires every assertion to be verdict 'pass' and complete")
-    return errors
-
-
-def _find_importable_source_receipt(agent_dir, source_case_id: str, current_bundle_digest: str,
-                                    expected_dependency_digests: dict[str, str]) -> dict | None:
-    root = Path(agent_dir) / "eval" / "receipts"
-    candidates = []
-    for receipt_path in sorted(root.glob(f"*/{source_case_id}.json")) if root.is_dir() else []:
-        receipt = _read_json(receipt_path, "existing evaluation receipt")
-        if receipt_path.parent.name == current_bundle_digest:
-            continue
-        errors = _validate_importable_source_receipt(receipt, source_case_id, expected_dependency_digests)
-        if not errors and receipt.get("bundle_digest") == receipt_path.parent.name:
-            candidates.append(receipt)
-    return candidates[0] if len(candidates) == 1 else None
-
-
 def _preserved_controller_allowlist_observation_from_receipt(receipt, evidence_dir) -> tuple[dict | None, list[str]]:
     if receipt is None or receipt.get("verdict") != "pass":
         return None, []
@@ -1476,19 +1406,6 @@ def _require_reusable_composed_evidence(agent_dir, bundle_digest: str, case_id: 
         raise CliError("existing live evidence does not match the current rendered bundle digest")
     return receipt
 
-
-def _require_importable_composed_evidence(agent_dir, current_bundle_digest: str, source_case_id: str,
-                                          evidence_dir, render_context: dict) -> dict:
-    for name, label, expected_sha256 in (
-            ("bundle.yaml", "current rendered coordinator bundle", render_context["coordinator_bundle_sha256"]),
-            ("hello-bundle.yaml", "current rendered pinned child bundle", render_context["child_bundle_sha256"])):
-        if _existing_file_sha256(Path(evidence_dir) / name, f"existing evidence {name}") != expected_sha256:
-            raise CliError(f"existing evidence {name} does not match the {label}")
-    receipt = _find_importable_source_receipt(
-        agent_dir, source_case_id, current_bundle_digest, {_EXPECTED_COMPOSED_CHILD: render_context["child_digest"]})
-    if receipt is None:
-        raise CliError("existing live source evidence does not define a unique importable composed anchor")
-    return receipt
 
 def check_window_covers_task(window_start, window_end, task_start, task_end) -> list[str]:
     """Diagnostics; empty means the asserted window covers the Task exactly, with no tolerance."""
@@ -1722,6 +1639,25 @@ def _load_validated_composed_case_source(agent_dir, case: dict, *, render_contex
         namespace=namespace,
     )
     return source
+
+
+def _load_validated_composed_case_bindings(agent_dir, case: dict, *, render_context: dict,
+                                          namespace: str) -> dict[str, dict]:
+    bindings = {}
+    for case_id in _paired_composed_receipt_case_ids(case["case_id"]):
+        bound_case = case if case_id == case["case_id"] else load_composed_coordination_case(
+            agent_dir, case_id, render_context["environment"])
+        source = _load_validated_composed_case_source(
+            agent_dir, bound_case, render_context=render_context, namespace=namespace)
+        bindings[case_id] = {"case": bound_case, **source}
+    if case["case_id"] in COMPOSED_REFUSAL_CASE_IDS:
+        denial = bindings[COMPOSED_REFUSAL_DENIAL_CASE_ID]
+        report = bindings[COMPOSED_REFUSAL_REPORT_CASE_ID]
+        if (denial["requested_agent"] != report["requested_agent"]
+                or not _json_objects_equal(denial["task_manifest"], report["task_manifest"])):
+            raise CliError("committed split refusal case files must bind identical requested_agent and task_manifest")
+    return bindings
+
 
 def _require_task_manifest_matches_committed_case(task_manifest, case_task, *, label: str) -> None:
     if not _json_objects_equal(task_manifest, case_task):
@@ -2865,6 +2801,7 @@ def _prepare_composed_render_context(args, *, evidence_dir: Path | None) -> dict
     if not all(isinstance(name, str) and name for name in (child_agent_name, coordinator_agent_name)):
         raise CliError("rendered Agent resources are missing metadata.name")
     return {
+        "environment": args.environment,
         "bundle_digest": bundle_digest,
         "expected_phrase": expected_phrase,
         "child_digest": pinned_child_digest,
@@ -3186,22 +3123,21 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
     return summary, receipt
 
 
-def _score_composed_coordination_receipts(args, cases_by_id: dict[str, dict], *, render_context: dict,
+def _score_composed_coordination_receipts(args, case_bindings: dict[str, dict], *, render_context: dict,
                                           task_manifest, terminal_task, events, latest_seq, records,
                                           child_live, coordinator_live, parent_result,
                                           raw_child_inventory, child_terminal_tasks, child_results,
-                                          requested_agent: str | None = None,
                                           observation: dict | None = None) -> tuple[dict[str, dict], dict[str, dict]]:
     summaries, receipts = {}, {}
-    for case_id in cases_by_id:
+    for case_id, binding in case_bindings.items():
         score_args = argparse.Namespace(**vars(args))
         score_args.case_id = case_id
         summary, receipt = _score_composed_coordination(
-            score_args, cases_by_id[case_id], render_context=render_context, task_manifest=task_manifest,
+            score_args, binding["case"], render_context=render_context, task_manifest=task_manifest,
             terminal_task=terminal_task, events=events, latest_seq=latest_seq, records=records,
             child_live=child_live, coordinator_live=coordinator_live, parent_result=parent_result,
             raw_child_inventory=raw_child_inventory, child_terminal_tasks=child_terminal_tasks,
-            child_results=child_results, requested_agent=requested_agent,
+            child_results=child_results, requested_agent=binding["requested_agent"],
             observation=(observation if case_id == COMPOSED_REFUSAL_DENIAL_CASE_ID else None))
         summaries[case_id] = summary
         receipts[case_id] = receipt
@@ -3213,15 +3149,11 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict]
     evidence_dir, journal_token = prepared["evidence_dir"], prepared["journal_token"]
     task_manifest, task_name, limits = prepared["task_manifest"], prepared["task_name"], case["limits"]
     preflight_render_context = _prepare_composed_render_context(args, evidence_dir=None)
-    case_source = _load_validated_composed_case_source(
+    case_bindings = _load_validated_composed_case_bindings(
         args.agent_dir, case, render_context=preflight_render_context, namespace=args.namespace)
     source_case_id = _composed_evidence_source_case_id(args.case_id)
-    cases_by_id = {
-        case_id: (case if case_id == case["case_id"] else load_composed_coordination_case(
-            args.agent_dir, case_id, args.environment))
-        for case_id in _paired_composed_receipt_case_ids(args.case_id)
-    }
-    _require_task_manifest_matches_committed_case(task_manifest, case_source["task_manifest"], label="Task manifest")
+    _require_task_manifest_matches_committed_case(
+        task_manifest, case_bindings[args.case_id]["task_manifest"], label="Task manifest")
     _require(check_zero_retries(task_manifest))
     metadata = task_manifest.get("metadata") if isinstance(task_manifest, dict) else None
     annotations = metadata.get("annotations") if isinstance(metadata, dict) else None
@@ -3313,11 +3245,11 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict]
             observation, probe_evidence_sha256 = _load_preserved_controller_allowlist_observation(
                 args.agent_dir, render_context["bundle_digest"], args.case_id, evidence_dir)
     summaries, receipts = _score_composed_coordination_receipts(
-        args, cases_by_id, render_context=render_context, task_manifest=task_manifest,
+        args, case_bindings, render_context=render_context, task_manifest=task_manifest,
         terminal_task=terminal_task, events=events, latest_seq=latest_seq, records=records,
         child_live=child_live, coordinator_live=coordinator_live, parent_result=parent_result,
         raw_child_inventory=raw_child_inventory, child_terminal_tasks=child_terminal_tasks,
-        child_results=child_results, requested_agent=case_source["requested_agent"], observation=observation)
+        child_results=child_results, observation=observation)
     evidence_sha256 = list(dict.fromkeys(
         _write_json(evidence_dir / name, data) for name, data in (
             ("task-manifest.json", task_manifest),
@@ -3340,8 +3272,8 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict]
 
 
 def _reuse_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict], dict | None]:
-    if args.source not in {"live", "imported"}:
-        raise CliError("--reuse-evidence requires --source live or --source imported")
+    if args.source != "live":
+        raise CliError("--reuse-evidence requires --source live")
     if not is_safe_slug(args.case_id):
         raise CliError(f"case_id must be a safe slug ({SAFE_SLUG_CONTRACT})")
     if not _is_date(args.date):
@@ -3350,21 +3282,13 @@ def _reuse_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict
     evidence_dir = Path(args.evidence_root) / source_case_id
     reuse_args = argparse.Namespace(**vars(args))
     render_context = _prepare_composed_render_context(reuse_args, evidence_dir=None)
-    case_source = _load_validated_composed_case_source(
+    case_bindings = _load_validated_composed_case_bindings(
         args.agent_dir, case, render_context=render_context, namespace=args.namespace)
-    cases_by_id = {
-        case_id: (case if case_id == case["case_id"] else load_composed_coordination_case(
-            args.agent_dir, case_id, args.environment))
-        for case_id in _paired_composed_receipt_case_ids(args.case_id)
-    }
-    prior_receipt = (_require_reusable_composed_evidence(
+    prior_receipt = _require_reusable_composed_evidence(
         args.agent_dir, render_context["bundle_digest"], args.case_id, evidence_dir, render_context)
-        if args.source == "live" else
-        _require_importable_composed_evidence(
-            args.agent_dir, render_context["bundle_digest"], source_case_id, evidence_dir, render_context))
     task_manifest = _read_receipt_bound_json(prior_receipt, evidence_dir, "task-manifest.json")
     _require_task_manifest_matches_committed_case(
-        task_manifest, case_source["task_manifest"], label="existing evidence task-manifest.json")
+        task_manifest, case_bindings[args.case_id]["task_manifest"], label="existing evidence task-manifest.json")
     terminal_task = _read_receipt_bound_json(prior_receipt, evidence_dir, "terminal-task.json")
     journal_payload = _read_receipt_bound_json(prior_receipt, evidence_dir, "journal-events.json")
     events = journal_payload.get("events") if isinstance(journal_payload, dict) else None
@@ -3398,15 +3322,12 @@ def _reuse_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict
     elif args.source == "live":
         observation, probe_evidence_sha256 = _load_preserved_controller_allowlist_observation(
             args.agent_dir, render_context["bundle_digest"], args.case_id, evidence_dir)
-    else:
-        observation, probe_evidence_sha256 = _preserved_controller_allowlist_observation_from_receipt(
-            prior_receipt, evidence_dir)
     summaries, receipts = _score_composed_coordination_receipts(
-        reuse_args, cases_by_id, render_context=render_context, task_manifest=task_manifest,
+        reuse_args, case_bindings, render_context=render_context, task_manifest=task_manifest,
         terminal_task=terminal_task, events=events, latest_seq=latest_seq, records=records,
         child_live=child_live, coordinator_live=coordinator_live, parent_result=parent_result,
         raw_child_inventory=raw_child_inventory, child_terminal_tasks=child_terminal_tasks,
-        child_results=child_results, requested_agent=case_source["requested_agent"], observation=observation)
+        child_results=child_results, observation=observation)
     evidence_sha256 = _existing_evidence_sha256(evidence_dir, _COMPOSED_EVIDENCE_FILES)
     for case_id, receipt in receipts.items():
         receipt["evidence_sha256"] = (list(dict.fromkeys([*evidence_sha256, *probe_evidence_sha256]))
