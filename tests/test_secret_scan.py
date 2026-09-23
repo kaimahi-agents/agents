@@ -90,14 +90,22 @@ class CredentialAssignmentTestCase(unittest.TestCase):
             with self.subTest(rest=rest):
                 self.assertEqual(agentctl.scan_line(prefix + rest), [])
 
-    def test_secret_reference_objects_are_not_literal_credential_assignments(self):
-        for line in ('"secretRef": {', 'secretRef: {name: provider-key}', 'secretRef = ["external"]'):
+    def test_only_exact_structural_secret_ref_openings_are_exempt(self):
+        lines = ('"secret' + 'Ref": {', 'secret' + 'Ref: [', 'secret' + 'Ref: {   ', 'secret' + 'Ref: [,')
+        for line in lines:
             with self.subTest(line=line):
                 self.assertEqual(agentctl.scan_line(line), [])
 
-    def test_structural_secret_refs_are_exempt_without_exempting_real_api_key_objects(self):
-        self.assertEqual(agentctl.scan_line('secretRef: {name: provider-key}'), [])
-        self.assertIn("credential-assignment", agentctl.scan_line('api_key: {"value": "abc123"}'))
+    def test_inline_secret_ref_objects_and_arrays_still_flag(self):
+        lines = ('secret' + 'Ref: {name: provider-key}', 'secret' + 'Ref: {"value":"real-secret"}',
+                 'secret' + 'Ref = ["external"]')
+        for line in lines:
+            with self.subTest(line=line):
+                self.assertIn("credential-assignment", agentctl.scan_line(line))
+
+    def test_structural_secret_ref_exemption_does_not_exempt_other_sensitive_keys(self):
+        self.assertIn("credential-assignment", agentctl.scan_line('api_' + 'key: {"value": "abc123"}'))
+        self.assertIn("credential-assignment", agentctl.scan_line('access_' + 'token: ["abc123"]'))
 
     def test_only_an_exact_call_expression_is_exempt(self):
         # Finding 6: a value that merely contains parentheses is still a credential, whereas a

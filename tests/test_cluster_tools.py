@@ -1095,7 +1095,10 @@ class ComposedEvalCliTestCase(unittest.TestCase):
                     "spec": {"type": AZURE_PROVIDER_TYPE,
                              "baseURL": base_url,
                              "azure": {"deploymentName": AZURE_DEPLOYMENT, "apiVersion": AZURE_API_VERSION},
-                             "secretRef": {"name": AZURE_CREDENTIAL_NAME, "key": AZURE_CREDENTIAL_ENTRY},
+                             "secretRef": {
+                                 "name": AZURE_CREDENTIAL_NAME,
+                                 "key": AZURE_CREDENTIAL_ENTRY,
+                             },
                              "defaultModel": AZURE_DEPLOYMENT}})
         self._rewrite_coordinator_agent_resource(
             lambda resource: resource["spec"].update({
@@ -1514,6 +1517,12 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             "journal_base_url": "https://api.example.com",
         })
         return summary
+
+    def seed_azure_delegate_evidence(self):
+        self._switch_coordinator_to_azure()
+        self._set_delegate_result_evidence(self._delegate_events())
+        return self.run_eval(
+            "delegates", self.root / "delegates-task.json", **{"--model": AZURE_DEPLOYMENT})
 
     def _canonical_wait_no_result_length(self, task: dict) -> int:
         metadata = task.get("metadata") if isinstance(task, dict) else None
@@ -2573,6 +2582,29 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.assertTrue(denial_path.is_file())
         self.assertTrue(self.receipt_path(REFUSAL_REPORT_CASE_ID).is_file())
 
+    def test_reuse_current_azure_anchor_requires_matching_provider_route_and_valid_token_usage(self):
+        cases = (
+            ("missing-provider-route", lambda receipt: receipt.pop("provider_route"),
+             "eval failed: existing live evidence does not match the current rendered bundle digest"),
+            ("forged-provider-route", lambda receipt: receipt["provider_route"].update({"deployment": "other"}),
+             "eval failed: existing live evidence does not match the current rendered bundle digest"),
+            ("missing-token-usage", lambda receipt: receipt.pop("token_usage"),
+             "eval failed: existing live evidence does not match the current rendered bundle digest"),
+            ("malformed-token-usage", lambda receipt: receipt.__setitem__("token_usage", {"input": 1, "output": 2, "total": 99}),
+             "eval failed: existing live evidence does not match the current rendered bundle digest"),
+        )
+        for label, mutate, message in cases:
+            with self.subTest(case=label):
+                self.setUp()
+                self.seed_azure_delegate_evidence()
+                receipt = self.receipt("delegates")
+                mutate(receipt)
+                agentctl._write_json(self.receipt_path("delegates"), receipt)
+                self._assert_reuse_failure_preserves_bytes(
+                    self.reuse_eval_argv("delegates", **{"--model": AZURE_DEPLOYMENT}),
+                    message,
+                )
+
     def test_reuse_only_migrates_the_exact_legacy_current_live_receipt_shape(self):
         cases = (
             ("delegates", self.seed_delegate_evidence, None, "pass"),
@@ -3356,7 +3388,10 @@ class LifecycleCliTestCase(unittest.TestCase):
                     "spec": {"type": AZURE_PROVIDER_TYPE,
                              "baseURL": base_url,
                              "azure": {"deploymentName": AZURE_DEPLOYMENT, "apiVersion": AZURE_API_VERSION},
-                             "secretRef": {"name": AZURE_CREDENTIAL_NAME, "key": AZURE_CREDENTIAL_ENTRY},
+                             "secretRef": {
+                                 "name": AZURE_CREDENTIAL_NAME,
+                                 "key": AZURE_CREDENTIAL_ENTRY,
+                             },
                              "defaultModel": AZURE_DEPLOYMENT}})
         path = self.coordinator / "resources" / "agent.yaml"
         agent_resource = json.loads(path.read_text(encoding="utf-8"))

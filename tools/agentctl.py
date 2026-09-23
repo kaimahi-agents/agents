@@ -938,7 +938,8 @@ def _is_credential_assignment(line: str) -> bool:
     if not match or not any(part in key for part in _SENSITIVE_KEYS):
         return False
     value = _unquote(match.group(2).strip())
-    if value.startswith(("{", "[")) and any(part in key for part in ("secretref", "secret_ref", "secret-ref")):
+    normalized = value.rstrip(",").strip()
+    if normalized in ("{", "[") and any(part in key for part in ("secretref", "secret_ref", "secret-ref")):
         return False
     if value.lower() in _PLACEHOLDERS or value.lower().startswith(("$", "{{", "<")):
         return False
@@ -1395,7 +1396,8 @@ def _legacy_composed_reuse_anchor_key_sets(case_id: str) -> set[frozenset[str]]:
 
 
 def _load_existing_live_reuse_anchor_receipt(agent_dir, bundle_digest: str, case_id: str,
-                                             expected_dependency_digests: dict[str, str]) -> dict | None:
+                                             expected_dependency_digests: dict[str, str],
+                                             expected_provider_route: dict | None) -> dict | None:
     receipt_path = _evaluation_receipt_path(agent_dir, bundle_digest, case_id)
     if not receipt_path.is_file():
         return None
@@ -1404,8 +1406,12 @@ def _load_existing_live_reuse_anchor_receipt(agent_dir, bundle_digest: str, case
             and receipt.get("case_id") == case_id
             and receipt.get("bundle_digest") == bundle_digest
             and receipt.get("source") == "live"):
-        return receipt
+        if expected_provider_route is None:
+            return (None if "provider_route" in receipt or "token_usage" in receipt else receipt)
+        return receipt if (receipt.get("provider_route") == expected_provider_route
+                           and is_valid_token_usage(receipt.get("token_usage"))) else None
     if (not isinstance(receipt, dict)
+            or expected_provider_route is not None
             or "dependency_digests" in receipt
             or set(receipt) not in _legacy_composed_reuse_anchor_key_sets(case_id)
             or receipt.get("case_id") != case_id
@@ -1496,7 +1502,9 @@ def _require_reusable_composed_evidence(agent_dir, bundle_digest: str, case_id: 
         if _existing_file_sha256(Path(evidence_dir) / name, f"existing evidence {name}") != expected_sha256:
             raise CliError(f"existing evidence {name} does not match the {label}")
     receipt = _load_existing_live_reuse_anchor_receipt(
-        agent_dir, bundle_digest, case_id, {_EXPECTED_COMPOSED_CHILD: render_context["child_digest"]})
+        agent_dir, bundle_digest, case_id,
+        {_EXPECTED_COMPOSED_CHILD: render_context["child_digest"]},
+        render_context["provider_route"])
     if receipt is None:
         raise CliError("existing live evidence does not match the current rendered bundle digest")
     return receipt

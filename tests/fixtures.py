@@ -217,7 +217,10 @@ def write_azure_native_coordinator(agent_dir, *, namespace="trial-namespace", ca
                 "spec": {"type": AZURE_PROVIDER_TYPE,
                          "baseURL": AZURE_ENDPOINT,
                          "azure": {"deploymentName": AZURE_DEPLOYMENT, "apiVersion": AZURE_API_VERSION},
-                         "secretRef": {"name": AZURE_CREDENTIAL_NAME, "key": AZURE_CREDENTIAL_ENTRY},
+                         "secretRef": {
+                             "name": AZURE_CREDENTIAL_NAME,
+                             "key": AZURE_CREDENTIAL_ENTRY,
+                         },
                          "defaultModel": AZURE_DEPLOYMENT}})
     return Path(agent_dir)
 
