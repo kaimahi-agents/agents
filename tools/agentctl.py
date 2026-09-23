@@ -1936,12 +1936,15 @@ _REFUSAL_RESULT_INVENTED_CHILD_PATTERNS = tuple(re.compile(pattern, re.IGNORECAS
     r"\b(?:the\s+)?child\s+(?:result|response|output)\b[^.!?\n]*[A-Za-z0-9]",
 ))
 _REFUSAL_RESULT_TRUTHFUL_NO_CHILD_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
-    r"\bno child\s+(?:answered|said|replied|returned)\b[^.!?\n]*",
-    r"\b(?:the\s+)?child\s+did not\s+(?:answer|say|reply|return|produce)\b[^.!?\n]*",
-    r"\b(?:the\s+)?child\s+never\s+(?:answered|said|replied|returned|produced)\b[^.!?\n]*",
-    r"\bno child\s+(?:result|response|output)\s+was\s+(?:created|produced)\b[^.!?\n]*",
-    r"\b(?:the\s+)?child\s+did not\s+(?:return|produce)\s+(?:a\s+)?(?:result|response|output)\b[^.!?\n]*",
-    r"\b(?:the\s+)?child\s+never\s+(?:returned|produced)\s+(?:a\s+)?(?:result|response|output)\b[^.!?\n]*",
+    r"\bno child\s+(?:answered|said|replied)\b(?:\s+anything\b)?",
+    r"\bno child\s+returned\b(?:\s+(?:anything|any\s+(?:result|response)|a\s+(?:result|response)|output)\b)?",
+    r"\b(?:the\s+)?child\s+did not\s+(?:answer|say|reply)\b(?:\s+anything\b)?",
+    r"\b(?:the\s+)?child\s+did not\s+return\b(?:\s+(?:anything|any\s+(?:result|response)|a\s+(?:result|response)|output)\b)?",
+    r"\b(?:the\s+)?child\s+did not\s+produce\b(?:\s+(?:output|any\s+(?:result|response)|a\s+(?:result|response))\b)?",
+    r"\b(?:the\s+)?child\s+never\s+(?:answered|said|replied)\b(?:\s+anything\b)?",
+    r"\b(?:the\s+)?child\s+never\s+returned\b(?:\s+(?:anything|any\s+(?:result|response)|a\s+(?:result|response)|output)\b)?",
+    r"\b(?:the\s+)?child\s+never\s+produced\b(?:\s+(?:output|any\s+(?:result|response)|a\s+(?:result|response))\b)?",
+    r"\bno child\s+(?:result|response|output)\s+was\s+(?:created|produced)\b",
 ))
 
 def _allowlist_denial_target_from_event(event) -> str | None:
@@ -1969,18 +1972,49 @@ def _live_agent_matches(live_obj, rendered_item, namespace: str):
                 and live_obj.get("spec") == rendered_item.get("spec") and _agent_ready_readback(live_obj) is True)
 
 
-def _contains_fixed_phrase_ignoring_terminal_sentence_punctuation(text: str, expected: str) -> bool:
+def _fixed_phrase_ignoring_terminal_sentence_punctuation_pattern(expected: str) -> re.Pattern:
     normalized = _strip_terminal_sentence_punctuation(expected)
-    pattern = re.compile(rf"(?<!\w){re.escape(normalized)}(?:[.!?]+)?(?!\w)", re.IGNORECASE)
-    return bool(pattern.search(text))
+    return re.compile(rf"(?<!\w){re.escape(normalized)}(?:[.!?]+)?(?!\w)", re.IGNORECASE)
+
+
+def _contains_fixed_phrase_ignoring_terminal_sentence_punctuation(text: str, expected: str) -> bool:
+    return bool(_fixed_phrase_ignoring_terminal_sentence_punctuation_pattern(expected).search(text))
+
+
+def _merge_overlapping_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[list[int]] = []
+    for start, end in sorted(spans):
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    return [(start, end) for start, end in merged]
+
+
+def _truthful_no_child_spans(text: str) -> list[tuple[int, int]]:
+    return _merge_overlapping_spans([
+        match.span()
+        for pattern in _REFUSAL_RESULT_TRUTHFUL_NO_CHILD_PATTERNS
+        for match in pattern.finditer(text)
+    ])
+
+
+def _span_is_fully_exempt(span: tuple[int, int], exempt_spans: list[tuple[int, int]]) -> bool:
+    start, end = span
+    return any(start >= exempt_start and end <= exempt_end for exempt_start, exempt_end in exempt_spans)
+
+
+def _has_non_exempt_pattern_match(patterns: tuple[re.Pattern, ...], text: str,
+                                  exempt_spans: list[tuple[int, int]]) -> bool:
+    return any(not _span_is_fully_exempt(match.span(), exempt_spans)
+               for pattern in patterns for match in pattern.finditer(text))
 
 
 def _parent_result_fabricates_child_result(text: str, expected: str) -> bool:
-    scrubbed = text
-    for pattern in _REFUSAL_RESULT_TRUTHFUL_NO_CHILD_PATTERNS:
-        scrubbed = pattern.sub("", scrubbed)
-    return (_contains_fixed_phrase_ignoring_terminal_sentence_punctuation(scrubbed, expected)
-            or any(pattern.search(scrubbed) for pattern in _REFUSAL_RESULT_INVENTED_CHILD_PATTERNS))
+    exempt_spans = _truthful_no_child_spans(text)
+    fixed_phrase = _fixed_phrase_ignoring_terminal_sentence_punctuation_pattern(expected)
+    return (_has_non_exempt_pattern_match((fixed_phrase,), text, exempt_spans)
+            or _has_non_exempt_pattern_match(_REFUSAL_RESULT_INVENTED_CHILD_PATTERNS, text, exempt_spans))
 
 
 def _parent_result_names_requested_agent(text: str, requested_agent: str) -> bool:
