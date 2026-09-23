@@ -1306,6 +1306,63 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         })
         return summary
 
+    def _canonical_wait_no_result_length(self, task: dict) -> int:
+        metadata = task.get("metadata") if isinstance(task, dict) else None
+        spec = task.get("spec") if isinstance(task, dict) else None
+        status = task.get("status") if isinstance(task, dict) else None
+        agent_ref = spec.get("agentRef") if isinstance(spec, dict) else None
+        result = {
+            "task": metadata.get("name"),
+            "phase": status.get("phase"),
+        }
+        if isinstance(agent_ref, dict) and isinstance(agent_ref.get("name"), str):
+            result["agent"] = agent_ref["name"]
+        execution = status.get("executionOutcome") if isinstance(status, dict) and isinstance(status.get("executionOutcome"), dict) else None
+        if execution is not None:
+            result["executionOutcome"] = execution
+        payload = {"completed": True, "results": [result]}
+        return len(json.dumps(payload, indent=2))
+
+    def _delegate_events(self, *, visible_arguments: bool = True, wait_result_length: int | None = None) -> list[dict]:
+        child_name = self.child_task["metadata"]["name"]
+        events = [
+            {"type": "ToolCallStarted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "tool": {"name": "delegate_task",
+                      "arguments": {"agent": "hello", "prompt": f"Reply exactly: {FIXED_PHRASE}"}}}
+            if visible_arguments else
+            {"type": "ToolCallStarted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "content": {"argumentBytes": 57, "toolCallID": "call-1", "toolName": "delegate_task"}},
+            {"type": "ToolCallCompleted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "contentText": "delegated"}
+            if visible_arguments else
+            {"type": "ToolCallCompleted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "content": {"resultLength": 171, "toolCallID": "call-1", "toolName": "delegate_task"}},
+            {"type": "ToolCallStarted", "toolCallID": "call-2", "toolName": "wait_for_tasks",
+             "tool": {"name": "wait_for_tasks", "arguments": {"tasks": [child_name]}}}
+            if visible_arguments else
+            {"type": "ToolCallStarted", "toolCallID": "call-2", "toolName": "wait_for_tasks",
+             "content": {"argumentBytes": 47, "toolCallID": "call-2", "toolName": "wait_for_tasks"}},
+            ({"type": "ToolCallCompleted", "toolCallID": "call-2", "toolName": "wait_for_tasks",
+              "content": {"resultLength": wait_result_length, "toolCallID": "call-2", "toolName": "wait_for_tasks"}}
+             if isinstance(wait_result_length, int) and not isinstance(wait_result_length, bool) else
+             {"type": "ToolCallCompleted", "toolCallID": "call-2", "toolName": "wait_for_tasks",
+              "contentText": "done"}),
+            {"type": "ModelMessage", "contentText": FIXED_PHRASE},
+        ]
+        return [{**event, "seq": index} for index, event in enumerate(events, start=1)]
+
+    def _set_delegate_result_evidence(self, events: list[dict], *, parent_result: str = FIXED_PHRASE,
+                                      child_items=None, child_results: dict | None = None):
+        parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
+        self.pages_by_task[parent_name] = [{"events": events, "latestSeq": max(event["seq"] for event in events)}]
+        items = [self.child_task] if child_items is None else child_items
+        self.child_inventory = {"items": items}
+        self.results_by_task = {parent_name: parent_result}
+        if child_results is None:
+            self.results_by_task.update({item["metadata"]["name"]: FIXED_PHRASE for item in items})
+        else:
+            self.results_by_task.update(child_results)
+
     def reuse_eval_argv(self, case_id="refuses-unlisted", **overrides):
         args = {
             "--journal-base-url": "https://unused.example.com",
@@ -1402,6 +1459,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.assertEqual(receipt["verdict"], "pass")
         self.assertEqual(receipt["request_count"], 3)
         self.assertEqual(receipt["tool_calls"], {"total": 2, "redacted": 0})
+        self.assertEqual(receipt["assertions"]["expected-delegation-tool-calls"]["verdict"], "pass")
         self.assertEqual(receipt["assertions"]["stayed-within-limits"]["verdict"], "pass")
         result_calls = [(url, token) for url, token, _ in self.http_calls if "/result?" in url]
         self.assertEqual({token for _, token in result_calls}, {"journal-token"})
@@ -1508,6 +1566,51 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.assertEqual(receipt["assertions"]["child-result-contained-fixed-phrase"]["verdict"], "pass")
         self.assertEqual(receipt["assertions"]["parent-result-contained-fixed-phrase"]["verdict"], "pass")
         self.assertEqual(receipt["assertions"]["stayed-within-limits"]["verdict"], "pass")
+
+    def test_delegates_expected_tool_calls_require_successful_ordered_nonempty_wait_proof(self):
+        empty_wait_length = self._canonical_wait_no_result_length(self.child_task)
+        cases = (
+            ("delegate-failed", False,
+             lambda events: events.__setitem__(1, {
+                 "seq": 2, "type": "ToolCallFailed", "toolCallID": "call-1", "toolName": "delegate_task",
+                 "summary": "delegate_task failed",
+             }), "fail"),
+            ("wait-failed", False,
+             lambda events: events.__setitem__(3, {
+                 "seq": 4, "type": "ToolCallFailed", "toolCallID": "call-2", "toolName": "wait_for_tasks",
+                 "summary": "wait_for_tasks failed",
+             }), "fail"),
+            ("missing-wait-completion", False,
+             lambda events: (events.pop(3), events[3].__setitem__("seq", 4)), "fail"),
+            ("wrong-wait-terminal-id", False,
+             lambda events: events[3].__setitem__("toolCallID", "call-other"), "fail"),
+            ("zero-wait-result-length", False,
+             lambda events: events[3].__setitem__("content", {
+                 "resultLength": 0, "toolCallID": "call-2", "toolName": "wait_for_tasks",
+             }), "fail"),
+            ("canonical-empty-wait-result-length", False,
+             lambda events: events[3].__setitem__("content", {
+                 "resultLength": empty_wait_length, "toolCallID": "call-2", "toolName": "wait_for_tasks",
+             }), "fail"),
+            ("reversed-sequence", False,
+             lambda events: (events[1].__setitem__("seq", 3), events[2].__setitem__("seq", 2)), "fail"),
+            ("wrong-visible-wait-task", True,
+             lambda events: events[2]["tool"]["arguments"].__setitem__("tasks", ["not-the-child"]), "fail"),
+            ("missing-wait-tool-call-id", True,
+             lambda events: events[2].pop("toolCallID"), "not_evaluated"),
+        )
+        for label, visible_arguments, mutate, expected_verdict in cases:
+            with self.subTest(case=label):
+                self.setUp()
+                events = self._delegate_events(visible_arguments=visible_arguments,
+                                               wait_result_length=(466 if not visible_arguments else None))
+                mutate(events)
+                self._set_delegate_result_evidence(events)
+                summary = self.run_eval("delegates", self.root / "delegates-task.json")
+                receipt = self.receipt("delegates")
+                self.assertEqual(summary["verdict"], "fail")
+                self.assertEqual(receipt["assertions"]["expected-delegation-tool-calls"]["verdict"],
+                                 expected_verdict)
 
     def _delegate_started_event(self, *, visible_arguments: bool, tool_call_id: str = "call-1") -> dict:
         event = {"type": "ToolCallStarted", "toolCallID": tool_call_id, "toolName": "delegate_task"}

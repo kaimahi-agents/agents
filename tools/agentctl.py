@@ -1784,6 +1784,47 @@ def visible_event_text(event) -> str | None:
                     return value
     return None
 
+
+def event_sequence_number(event) -> int | None:
+    seq = event.get("seq") if isinstance(event, dict) else None
+    return seq if isinstance(seq, int) and not isinstance(seq, bool) else None
+
+
+def tool_result_length_from_event(event) -> int | None:
+    if not isinstance(event, dict) or find_redacted_sequences([event]):
+        return None
+    holders = [event.get("content") if isinstance(event.get("content"), dict) else None, event]
+    for holder in holders:
+        value = holder.get("resultLength") if isinstance(holder, dict) else None
+        if _is_count(value):
+            return value
+    return None
+
+
+def canonical_wait_for_tasks_empty_result_length(task) -> int | None:
+    metadata = task.get("metadata") if isinstance(task, dict) else None
+    spec = task.get("spec") if isinstance(task, dict) else None
+    status = task.get("status") if isinstance(task, dict) else None
+    name = metadata.get("name") if isinstance(metadata, dict) else None
+    phase = status.get("phase") if isinstance(status, dict) else None
+    if not (isinstance(name, str) and name and isinstance(phase, str) and phase):
+        return None
+    result = {"task": name, "phase": phase}
+    agent_ref = spec.get("agentRef") if isinstance(spec, dict) else None
+    if isinstance(agent_ref, dict) and isinstance(agent_ref.get("name"), str) and agent_ref.get("name"):
+        result["agent"] = agent_ref["name"]
+    execution = status.get("executionOutcome") if isinstance(status, dict) and isinstance(status.get("executionOutcome"), dict) else None
+    workspace_status = status.get("executionWorkspace") if isinstance(status, dict) and isinstance(status.get("executionWorkspace"), dict) else None
+    delivery = status.get("delivery") if isinstance(status, dict) and isinstance(status.get("delivery"), dict) else None
+    if execution is not None:
+        result["executionOutcome"] = execution
+    if workspace_status is not None:
+        result["workspaceStatus"] = workspace_status
+    if delivery is not None:
+        result["delivery"] = delivery
+    return len(json.dumps({"completed": True, "results": [result]}, indent=2))
+
+
 def _strip_terminal_sentence_punctuation(text: str) -> str:
     return re.sub(r"[.!?]+$", "", text)
 
@@ -2743,15 +2784,54 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
         required_counts = {name: 1 for name in expected_tools}
         if any(started_names.count(name) != count_needed for name, count_needed in required_counts.items()):
             return settled(False, "required delegation tool calls were not each started exactly once")
-        for event in [*delegate_started, *wait_started]:
+        started_by_name = {"delegate_task": delegate_started[0], "wait_for_tasks": wait_started[0]}
+        completed_by_name = {}
+        for tool_name in expected_tools:
+            event = started_by_name[tool_name]
             tool_call_id = tool_call_id_from_event(event)
             if tool_call_id is None:
                 return not_evaluated("a delegation tool call was missing toolCallID")
-            if not terminal_by_id.get(tool_call_id):
+            terminal_events = terminal_by_id.get(tool_call_id, [])
+            if not terminal_events:
                 return settled(False, "a delegation tool call lacked a correlated terminal event")
-        note = ("delegate_task and wait_for_tasks each started once with visible names, toolCallIDs, and correlated terminal events"
-                if args.case_id == "delegates"
-                else "delegate_task started once with a visible name, toolCallID, and correlated terminal event")
+            completed = [candidate for candidate in terminal_events if candidate.get("type") == "ToolCallCompleted"]
+            failed = [candidate for candidate in terminal_events if candidate.get("type") == "ToolCallFailed"]
+            if failed or len(completed) != 1:
+                return settled(False, f"{tool_name} did not complete successfully exactly once")
+            completed_by_name[tool_name] = completed[0]
+        if args.case_id != "delegates":
+            return settled(True, "delegate_task started once with a visible name, toolCallID, and correlated terminal event")
+        final_message = find_final_model_message(events)
+        if final_message is None:
+            return not_evaluated("the final ModelMessage event was missing from the journal")
+        ordered_events = (
+            delegate_started[0], completed_by_name["delegate_task"],
+            wait_started[0], completed_by_name["wait_for_tasks"], final_message,
+        )
+        sequences = [event_sequence_number(event) for event in ordered_events]
+        if any(seq is None for seq in sequences):
+            return not_evaluated("delegation and wait ordering could not be established from the journal")
+        if not sequences[0] < sequences[1] < sequences[2] < sequences[3] < sequences[4]:
+            return settled(False, "delegate_task and wait_for_tasks were not ordered successively before the final ModelMessage")
+        visible_wait_target = False
+        wait_args = tool_arguments_from_event(wait_started[0])
+        if wait_args is not None:
+            if child_name is None:
+                return not_evaluated("genuine child Task identity could not be established")
+            if wait_args.get("tasks") != [child_name]:
+                return settled(False, "wait_for_tasks did not name exactly the genuine child Task")
+            visible_wait_target = True
+        wait_result_length = tool_result_length_from_event(completed_by_name["wait_for_tasks"])
+        if wait_result_length is not None:
+            empty_wait_length = canonical_wait_for_tasks_empty_result_length(child)
+            if empty_wait_length is None:
+                return not_evaluated("wait_for_tasks non-empty completion could not be established")
+            if wait_result_length <= empty_wait_length:
+                return settled(False, "wait_for_tasks did not prove a non-empty child result")
+        elif not (visible_wait_target and isinstance(child_result, str) and child_result
+                  and isinstance(parent_result, str) and child_result in parent_result):
+            return not_evaluated("wait_for_tasks non-empty completion could not be established")
+        note = "delegate_task and wait_for_tasks each started once with visible names, toolCallIDs, and correlated terminal events"
         return settled(True, note)
 
     def no_unexpected_assertion() -> dict:

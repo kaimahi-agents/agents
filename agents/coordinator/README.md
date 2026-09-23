@@ -38,6 +38,11 @@ render-and-apply flow above rather than the monitored-runtime path.
 `delegates` proves the coordinator delegated once to `hello`, waited for the
 child, propagated the authenticated child greeting into the parent result, and
 stayed within the fixed request, tool-call, child-count, and retry limits.
+When `wait_for_tasks` arguments are visible in retained evidence, evaluation
+also checks that they name the one genuine child Task exactly. Current live
+Orka journals do not always retain those exact wait arguments, so live
+verification instead proves one ordered successful non-empty wait after
+delegation plus authenticated child-result propagation.
 
 `refuses-unlisted` proves the coordinator attempted to delegate to
 `not-allowed`, Orka refused that call before child creation, the parent still
