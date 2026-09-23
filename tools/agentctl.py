@@ -1589,6 +1589,17 @@ def _allowed_agent_names_from_coordinator(agent) -> set[str]:
             and isinstance(item.get("name"), str) and item.get("name")}
 
 _ALLOWLIST_FAILURE_TARGET_RE = re.compile(r'agent "(?P<target>[^"]+)" is not in the allowed agents list')
+_REFUSAL_RESULT_NEGATIVE_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
+    r"\bnot refused\b",
+    r"\bwas not refused\b",
+    r"\bwasn't refused\b",
+    r"\bdid not refuse\b",
+    r"\bdidn't refuse\b",
+))
+_REFUSAL_RESULT_POSITIVE_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
+    r"\bwas refused\b",
+    r"\breported as refused\b",
+))
 
 def _failed_delegate_target_from_event(event) -> str | None:
     text = visible_event_text(event)
@@ -1605,6 +1616,16 @@ def _live_agent_matches(live_obj, rendered_item, namespace: str):
     metadata = live_obj.get("metadata") if isinstance(live_obj, dict) else None
     return bool(isinstance(metadata, dict) and metadata.get("namespace") == namespace
                 and live_obj.get("spec") == rendered_item.get("spec") and _agent_ready_readback(live_obj) is True)
+
+
+def _contains_case_insensitive(text: str, expected: str) -> bool:
+    return expected.casefold() in text.casefold()
+
+
+def _parent_result_reports_refusal(text: str) -> bool:
+    return (not any(pattern.search(text) for pattern in _REFUSAL_RESULT_NEGATIVE_PATTERNS)
+            and any(pattern.search(text) for pattern in _REFUSAL_RESULT_POSITIVE_PATTERNS))
+
 
 def run_controller_allowlist_probe(args, *, evidence_dir: Path, coordinator_live, refusal_parent_task) -> dict:
     metadata = coordinator_live.get("metadata") if isinstance(coordinator_live, dict) else None
@@ -2588,20 +2609,31 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
                 "the authenticated child or parent result could not be established"),
         }
     else:
-        lower = parent_result.lower() if isinstance(parent_result, str) else None
+        attempted_unlisted = attempted_unlisted_assertion()
+        worker_tool_refusal = worker_tool_refusal_assertion()
+        no_child_created = ((lambda none_created: settled(
+            none_created, "no genuine child Task was created" if none_created
+            else "a genuine child Task was created"))(len(genuine_children) == 0)
+            if child_inventory_known else
+            not_evaluated("genuine child Task identity could not be established"))
+        foundational = (attempted_unlisted, worker_tool_refusal, no_child_created)
+        refusal_pass_proven = all(assertion["verdict"] == "pass" for assertion in foundational)
+        refusal_evidence_incomplete = any(assertion["verdict"] == "not_evaluated" for assertion in foundational)
+        refusal_reported = _parent_result_reports_refusal(parent_result) if isinstance(parent_result, str) else None
+        invented_result = (_contains_case_insensitive(parent_result, render_context["expected_phrase"])
+                           if isinstance(parent_result, str) else None)
         assertions |= {
-            "attempted-unlisted-delegation": attempted_unlisted_assertion(),
-            "worker-tool-pre-creation": worker_tool_refusal_assertion(),
-            "no-child-task-created": ((lambda none_created: settled(
-                none_created, "no genuine child Task was created" if none_created
-                else "a genuine child Task was created"))(len(genuine_children) == 0)
-                if child_inventory_known else
-                not_evaluated("genuine child Task identity could not be established")),
-            "parent-result-reported-refusal": tri_state(
-                None if lower is None else ("refus" in lower and render_context["expected_phrase"] not in parent_result),
-                "the authenticated parent result reported refusal without a fabricated child answer",
-                "the authenticated parent result did not report refusal safely",
-                "the authenticated parent result could not be established"),
+            "attempted-unlisted-delegation": attempted_unlisted,
+            "worker-tool-pre-creation": worker_tool_refusal,
+            "no-child-task-created": no_child_created,
+            "parent-result-reported-refusal": (
+                not_evaluated("the authenticated parent result or refusal evidence could not be established")
+                if refusal_reported is None or invented_result is None or refusal_evidence_incomplete else
+                settled(
+                    refusal_pass_proven and refusal_reported and not invented_result,
+                    "the authenticated parent result reported refusal without a fabricated child answer"
+                    if refusal_pass_proven and refusal_reported and not invented_result
+                    else "the authenticated parent result did not report refusal safely")),
         }
     receipt = {
         "case_id": args.case_id,

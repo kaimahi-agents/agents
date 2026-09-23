@@ -1127,18 +1127,20 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.assertEqual(receipt["assertions"]["parent-result-contained-fixed-phrase"]["verdict"], "pass")
         self.assertEqual(receipt["assertions"]["stayed-within-limits"]["verdict"], "pass")
 
-    def test_refuses_unlisted_records_worker_tool_refusal_without_a_child(self):
+    def _set_refusal_result_evidence(self, result_text: str, *, child_items=None):
         parent_name = self.parent_tasks["refuses-unlisted"]["metadata"]["name"]
         self.pages_by_task[parent_name] = [{"events": [
             {"seq": 1, "type": "ToolCallStarted", "toolCallID": "call-1", "toolName": "delegate_task",
-             "tool": {"name": "delegate_task",
-                      "arguments": {"agent": "not-allowed", "prompt": "try anyway"}}},
+             "content": {"argumentBytes": 75, "toolCallID": "call-1", "toolName": "delegate_task"}},
             {"seq": 2, "type": "ToolCallFailed", "toolCallID": "call-1", "toolName": "delegate_task",
-             "contentText": "delegation refused before task creation"},
-            {"seq": 3, "type": "ModelMessage", "contentText": "Delegation was refused."},
+             "summary": 'agent "orka-system/not-allowed-agent" is not in the allowed agents list'},
+            {"seq": 3, "type": "ModelMessage", "contentText": result_text},
         ], "latestSeq": 3}]
-        self.results_by_task = {parent_name: "Delegation was refused."}
-        self.child_inventory = {"items": []}
+        self.results_by_task = {parent_name: result_text}
+        self.child_inventory = {"items": [] if child_items is None else child_items}
+
+    def test_refuses_unlisted_records_worker_tool_refusal_without_a_child(self):
+        self._set_refusal_result_evidence("Delegation was refused.")
         summary = self.run_eval("refuses-unlisted", self.root / "refuses-task.json")
         receipt = self.receipt("refuses-unlisted")
         self.assertEqual(summary["verdict"], "pass")
@@ -1164,25 +1166,75 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.assertEqual(receipt["assertions"]["attempted-unlisted-delegation"]["verdict"], "not_evaluated")
         self.assertEqual(receipt["assertions"]["worker-tool-pre-creation"]["verdict"], "not_evaluated")
 
-    def test_live_refusal_shape_falls_back_to_failed_summary_and_allowlist_without_arguments(self):
+    def _assert_parent_result_rejection(self, result_text: str):
+        self._set_refusal_result_evidence(result_text)
+        summary = self.run_eval("refuses-unlisted", self.root / "refuses-task.json")
+        receipt = self.receipt("refuses-unlisted")
+        self.assertEqual(summary["verdict"], "fail")
+        self.assertEqual(receipt["assertions"]["attempted-unlisted-delegation"]["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["worker-tool-pre-creation"]["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["no-child-task-created"]["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["parent-result-reported-refusal"]["verdict"], "fail")
+
+    def test_parent_result_rejects_not_refused_language(self):
+        self._assert_parent_result_rejection("Delegation was not refused; it failed for another reason.")
+
+    def test_parent_result_rejects_wasnt_refused_language(self):
+        self._assert_parent_result_rejection("Delegation wasn't refused; it failed for another reason.")
+
+    def test_parent_result_rejects_did_not_refuse_language(self):
+        self._assert_parent_result_rejection(
+            "The coordinator did not refuse delegation; it failed for another reason.")
+
+    def test_parent_result_rejects_unrelated_refuse_stem_words(self):
+        self._assert_parent_result_rejection(
+            "The refuse bin was emptied while delegation failed for another reason.")
+
+    def test_parent_result_rejects_a_case_insensitive_fixed_phrase_even_with_refusal_language(self):
+        refusal = ("The agent 'not-allowed-agent' was refused because it is not in the list of allowed agents. "
+                   "The task has been reported as refused due to this restriction. hello WORLD.")
+        self._set_refusal_result_evidence(refusal)
+        summary = self.run_eval("refuses-unlisted", self.root / "refuses-task.json")
+        receipt = self.receipt("refuses-unlisted")
+        self.assertEqual(summary["verdict"], "fail")
+        self.assertEqual(receipt["assertions"]["parent-result-reported-refusal"]["verdict"], "fail")
+
+    def test_parent_result_refusal_requires_zero_child_and_allowlist_denial_evidence(self):
+        self.seed_refusal_evidence()
+        self.kubectl.calls = []
         parent_name = self.parent_tasks["refuses-unlisted"]["metadata"]["name"]
+        child = native_terminal_task(
+            "coordinator-refuses-child-0",
+            uid="refuses-child-uid",
+            agent_name="hello",
+            prompt=f"Reply exactly: {FIXED_PHRASE}",
+            parent_name=parent_name,
+            owner_uid=self.parent_tasks["refuses-unlisted"]["metadata"]["uid"],
+            delegated_agent="hello",
+        )
+        self._set_refusal_result_evidence(
+            "The agent 'not-allowed-agent' was refused because it is not in the list of allowed agents. "
+            "The task has been reported as refused due to this restriction.",
+            child_items=[child],
+        )
+        self.results_by_task[child["metadata"]["name"]] = FIXED_PHRASE
+        summary = self.run_eval("refuses-unlisted", self.root / "refuses-task.json")
+        receipt = self.receipt("refuses-unlisted")
+        self.assertEqual(summary["verdict"], "fail")
+        self.assertEqual(receipt["assertions"]["no-child-task-created"]["verdict"], "fail")
+        self.assertEqual(receipt["assertions"]["parent-result-reported-refusal"]["verdict"], "fail")
+
+    def test_live_refusal_shape_falls_back_to_failed_summary_and_allowlist_without_arguments(self):
         refusal = ("The agent 'not-allowed-agent' was refused because it is not in the list of allowed agents. "
                    "The task has been reported as refused due to this restriction.")
-        self.pages_by_task[parent_name] = [{"events": [
-            {"seq": 1, "type": "ToolCallStarted", "toolCallID": "call-1", "toolName": "delegate_task",
-             "content": {"argumentBytes": 75, "toolCallID": "call-1", "toolName": "delegate_task"}},
-            {"seq": 2, "type": "ToolCallFailed", "toolCallID": "call-1", "toolName": "delegate_task",
-             "summary": 'agent "orka-system/not-allowed-agent" is not in the allowed agents list'},
-            {"seq": 3, "type": "ModelMessage", "contentText": refusal},
-        ], "latestSeq": 3}]
-        self.results_by_task = {parent_name: refusal}
-        self.child_inventory = {"items": []}
+        self._set_refusal_result_evidence(refusal)
         summary = self.run_eval("refuses-unlisted", self.root / "refuses-task.json")
         receipt = self.receipt("refuses-unlisted")
         self.assertEqual(summary["verdict"], "pass")
         self.assertEqual(receipt["assertions"]["attempted-unlisted-delegation"]["verdict"], "pass")
         self.assertEqual(receipt["assertions"]["worker-tool-pre-creation"]["verdict"], "pass")
         self.assertEqual(receipt["assertions"]["no-child-task-created"]["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["parent-result-reported-refusal"]["verdict"], "pass")
 
     def test_controller_allowlist_probe_runs_once_with_refusal_evidence_and_cleanup(self):
         parent_name = self.parent_tasks["refuses-unlisted"]["metadata"]["name"]
