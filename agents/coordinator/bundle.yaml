@@ -1,0 +1,53 @@
+{
+  "apiVersion": "v1",
+  "items": [
+    {
+      "apiVersion": "core.orka.ai/v1alpha1",
+      "kind": "Agent",
+      "metadata": {
+        "labels": {
+          "environment": "production",
+          "kaimahi.dev/agent": "coordinator",
+          "kaimahi.dev/environment": "production"
+        },
+        "name": "coordinator",
+        "namespace": "orka-system"
+      },
+      "spec": {
+        "coordination": {
+          "allowedAgents": [
+            {
+              "name": "hello"
+            }
+          ],
+          "enabled": true,
+          "maxConcurrentChildren": 1,
+          "maxDepth": 1
+        },
+        "model": {
+          "maxTokens": 512,
+          "name": "qwen2.5:3b",
+          "temperature": 0
+        },
+        "providerRef": {
+          "name": "hello",
+          "namespace": "orka-system"
+        },
+        "systemPrompt": {
+          "inline": "Delegate only to hello and report refusals truthfully."
+        },
+        "tools": [
+          {
+            "enabled": true,
+            "name": "delegate_task"
+          },
+          {
+            "enabled": true,
+            "name": "wait_for_tasks"
+          }
+        ]
+      }
+    }
+  ],
+  "kind": "List"
+}

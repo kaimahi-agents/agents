@@ -10,7 +10,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tests.fixtures import acceptance_block, evaluation_receipt, write_agent, write_json, write_native_agent  # noqa: E402
+from tests.fixtures import (  # noqa: E402
+    CONTROLLER_ALLOWLIST_PRE_DISPATCH,
+    REFUSAL_DENIAL_CASE_ID,
+    REFUSAL_REPORT_CASE_ID,
+    acceptance_block,
+    composed_case,
+    evaluation_receipt,
+    refusal_case_payload,
+    write_agent,
+    write_json,
+    write_native_agent,
+    write_native_coordinator,
+)
 from tools import agentctl  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -21,6 +33,76 @@ CASE_DIGEST = agentctl.sha256_hex(CASE_TEXT.encode("utf-8"))
 
 def required_case(environment="trial", case_id="demo-case", digest=CASE_DIGEST, required=True):
     return {"case_id": case_id, "environment": environment, "case_sha256": digest, "required": required}
+
+
+COMPOSED_CASES = (
+    {"case_id": "delegates", "environment": "trial", "case_sha256": "a" * 64, "required": False,
+     "policy": "composed-coordination-v1",
+     "assertions": ["live-pinned-agents-ready", "parent-task-succeeded", "expected-delegation-tool-calls",
+                    "no-unexpected-tool-calls", "exactly-one-child-task", "child-targeted-hello",
+                    "child-task-succeeded", "child-result-contained-fixed-phrase",
+                    "parent-result-contained-fixed-phrase", "stayed-within-limits"],
+     "limits": {"provider_requests": 10, "tool_calls": 2, "child_tasks": 1, "retries": 0}},
+    {"case_id": "orka-denies-unlisted", "environment": "trial", "case_sha256": "a" * 64, "required": False,
+     "policy": "composed-coordination-v1",
+     "assertions": ["live-pinned-agents-ready", "parent-task-succeeded", "expected-delegation-tool-calls",
+                    "attempted-unlisted-delegation", "worker-tool-pre-creation", "no-child-task-created",
+                    "no-unexpected-tool-calls", "stayed-within-limits"],
+     "limits": {"provider_requests": 10, "tool_calls": 1, "child_tasks": 0, "retries": 0}},
+    {"case_id": "coordinator-reports-denial", "environment": "trial", "case_sha256": "a" * 64,
+     "required": False, "policy": "composed-coordination-v1",
+     "assertions": ["live-pinned-agents-ready", "parent-task-succeeded", "expected-delegation-tool-calls",
+                    "no-child-task-created", "no-unexpected-tool-calls",
+                    "parent-result-named-requested-agent", "parent-result-reported-refusal",
+                    "stayed-within-limits"],
+     "limits": {"provider_requests": 10, "tool_calls": 1, "child_tasks": 0, "retries": 0}},
+)
+NATIVE_DEPLOY_ASSERTIONS = (
+    "child-matches-rendered", "child-ready", "coordinator-matches-rendered", "coordinator-ready",
+)
+NATIVE_ROLLBACK_ASSERTIONS = (
+    "child-matches-restored", "child-ready", "coordinator-matches-restored", "coordinator-ready",
+)
+
+
+def native_lifecycle_receipt(kind: str, coordinator_digest: str, child_digest: str, **overrides) -> dict:
+    assertion_ids = NATIVE_DEPLOY_ASSERTIONS if kind == "deploy" else NATIVE_ROLLBACK_ASSERTIONS
+    receipt = {
+        "schema_version": agentctl.NATIVE_COMPOSITION_LIFECYCLE_RECEIPT_SCHEMA_VERSION,
+        "kind": kind,
+        "coordinator_digest": coordinator_digest,
+        "child_digest": child_digest,
+        "date": "2026-09-17",
+        "namespace": "trial-namespace",
+        "verdict": "pass",
+        "assertions": {name: {"verdict": "pass", "evidence_completeness": True, "note": "n"}
+                        for name in assertion_ids},
+    }
+    if kind == "rollback":
+        receipt["limitations"] = list(agentctl.NATIVE_COMPOSITION_ROLLBACK_LIMITATIONS)
+    receipt.update(overrides)
+    return receipt
+
+
+def monitored_lifecycle_receipt(kind: str, **overrides) -> dict:
+    assertion_ids = agentctl._LIFECYCLE[kind][2]
+    receipt = {
+        "schema_version": agentctl.LIFECYCLE_RECEIPT_SCHEMA_VERSION,
+        "kind": kind,
+        "bundle_digest": "d" * 64,
+        "date": "2026-09-17",
+        "namespace": "trial-namespace",
+        "verdict": "pass",
+        "assertions": {name: {"verdict": "pass", "evidence_completeness": True, "note": "n"}
+                        for name in assertion_ids},
+        "digests": {"prompt": "a" * 64},
+        "counts": {"memory-items": 0, "proposal-items": 0},
+    }
+    if kind == "rollback":
+        receipt["restored"] = {"model": "test-model", "request-cap": 60, "tools": ["Read"]}
+        receipt["limitations"] = list(agentctl.ROLLBACK_LIMITATIONS)
+    receipt.update(overrides)
+    return receipt
 
 
 class VerifyAgentTestCase(unittest.TestCase):
@@ -88,6 +170,12 @@ class VerifyAgentTestCase(unittest.TestCase):
         self.receipt_path.unlink()
         self.assertTrue(any("no receipt found" in error for error in self.verify()))
 
+    def test_required_case_receipt_bundle_digest_must_match_its_directory_and_current_digest(self):
+        write_json(self.receipt_path, evaluation_receipt("demo-case", "c" * 64))
+        errors = self.verify()
+        self.assertTrue(any("receipt bundle_digest does not match the receipt directory and current rendered bundle digest"
+                            in error for error in errors))
+
     def test_case_file_must_match_the_declared_hash(self):
         (self.agent / "eval" / "cases" / "demo-case.yaml").write_text("id: tampered\n", encoding="utf-8")
         self.assertTrue(any("declared SHA-256" in error for error in self.verify()))
@@ -113,7 +201,9 @@ class VerifyAgentTestCase(unittest.TestCase):
     def test_malformed_acceptance_block_is_a_diagnostic(self):
         for text in ("no markers at all\n", "<!-- acceptance:end -->\n<!-- acceptance:begin -->\n",
                      "<!-- acceptance:begin -->\nnot json\n<!-- acceptance:end -->\n",
-                     "<!-- acceptance:begin -->\n{\"case_id\": \"x\"}\n<!-- acceptance:end -->\n"):
+                     "<!-- acceptance:begin -->\n{\"case_id\": \"x\"}\n<!-- acceptance:end -->\n",
+                     "<!-- acceptance:begin -->\nnull\n<!-- acceptance:end -->\n",
+                     "<!-- acceptance:begin -->\n1\n<!-- acceptance:end -->\n"):
             with self.subTest(text=text):
                 (self.agent / "eval" / "acceptance.md").write_text(text, encoding="utf-8")
                 self.assertTrue(any("verify failed" in error for error in self.verify()))
@@ -139,6 +229,89 @@ class VerifyAgentTestCase(unittest.TestCase):
         self.assertEqual(agentctl.validate_lifecycle_receipt(receipt, "deploy"), [])
         receipt["assertions"]["agent-identity-readback"]["note"] += " changed"
         self.assertTrue(agentctl.validate_lifecycle_receipt(receipt, "deploy"))
+
+    def test_native_lifecycle_receipts_are_validated_by_the_gate(self):
+        (self.root / "agents").mkdir(exist_ok=True)
+        hello = write_native_agent(self.root / "agents" / "hello", namespace="trial-namespace",
+                                   agent_name="hello", provider_name="hello")
+        pins = {environment: agentctl.render_agent(
+            hello, environment, self.root / f"hello-{environment}.json")["bundle_digest"]
+                for environment in agentctl.ALLOWED_ENVIRONMENTS}
+        coordinator = write_native_coordinator(
+            self.root / "agents" / "coordinator", namespace="trial-namespace",
+            catalogue_agents={"hello": pins},
+        )
+        bad = coordinator / "lifecycle" / "receipts" / ("a" * 64) / "deploy.json"
+        write_json(bad, {"kind": "deploy", "coordinator_digest": "a" * 64, "child_digest": "b" * 64})
+        errors = agentctl.verify_agent(coordinator, "trial")
+        self.assertTrue(any("lifecycle receipt #" in error for error in errors))
+        self.assertTrue(any("fixed public-safe set" in error for error in errors))
+
+    def test_native_receipt_schema_rejects_a_malformed_child_digest(self):
+        errors = agentctl.validate_lifecycle_receipt(
+            native_lifecycle_receipt("deploy", "c" * 64, "short"), "deploy")
+        self.assertTrue(any("child_digest" in error for error in errors))
+
+    def test_lifecycle_receipt_rejects_non_object_digests_and_counts(self):
+        errors = agentctl.validate_lifecycle_receipt(
+            monitored_lifecycle_receipt("deploy", digests="not-an-object", counts="not-a-map"), "deploy")
+        self.assertTrue(any("digests" in error for error in errors))
+        self.assertTrue(any("counts" in error for error in errors))
+
+    def test_grandfathered_legacy_lifecycle_receipt_still_requires_a_pass_or_fail_verdict(self):
+        path = REAL_AGENT / "lifecycle" / "receipts" / (
+            "50be51a4de3e857436fcebd244192d37590ea51f64d19a91216a2cfc13e532b8/deploy.json")
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+        receipt["verdict"] = "maybe"
+        errors = agentctl.validate_lifecycle_receipt(receipt, "deploy")
+        self.assertTrue(any("verdict" in error for error in errors))
+
+    def test_native_lifecycle_receipt_requires_a_pass_or_fail_verdict(self):
+        errors = agentctl.validate_lifecycle_receipt(
+            native_lifecycle_receipt("deploy", "c" * 64, "d" * 64, verdict="maybe"), "deploy")
+        self.assertTrue(any("verdict" in error for error in errors))
+
+    def test_native_historical_deploy_receipt_stays_valid_after_source_rollback(self):
+        (self.root / "agents").mkdir(exist_ok=True)
+        original_child_prompt = "Reply briefly and in plain text."
+        original_coordinator_prompt = "Delegate to exactly one allowed catalogue agent when needed."
+        updated_child_prompt = "Reply exactly with the updated greeting."
+        updated_coordinator_prompt = "Delegate to hello and report the updated greeting."
+        hello = write_native_agent(self.root / "agents" / "hello", namespace="trial-namespace",
+                                   agent_name="hello", provider_name="hello", prompt=original_child_prompt)
+        original_pins = {environment: agentctl.render_agent(
+            hello, environment, self.root / f"hello-original-{environment}.json")["bundle_digest"]
+                for environment in agentctl.ALLOWED_ENVIRONMENTS}
+        coordinator = write_native_coordinator(
+            self.root / "agents" / "coordinator", namespace="trial-namespace",
+            catalogue_agents={"hello": original_pins}, prompt=original_coordinator_prompt,
+        )
+        original_digest = agentctl.render_agent(
+            coordinator, "trial", self.root / "coordinator-original.json")["bundle_digest"]
+
+        write_native_agent(self.root / "agents" / "hello", namespace="trial-namespace",
+                           agent_name="hello", provider_name="hello", prompt=updated_child_prompt)
+        updated_pins = {environment: agentctl.render_agent(
+            hello, environment, self.root / f"hello-updated-{environment}.json")["bundle_digest"]
+                for environment in agentctl.ALLOWED_ENVIRONMENTS}
+        write_native_coordinator(
+            self.root / "agents" / "coordinator", namespace="trial-namespace",
+            catalogue_agents={"hello": updated_pins}, prompt=updated_coordinator_prompt,
+        )
+        updated_digest = agentctl.render_agent(
+            coordinator, "trial", self.root / "coordinator-updated.json")["bundle_digest"]
+
+        write_native_agent(self.root / "agents" / "hello", namespace="trial-namespace",
+                           agent_name="hello", provider_name="hello", prompt=original_child_prompt)
+        write_native_coordinator(
+            self.root / "agents" / "coordinator", namespace="trial-namespace",
+            catalogue_agents={"hello": original_pins}, prompt=original_coordinator_prompt,
+        )
+        write_json(coordinator / "lifecycle" / "receipts" / updated_digest / "deploy.json",
+                   native_lifecycle_receipt("deploy", updated_digest, updated_pins["trial"]))
+        write_json(coordinator / "lifecycle" / "receipts" / original_digest / "rollback.json",
+                   native_lifecycle_receipt("rollback", original_digest, original_pins["trial"]))
+        self.assertEqual(agentctl.verify_agent(coordinator, "trial"), [])
 
     def _write_policy_case(self, assertions):
         """Rewrite acceptance.md/policy file for a `missing-toolchain-v2` case and re-render, since
@@ -175,11 +348,220 @@ class VerifyAgentTestCase(unittest.TestCase):
         errors = self.verify()
         self.assertTrue(any("missing valid tool_calls" in error for error in errors))
 
+    def test_a_composed_refusal_required_case_does_not_require_observations(self):
+        (self.root / "agents").mkdir(exist_ok=True)
+        hello = write_native_agent(self.root / "agents" / "hello", namespace="orka-system",
+                                   agent_name="hello", provider_name="hello")
+        pins = {environment: agentctl.render_agent(
+            hello, environment, self.root / f"hello-refusal-{environment}.json")["bundle_digest"]
+                for environment in agentctl.ALLOWED_ENVIRONMENTS}
+        placeholder = composed_case(REFUSAL_DENIAL_CASE_ID, required=True)
+        coordinator = write_native_coordinator(
+            self.root / "agents" / "coordinator-refusal", namespace="orka-system",
+            agent_name="coordinator-refusal", catalogue_agents={"hello": pins}, cases=(placeholder,),
+        )
+        (coordinator / "eval" / "cases").mkdir(parents=True, exist_ok=True)
+        case_path = coordinator / "eval" / "cases" / f"{REFUSAL_DENIAL_CASE_ID}.yaml"
+        write_json(case_path, refusal_case_payload({"id": "demo-case"}))
+        case = composed_case(REFUSAL_DENIAL_CASE_ID, required=True,
+                             case_sha256=agentctl.sha256_hex(case_path.read_bytes()))
+        (coordinator / "eval" / "acceptance.md").write_text(acceptance_block(case), encoding="utf-8")
+        digest = agentctl.render_agent(coordinator, "trial", self.root / "probe-composed.yaml")["bundle_digest"]
+        receipt = evaluation_receipt(
+            REFUSAL_DENIAL_CASE_ID,
+            digest,
+            assertions={name: {"verdict": "pass", "evidence_completeness": True, "note": "n"}
+                        for name in case["assertions"]},
+            tool_calls={"total": case["limits"]["tool_calls"], "redacted": 0},
+            dependency_digests={"hello": pins["trial"]},
+        )
+        write_json(coordinator / "eval" / "receipts" / digest / f"{REFUSAL_DENIAL_CASE_ID}.json", receipt)
+        self.assertEqual(agentctl.verify_agent(coordinator, "trial"), [])
+
+    def test_gate_rejects_a_current_digest_legacy_composed_live_receipt_missing_dependency_digests(self):
+        placeholder = composed_case(REFUSAL_DENIAL_CASE_ID, required=True)
+        (self.agent / "eval" / "acceptance.md").write_text(acceptance_block(placeholder), encoding="utf-8")
+        (self.agent / "eval" / "policies").mkdir(parents=True, exist_ok=True)
+        (self.agent / "eval" / "policies" / "composed-coordination.md").write_text(
+            "policy text\n", encoding="utf-8")
+        case_path = self.agent / "eval" / "cases" / f"{REFUSAL_DENIAL_CASE_ID}.yaml"
+        write_json(case_path, refusal_case_payload({"id": "demo-case"}))
+        case = composed_case(REFUSAL_DENIAL_CASE_ID, required=True,
+                             case_sha256=agentctl.sha256_hex(case_path.read_bytes()))
+        (self.agent / "eval" / "acceptance.md").write_text(acceptance_block(case), encoding="utf-8")
+        digest = agentctl.render_agent(self.agent, "trial", self.root / "probe-composed-legacy.yaml")["bundle_digest"]
+        receipt = evaluation_receipt(
+            REFUSAL_DENIAL_CASE_ID,
+            digest,
+            source="live",
+            assertions={name: {"verdict": "pass", "evidence_completeness": True, "note": "n"}
+                        for name in case["assertions"]},
+            tool_calls={"total": case["limits"]["tool_calls"], "redacted": 0},
+        )
+        write_json(self.agent / "eval" / "receipts" / digest / f"{REFUSAL_DENIAL_CASE_ID}.json", receipt)
+        errors = self.verify()
+        self.assertTrue(any("dependency_digests" in error for error in errors))
+
+    def test_a_legacy_required_refusal_case_rejects_observations(self):
+        placeholder = required_case(case_id=REFUSAL_DENIAL_CASE_ID, required=True)
+        (self.agent / "eval" / "acceptance.md").write_text(acceptance_block(placeholder), encoding="utf-8")
+        case_path = self.agent / "eval" / "cases" / f"{REFUSAL_DENIAL_CASE_ID}.yaml"
+        write_json(case_path, refusal_case_payload({"id": "demo-case"}))
+        case = required_case(case_id=REFUSAL_DENIAL_CASE_ID,
+                             digest=agentctl.sha256_hex(case_path.read_bytes()), required=True)
+        (self.agent / "eval" / "acceptance.md").write_text(acceptance_block(case), encoding="utf-8")
+        digest = agentctl.render_agent(self.agent, "trial", self.root / "probe-legacy-refusal.yaml")["bundle_digest"]
+        refusal = composed_case(REFUSAL_DENIAL_CASE_ID)
+        receipt = evaluation_receipt(
+            REFUSAL_DENIAL_CASE_ID,
+            digest,
+            assertions={name: {"verdict": "pass", "evidence_completeness": True, "note": "n"}
+                        for name in refusal["assertions"]},
+            tool_calls={"total": refusal["limits"]["tool_calls"], "redacted": 0},
+            observations=CONTROLLER_ALLOWLIST_PRE_DISPATCH,
+            dependency_digests={"hello": "a" * 64},
+        )
+        write_json(self.agent / "eval" / "receipts" / digest / f"{REFUSAL_DENIAL_CASE_ID}.json", receipt)
+        errors = self.verify()
+        self.assertTrue(any("observations" in error for error in errors))
+
+
+class VerifyCatalogueDependenciesTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        (self.root / "agents").mkdir()
+
+    def write_child(self, slug="hello", *, agent_name="hello") -> Path:
+        return write_native_agent(self.root / "agents" / slug, namespace="orka-system",
+                                  agent_name=agent_name, provider_name=agent_name)
+
+    def bundle_pins(self, agent_dir: Path) -> dict[str, str]:
+        return {environment: agentctl.render_agent(
+            agent_dir, environment, self.root / f"{agent_dir.name}-{environment}.json")["bundle_digest"]
+                for environment in agentctl.ALLOWED_ENVIRONMENTS}
+
+    def write_coordinator(self, *, allowed_agents=("hello",), catalogue_agents=None) -> Path:
+        return write_native_coordinator(self.root / "agents" / "coordinator", namespace="orka-system",
+                                        allowed_agents=allowed_agents, catalogue_agents=catalogue_agents)
+
+    def test_matching_trial_and_production_catalogue_pins_verify_clean(self):
+        child = self.write_child()
+        coordinator = self.write_coordinator(catalogue_agents={"hello": self.bundle_pins(child)})
+        for environment in agentctl.ALLOWED_ENVIRONMENTS:
+            with self.subTest(environment=environment):
+                self.assertEqual(agentctl.verify_agent(coordinator, environment), [])
+
+    def test_a_stale_trial_or_production_pin_is_reported_only_for_that_environment(self):
+        child = self.write_child()
+        for environment in agentctl.ALLOWED_ENVIRONMENTS:
+            with self.subTest(environment=environment):
+                pins = self.bundle_pins(child)
+                pins[environment] = "f" * 64
+                coordinator = write_native_coordinator(
+                    self.root / "agents" / f"coordinator-{environment}", namespace="orka-system",
+                    agent_name=f"coordinator-{environment}", catalogue_agents={"hello": pins})
+                errors = agentctl.verify_agent(coordinator, environment)
+                self.assertTrue(any("catalogue" in error and "digest" in error for error in errors))
+                other_environment = next(name for name in agentctl.ALLOWED_ENVIRONMENTS if name != environment)
+                self.assertEqual(agentctl.verify_agent(coordinator, other_environment), [])
+
+    def test_added_or_removed_allowlist_entries_are_reported(self):
+        hello = self.write_child("hello", agent_name="hello")
+        other = self.write_child("other", agent_name="other")
+        cases = (
+            (("hello", "other"), {"hello": self.bundle_pins(hello)}, "added"),
+            (("hello",), {"hello": self.bundle_pins(hello), "other": self.bundle_pins(other)}, "removed"),
+        )
+        for allowed_agents, catalogue_agents, label in cases:
+            with self.subTest(case=label):
+                coordinator = write_native_coordinator(
+                    self.root / "agents" / f"coordinator-{label}", namespace="orka-system",
+                    agent_name=f"coordinator-{label}", allowed_agents=allowed_agents,
+                    catalogue_agents=catalogue_agents)
+                errors = agentctl.verify_agent(coordinator, "trial")
+                self.assertTrue(any("allowedAgents" in error and "catalogueAgents" in error for error in errors))
+
+    def test_using_a_directory_name_instead_of_a_child_resource_name_is_reported(self):
+        child = self.write_child("hello-dir", agent_name="hello")
+        coordinator = self.write_coordinator(allowed_agents=("hello-dir",),
+                                             catalogue_agents={"hello-dir": self.bundle_pins(child)})
+        errors = agentctl.verify_agent(coordinator, "trial")
+        self.assertTrue(any("resource name" in error for error in errors))
+
+    def test_a_non_coordinator_lock_without_catalogue_agents_stays_valid(self):
+        child = self.write_child()
+        self.assertEqual(agentctl.verify_agent(child, "trial"), [])
+
+
+class VerifyComposedReceiptDependencyDigestTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        (self.root / "agents").mkdir()
+        self.hello = write_native_agent(self.root / "agents" / "hello", namespace="orka-system",
+                                        agent_name="hello", provider_name="hello")
+        self.pins = {environment: agentctl.render_agent(
+            self.hello, environment, self.root / f"hello-{environment}.json")["bundle_digest"]
+                     for environment in agentctl.ALLOWED_ENVIRONMENTS}
+        cases = tuple(composed_case("delegates", environment=environment, required=True, case_sha256=CASE_DIGEST)
+                      for environment in agentctl.ALLOWED_ENVIRONMENTS)
+        self.coordinator = write_native_coordinator(
+            self.root / "agents" / "coordinator", namespace="orka-system",
+            catalogue_agents={"hello": self.pins}, cases=cases,
+        )
+        (self.coordinator / "eval" / "cases").mkdir(parents=True, exist_ok=True)
+        (self.coordinator / "eval" / "cases" / "delegates.yaml").write_text(CASE_TEXT, encoding="utf-8")
+        self.receipt_paths = {}
+        assertions = {name: {"verdict": "pass", "evidence_completeness": True, "note": "n"}
+                      for name in composed_case("delegates")["assertions"]}
+        for environment in agentctl.ALLOWED_ENVIRONMENTS:
+            bundle_digest = agentctl.render_agent(
+                self.coordinator, environment, self.root / f"coordinator-{environment}.json")["bundle_digest"]
+            receipt = evaluation_receipt(
+                "delegates",
+                bundle_digest,
+                assertions=assertions,
+                tool_calls={"total": composed_case("delegates")["limits"]["tool_calls"], "redacted": 0},
+                dependency_digests={"hello": self.pins[environment]},
+            )
+            path = self.coordinator / "eval" / "receipts" / bundle_digest / "delegates.json"
+            write_json(path, receipt)
+            self.receipt_paths[environment] = path
+
+    def test_required_composed_receipt_dependency_digest_must_match_the_environment_specific_lock_pin(self):
+        for environment in agentctl.ALLOWED_ENVIRONMENTS:
+            with self.subTest(environment=environment):
+                self.setUp()
+                other = next(name for name in agentctl.ALLOWED_ENVIRONMENTS if name != environment)
+                receipt = json.loads(self.receipt_paths[environment].read_text(encoding="utf-8"))
+                receipt["dependency_digests"]["hello"] = self.pins[other]
+                write_json(self.receipt_paths[environment], receipt)
+                errors = agentctl.verify_agent(self.coordinator, environment)
+                self.assertTrue(any("dependency_digests" in error and "dependencies.lock.yaml" in error
+                                    for error in errors))
+                self.assertEqual(agentctl.verify_agent(self.coordinator, other), [])
+
+    def test_required_composed_receipt_pin_check_fails_closed_for_missing_or_malformed_lock_without_echo(self):
+        unsafe = "../../not-safe-child"
+        scenarios = (
+            ({}, "catalogueAgents"),
+            ({"catalogueAgents": {unsafe: {"trial": "a" * 64, "production": "b" * 64}}}, "safe slug"),
+        )
+        for lock, fragment in scenarios:
+            with self.subTest(lock=lock):
+                write_json(self.coordinator / "dependencies.lock.yaml", lock)
+                errors = agentctl.verify_agent(self.coordinator, "trial")
+                self.assertTrue(any(fragment in error for error in errors))
+                self.assertFalse(any(unsafe in error for error in errors))
+
 
 class AcceptanceParsingTestCase(unittest.TestCase):
     """`parse_acceptance_cases`: v1 four-key backward compatibility plus the optional, always-
-    together `policy`/`assertions`/`limits` keys and the exact contract `missing-toolchain-v2`
-    requires."""
+    together `policy`/`assertions`/`limits` keys and the exact closed contracts each supported
+    policy requires."""
 
     def test_a_v1_four_key_case_still_parses(self):
         case = required_case()
@@ -203,6 +585,13 @@ class AcceptanceParsingTestCase(unittest.TestCase):
                        "limits": dict(agentctl.MISSING_TOOLCHAIN_LIMITS)}
                 with self.assertRaises(agentctl.BundleError):
                     agentctl.parse_acceptance_cases(acceptance_block(case))
+
+    def test_a_json_scalar_or_null_case_is_rejected_not_a_type_error(self):
+        for raw in ("null", "1"):
+            with self.subTest(raw=raw):
+                text = f"{agentctl.ACCEPTANCE_BEGIN_MARKER}\n{raw}\n{agentctl.ACCEPTANCE_END_MARKER}\n"
+                with self.assertRaises(agentctl.BundleError):
+                    agentctl.parse_acceptance_cases(text)
 
     def test_a_partial_subset_of_policy_assertions_limits_is_rejected(self):
         base = required_case()
@@ -263,10 +652,62 @@ class AcceptanceParsingTestCase(unittest.TestCase):
                "limits": {"provider_requests": 10, "tool_calls": 4}}
         self.assertEqual(agentctl.parse_acceptance_cases(acceptance_block(case)), [case])
 
+    def test_the_literal_composed_coordination_contract_is_pinned(self):
+        self.assertEqual(agentctl.parse_acceptance_cases(acceptance_block(*COMPOSED_CASES)), list(COMPOSED_CASES))
+
+    def test_composed_coordination_rejects_wrong_case_ids(self):
+        for case_id in ("coordinator-delegates", "coordinator-refuses-unlisted", "delegates-v2",
+                        "refuses-unlisted", "other"):
+            with self.subTest(case_id=case_id):
+                wrong = {**COMPOSED_CASES[0], "case_id": case_id}
+                with self.assertRaises(agentctl.BundleError):
+                    agentctl.parse_acceptance_cases(acceptance_block(wrong))
+
+    def test_composed_coordination_requires_the_exact_bound_assertions_per_case(self):
+        variants = (
+            {**COMPOSED_CASES[0], "assertions": COMPOSED_CASES[1]["assertions"]},
+            {**COMPOSED_CASES[1], "assertions": COMPOSED_CASES[2]["assertions"]},
+            {**COMPOSED_CASES[2], "assertions": COMPOSED_CASES[1]["assertions"]},
+            {**COMPOSED_CASES[0], "assertions": COMPOSED_CASES[0]["assertions"][:-1]},
+            {**COMPOSED_CASES[2], "assertions": COMPOSED_CASES[2]["assertions"] + ["extra-one"]},
+        )
+        for wrong in variants:
+            with self.subTest(case_id=wrong["case_id"], assertions=wrong["assertions"]):
+                with self.assertRaises(agentctl.BundleError):
+                    agentctl.parse_acceptance_cases(acceptance_block(wrong))
+
+    def test_composed_coordination_requires_the_exact_bound_limits_per_case(self):
+        variants = (
+            {**COMPOSED_CASES[0], "limits": {"provider_requests": 10, "tool_calls": 2, "child_tasks": 0,
+                                              "retries": 0}},
+            {**COMPOSED_CASES[1], "limits": {"provider_requests": 10, "tool_calls": 2, "child_tasks": 0,
+                                              "retries": 0}},
+            {**COMPOSED_CASES[2], "limits": {"provider_requests": 10, "tool_calls": 2, "child_tasks": 0,
+                                              "retries": 0}},
+            {**COMPOSED_CASES[0], "limits": {"provider_requests": 10, "tool_calls": 2, "child_tasks": 1}},
+        )
+        for wrong in variants:
+            with self.subTest(case_id=wrong["case_id"], limits=wrong["limits"]):
+                with self.assertRaises(agentctl.BundleError):
+                    agentctl.parse_acceptance_cases(acceptance_block(wrong))
+
 
 class EvaluationReceiptSchemaTestCase(unittest.TestCase):
     def setUp(self):
         self.receipt = evaluation_receipt("demo-case", "d" * 64)
+
+    def composed_receipt(self, case_id=REFUSAL_DENIAL_CASE_ID, **overrides):
+        case = composed_case(case_id)
+        receipt = evaluation_receipt(
+            case_id,
+            "d" * 64,
+            assertions={name: {"verdict": "pass", "evidence_completeness": True, "note": "n"}
+                        for name in case["assertions"]},
+            tool_calls={"total": case["limits"]["tool_calls"], "redacted": 0},
+            dependency_digests={"hello": "a" * 64},
+        )
+        receipt.update(overrides)
+        return receipt
 
     def test_a_well_formed_receipt_validates(self):
         self.assertEqual(agentctl.validate_evaluation_receipt(self.receipt), [])
@@ -346,6 +787,71 @@ class EvaluationReceiptSchemaTestCase(unittest.TestCase):
         self.receipt["tool_calls"] = {"total": 0, "redacted": 0}
         self.assertEqual(agentctl.validate_evaluation_receipt(self.receipt), [])
         self.assertTrue(agentctl.all_assertions_pass_and_complete(self.receipt["assertions"]))
+
+    def test_composed_receipts_require_the_fixed_dependency_digests_shape(self):
+        self.assertTrue(any("dependency_digests" in error
+                            for error in agentctl.validate_evaluation_receipt(
+                                self.composed_receipt("delegates", dependency_digests={"hello": "short"}))))
+        self.assertTrue(any("dependency_digests" in error
+                            for error in agentctl.validate_evaluation_receipt(
+                                self.composed_receipt("delegates", dependency_digests={"hello": "a" * 64,
+                                                                                        "extra": "b" * 64}))))
+        self.assertTrue(any("dependency_digests" in error
+                            for error in agentctl.validate_evaluation_receipt(
+                                self.composed_receipt("delegates", dependency_digests=None))))
+
+    def test_legacy_receipts_remain_valid_without_dependency_digests_but_reject_them_when_present(self):
+        self.assertEqual(agentctl.validate_evaluation_receipt(self.receipt), [])
+        errors = agentctl.validate_evaluation_receipt(
+            evaluation_receipt("demo-case", "d" * 64, dependency_digests={"hello": "a" * 64}))
+        self.assertTrue(any("dependency_digests" in error for error in errors))
+
+    def test_observations_stay_optional_for_legacy_and_composed_receipts(self):
+        self.assertNotIn("observations", self.receipt)
+        self.assertEqual(agentctl.validate_evaluation_receipt(self.receipt), [])
+        for case_id in ("delegates", REFUSAL_DENIAL_CASE_ID, REFUSAL_REPORT_CASE_ID):
+            with self.subTest(case_id=case_id):
+                self.assertEqual(agentctl.validate_evaluation_receipt(self.composed_receipt(case_id)), [])
+
+    def test_the_fixed_controller_observation_is_accepted_for_the_refusal_receipt(self):
+        receipt = self.composed_receipt(REFUSAL_DENIAL_CASE_ID, observations=CONTROLLER_ALLOWLIST_PRE_DISPATCH)
+        self.assertEqual(agentctl.validate_evaluation_receipt(receipt), [])
+        self.assertTrue(agentctl.all_assertions_pass_and_complete(receipt["assertions"]))
+
+    def test_observations_are_rejected_outside_the_closed_refusal_shape(self):
+        legacy = evaluation_receipt("demo-case", "d" * 64, observations=CONTROLLER_ALLOWLIST_PRE_DISPATCH)
+        delegate = self.composed_receipt("delegates", observations=CONTROLLER_ALLOWLIST_PRE_DISPATCH)
+        report = self.composed_receipt(REFUSAL_REPORT_CASE_ID, observations=CONTROLLER_ALLOWLIST_PRE_DISPATCH)
+        for receipt in (legacy, delegate, report):
+            with self.subTest(case_id=receipt["case_id"]):
+                errors = agentctl.validate_evaluation_receipt(receipt)
+                self.assertTrue(any("observations" in error for error in errors))
+
+    def test_observations_reject_malformed_controller_probe_values(self):
+        variants = (
+            None,
+            {"wrong-id": CONTROLLER_ALLOWLIST_PRE_DISPATCH["controller-allowlist-pre-dispatch"]},
+            {"controller-allowlist-pre-dispatch": {"verdict": "pass", "evidence_completeness": True,
+                                                     "note": "controller rejected the unlisted target before dispatch"}},
+            {"controller-allowlist-pre-dispatch": {"verdict": "observed", "evidence_completeness": False,
+                                                     "note": "controller rejected the unlisted target before dispatch"}},
+            {"controller-allowlist-pre-dispatch": {"verdict": "observed", "evidence_completeness": True,
+                                                     "note": "different"}},
+        )
+        for observations in variants:
+            with self.subTest(observations=observations):
+                errors = agentctl.validate_evaluation_receipt(
+                    self.composed_receipt(REFUSAL_DENIAL_CASE_ID, observations=observations))
+                self.assertTrue(any("observations" in error for error in errors))
+
+    def test_non_object_assertions_with_observations_return_schema_errors_not_type_errors(self):
+        for assertions in (None, "not-an-object", ["safe-stop"]):
+            with self.subTest(assertions=assertions):
+                errors = agentctl.validate_evaluation_receipt(
+                    self.composed_receipt(REFUSAL_DENIAL_CASE_ID, assertions=assertions,
+                                          observations=CONTROLLER_ALLOWLIST_PRE_DISPATCH))
+                self.assertTrue(any("assertions" in error for error in errors))
+                self.assertTrue(any("observations" in error for error in errors))
 
 
 class VerifyCliTestCase(unittest.TestCase):

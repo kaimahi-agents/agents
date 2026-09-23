@@ -1,0 +1,80 @@
+{
+  "assertions": {
+    "child-result-contained-fixed-phrase": {
+      "evidence_completeness": true,
+      "note": "the authenticated child result matched the fixed phrase ignoring terminal sentence punctuation",
+      "verdict": "pass"
+    },
+    "child-targeted-hello": {
+      "evidence_completeness": true,
+      "note": "the genuine child targeted hello",
+      "verdict": "pass"
+    },
+    "child-task-succeeded": {
+      "evidence_completeness": true,
+      "note": "the genuine child Task succeeded",
+      "verdict": "pass"
+    },
+    "exactly-one-child-task": {
+      "evidence_completeness": true,
+      "note": "exactly one genuine child Task was captured",
+      "verdict": "pass"
+    },
+    "expected-delegation-tool-calls": {
+      "evidence_completeness": true,
+      "note": "delegate_task and wait_for_tasks each started once with visible names, toolCallIDs, and correlated terminal events",
+      "verdict": "pass"
+    },
+    "live-pinned-agents-ready": {
+      "evidence_completeness": true,
+      "note": "the pinned hello and coordinator specs were live and Ready before submission",
+      "verdict": "pass"
+    },
+    "no-unexpected-tool-calls": {
+      "evidence_completeness": true,
+      "note": "no unexpected tool call started",
+      "verdict": "pass"
+    },
+    "parent-result-contained-fixed-phrase": {
+      "evidence_completeness": true,
+      "note": "the authenticated parent result contained the authenticated child result",
+      "verdict": "pass"
+    },
+    "parent-task-succeeded": {
+      "evidence_completeness": true,
+      "note": "the parent Task succeeded",
+      "verdict": "pass"
+    },
+    "stayed-within-limits": {
+      "evidence_completeness": true,
+      "note": "provider, child, tool, and retry counts stayed within limits",
+      "verdict": "pass"
+    }
+  },
+  "bundle_digest": "470f6d435148e098a0ba6a003bf4228dbf422db4d6404d2a8d03de568900de78",
+  "case_id": "delegates",
+  "date": "2026-09-23",
+  "dependency_digests": {
+    "hello": "6256b38ca1a3b89b089eeedf39d5c91b1abffebc2e461675b83d22fca1c720a2"
+  },
+  "evidence_sha256": [
+    "6ef7088013d70abee5158fe17b4fce269c734e38376d6a7da3fa922612113430",
+    "da57286af20630d38821b19cf21730eac7722c7cef67ae57b41f6074efd679a0",
+    "8740060136f1d6ac90e921fdc26a2ef90c7c0e884ecc7644e3102919d72064f1",
+    "0525b52398c5e04cc2d376735d5cd2b840b5a0f60d9a38899471d3c76b8ce6b9",
+    "32ed606686ec998544e02842a328a0aeb9257cbe350e682a3b4a4b674398f011",
+    "fadf26f668de1e2d89e950c7a9d7e94ba20b6231073da8caf0a649b5649b8aa3",
+    "c31d1d2b999650e386fc1f65a047c8e699d277c23c0d899621019f5494e9a3de",
+    "42ff3d56c6d3c1e8f203bf176d6ec0f85603f27ad5501ab46323a669262289e2",
+    "cd5c8fe4f7909c47658042e066b4149a056e12a9cfae1a593388421753a9a59a",
+    "8de8c7a8a1f3c78076ce5809265127a19bac4f68906c35abd37216e8516e1ecf"
+  ],
+  "model": "qwen2.5:3b",
+  "request_count": 6,
+  "source": "imported",
+  "tool_calls": {
+    "redacted": 0,
+    "total": 2
+  },
+  "verdict": "pass"
+}

@@ -1,0 +1,8 @@
+{
+  "catalogueAgents": {
+    "hello": {
+      "trial": "6256b38ca1a3b89b089eeedf39d5c91b1abffebc2e461675b83d22fca1c720a2",
+      "production": "7b9d2eda4bffc0d32d248fa2be0bcde6d3866f1213a00e4c9b34ecde61aa272c"
+    }
+  }
+}
