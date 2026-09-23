@@ -478,6 +478,20 @@ def parse_acceptance_cases(acceptance_text: str) -> list[dict]:
 def _case_allows_observations(case: dict, receipt: dict) -> bool:
     return bool(case.get("policy") == COMPOSED_COORDINATION_POLICY and _receipt_allows_observations(receipt))
 
+
+def _required_case_expected_dependency_digests(agent_dir: Path, environment: str, case: dict) -> tuple[dict[str, str] | None, list[str]]:
+    if case.get("policy") != COMPOSED_COORDINATION_POLICY:
+        return None, []
+    try:
+        lock = _parse_catalogue_lock(Path(agent_dir) / "dependencies.lock.yaml")
+    except CliError as exc:
+        return None, [str(exc)]
+    pins = lock.get(_EXPECTED_COMPOSED_CHILD)
+    if not isinstance(pins, dict) or environment not in pins:
+        return None, ["dependencies.lock.yaml catalogueAgents must include hello for composed receipt verification"]
+    return {_EXPECTED_COMPOSED_CHILD: pins[environment]}, []
+
+
 def _verify_required_case(agent_dir: Path, environment: str, bundle_digest: str, case: dict) -> list[str]:
     """One required case needs a case file matching acceptance.md's declared hash and, in this
     environment, a schema-valid, pattern-free, passing receipt under the current digest."""
@@ -489,6 +503,8 @@ def _verify_required_case(agent_dir: Path, environment: str, bundle_digest: str,
               [f"required case {case_id!r}: case file content does not match acceptance.md's declared SHA-256"])
     if case["environment"] != environment:
         return errors  # this case is evaluated in a different environment
+    expected_dependency_digests, expected_dependency_errors = _required_case_expected_dependency_digests(
+        agent_dir, environment, case)
     receipts_dir = agent_dir / "eval" / "receipts" / bundle_digest
     matching = []
     for receipt_path in sorted(receipts_dir.glob("*.json")) if receipts_dir.is_dir() else []:
@@ -509,8 +525,15 @@ def _verify_required_case(agent_dir: Path, environment: str, bundle_digest: str,
         if receipt.get("bundle_digest") != bundle_digest:
             schema_errors.append(
                 "receipt bundle_digest does not match the receipt directory and current rendered bundle digest")
+        dependency_errors = []
+        if not schema_errors and _receipt_requires_dependency_digests(receipt):
+            if expected_dependency_errors:
+                dependency_errors = list(expected_dependency_errors)
+            elif receipt.get("dependency_digests") != expected_dependency_digests:
+                dependency_errors.append(
+                    "receipt dependency_digests do not match dependencies.lock.yaml catalogueAgents for this environment")
         errors += [f"{receipt_path.name}: {error}"
-                   for error in schema_errors + find_prohibited_in_document(receipt, "receipt")]
+                   for error in schema_errors + dependency_errors + find_prohibited_in_document(receipt, "receipt")]
         if not schema_errors and receipt["verdict"] != "pass":
             errors.append(f"{receipt_path.name}: required case does not have a passing receipt")
         if not schema_errors and "policy" in case:

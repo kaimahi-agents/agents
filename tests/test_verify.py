@@ -339,24 +339,30 @@ class VerifyAgentTestCase(unittest.TestCase):
         self.assertTrue(any("missing valid tool_calls" in error for error in errors))
 
     def test_a_composed_refusal_required_case_does_not_require_observations(self):
+        (self.root / "agents").mkdir(exist_ok=True)
+        hello = write_native_agent(self.root / "agents" / "hello", namespace="orka-system",
+                                   agent_name="hello", provider_name="hello")
+        pins = {environment: agentctl.render_agent(
+            hello, environment, self.root / f"hello-refusal-{environment}.json")["bundle_digest"]
+                for environment in agentctl.ALLOWED_ENVIRONMENTS}
         case = composed_case("refuses-unlisted", required=True, case_sha256=CASE_DIGEST)
-        (self.agent / "eval" / "acceptance.md").write_text(acceptance_block(case), encoding="utf-8")
-        (self.agent / "eval" / "policies").mkdir(parents=True, exist_ok=True)
-        (self.agent / "eval" / "policies" / "composed-coordination.md").write_text(
-            "policy text\n", encoding="utf-8")
-        case_path = self.agent / "eval" / "cases" / "refuses-unlisted.yaml"
-        case_path.write_text(CASE_TEXT, encoding="utf-8")
-        digest = agentctl.render_agent(self.agent, "trial", self.root / "probe-composed.yaml")["bundle_digest"]
+        coordinator = write_native_coordinator(
+            self.root / "agents" / "coordinator-refusal", namespace="orka-system",
+            agent_name="coordinator-refusal", catalogue_agents={"hello": pins}, cases=(case,),
+        )
+        (coordinator / "eval" / "cases").mkdir(parents=True, exist_ok=True)
+        (coordinator / "eval" / "cases" / "refuses-unlisted.yaml").write_text(CASE_TEXT, encoding="utf-8")
+        digest = agentctl.render_agent(coordinator, "trial", self.root / "probe-composed.yaml")["bundle_digest"]
         receipt = evaluation_receipt(
             "refuses-unlisted",
             digest,
             assertions={name: {"verdict": "pass", "evidence_completeness": True, "note": "n"}
                         for name in case["assertions"]},
             tool_calls={"total": case["limits"]["tool_calls"], "redacted": 0},
-            dependency_digests={"hello": "a" * 64},
+            dependency_digests={"hello": pins["trial"]},
         )
-        write_json(self.agent / "eval" / "receipts" / digest / "refuses-unlisted.json", receipt)
-        self.assertEqual(self.verify(), [])
+        write_json(coordinator / "eval" / "receipts" / digest / "refuses-unlisted.json", receipt)
+        self.assertEqual(agentctl.verify_agent(coordinator, "trial"), [])
 
     def test_gate_rejects_a_current_digest_legacy_composed_live_receipt_missing_dependency_digests(self):
         case = composed_case("refuses-unlisted", required=True, case_sha256=CASE_DIGEST)
@@ -467,6 +473,69 @@ class VerifyCatalogueDependenciesTestCase(unittest.TestCase):
     def test_a_non_coordinator_lock_without_catalogue_agents_stays_valid(self):
         child = self.write_child()
         self.assertEqual(agentctl.verify_agent(child, "trial"), [])
+
+
+class VerifyComposedReceiptDependencyDigestTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        (self.root / "agents").mkdir()
+        self.hello = write_native_agent(self.root / "agents" / "hello", namespace="orka-system",
+                                        agent_name="hello", provider_name="hello")
+        self.pins = {environment: agentctl.render_agent(
+            self.hello, environment, self.root / f"hello-{environment}.json")["bundle_digest"]
+                     for environment in agentctl.ALLOWED_ENVIRONMENTS}
+        cases = tuple(composed_case("delegates", environment=environment, required=True, case_sha256=CASE_DIGEST)
+                      for environment in agentctl.ALLOWED_ENVIRONMENTS)
+        self.coordinator = write_native_coordinator(
+            self.root / "agents" / "coordinator", namespace="orka-system",
+            catalogue_agents={"hello": self.pins}, cases=cases,
+        )
+        (self.coordinator / "eval" / "cases").mkdir(parents=True, exist_ok=True)
+        (self.coordinator / "eval" / "cases" / "delegates.yaml").write_text(CASE_TEXT, encoding="utf-8")
+        self.receipt_paths = {}
+        assertions = {name: {"verdict": "pass", "evidence_completeness": True, "note": "n"}
+                      for name in composed_case("delegates")["assertions"]}
+        for environment in agentctl.ALLOWED_ENVIRONMENTS:
+            bundle_digest = agentctl.render_agent(
+                self.coordinator, environment, self.root / f"coordinator-{environment}.json")["bundle_digest"]
+            receipt = evaluation_receipt(
+                "delegates",
+                bundle_digest,
+                assertions=assertions,
+                tool_calls={"total": composed_case("delegates")["limits"]["tool_calls"], "redacted": 0},
+                dependency_digests={"hello": self.pins[environment]},
+            )
+            path = self.coordinator / "eval" / "receipts" / bundle_digest / "delegates.json"
+            write_json(path, receipt)
+            self.receipt_paths[environment] = path
+
+    def test_required_composed_receipt_dependency_digest_must_match_the_environment_specific_lock_pin(self):
+        for environment in agentctl.ALLOWED_ENVIRONMENTS:
+            with self.subTest(environment=environment):
+                self.setUp()
+                other = next(name for name in agentctl.ALLOWED_ENVIRONMENTS if name != environment)
+                receipt = json.loads(self.receipt_paths[environment].read_text(encoding="utf-8"))
+                receipt["dependency_digests"]["hello"] = self.pins[other]
+                write_json(self.receipt_paths[environment], receipt)
+                errors = agentctl.verify_agent(self.coordinator, environment)
+                self.assertTrue(any("dependency_digests" in error and "dependencies.lock.yaml" in error
+                                    for error in errors))
+                self.assertEqual(agentctl.verify_agent(self.coordinator, other), [])
+
+    def test_required_composed_receipt_pin_check_fails_closed_for_missing_or_malformed_lock_without_echo(self):
+        unsafe = "../../not-safe-child"
+        scenarios = (
+            ({}, "catalogueAgents"),
+            ({"catalogueAgents": {unsafe: {"trial": "a" * 64, "production": "b" * 64}}}, "safe slug"),
+        )
+        for lock, fragment in scenarios:
+            with self.subTest(lock=lock):
+                write_json(self.coordinator / "dependencies.lock.yaml", lock)
+                errors = agentctl.verify_agent(self.coordinator, "trial")
+                self.assertTrue(any(fragment in error for error in errors))
+                self.assertFalse(any(unsafe in error for error in errors))
 
 
 class AcceptanceParsingTestCase(unittest.TestCase):
