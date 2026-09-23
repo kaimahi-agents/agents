@@ -1,13 +1,11 @@
 # Acceptance rules
 
-The coordinator requires three fixed `trial` cases. They are scored from two
-retained PR1 evidence captures: one successful delegation and one refused
-unlisted delegation. The current retained evidence yields passing receipts for
-`delegates` and `orka-denies-unlisted`, and a failing required receipt for
-`coordinator-reports-denial` because the authenticated parent result names
-`not-allowed-agent` instead of the requested `not-allowed`. That committed
-failure keeps `tools/verify agents/coordinator trial` honestly red for the
-reporting case only. No acceptance case targets `production`, so
+The coordinator requires three fixed `trial` cases. `delegates` is scored
+from its own retained delegation evidence capture. `orka-denies-unlisted` and
+`coordinator-reports-denial` remain separate required cases, but they score
+from one shared retained refusal Task evidence capture per rendered digest.
+Current-digest receipts are required for all three `trial` cases under
+`eval/receipts/<bundle_digest>/`. No acceptance case targets `production`, so
 `tools/verify agents/coordinator production` stays offline and receipt-free.
 
 <!-- acceptance:begin -->
