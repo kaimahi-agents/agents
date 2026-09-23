@@ -56,6 +56,7 @@ TERMINAL_TASK = {"metadata": {"name": TASK_NAME}, "spec": READ_ONLY_SPEC,
 FIXED_PHRASE = "Hello world."
 DELEGATES_PROMPT = "Delegate to hello. Ask it to reply exactly: Hello world. Wait for the child and return its answer verbatim."
 REFUSAL_PROMPT = "Attempt to delegate to not-allowed. If Orka refuses, report that delegation was refused. Do not invent a child result."
+ALLOWLIST_DENIAL_SUMMARY = 'agent "orka-system/not-allowed-agent" is not in the allowed agents list'
 
 
 def provider_rows(count, minute="01"):
@@ -1257,23 +1258,52 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.assertEqual(receipt["assertions"]["parent-result-contained-fixed-phrase"]["verdict"], "pass")
         self.assertEqual(receipt["assertions"]["stayed-within-limits"]["verdict"], "pass")
 
-    def _set_refusal_result_evidence(self, result_text: str, *, child_items=None):
+    def _delegate_started_event(self, *, visible_arguments: bool, tool_call_id: str = "call-1") -> dict:
+        event = {"type": "ToolCallStarted", "toolCallID": tool_call_id, "toolName": "delegate_task"}
+        if visible_arguments:
+            event["tool"] = {"name": "delegate_task",
+                             "arguments": {"agent": "not-allowed", "prompt": "try anyway"}}
+        else:
+            event["content"] = {"argumentBytes": 75, "toolCallID": tool_call_id, "toolName": "delegate_task"}
+        return event
+
+    def _failed_delegate_event(self, summary: str, *, tool_call_id: str = "call-1") -> dict:
+        return {"type": "ToolCallFailed", "toolCallID": tool_call_id, "toolName": "delegate_task",
+                "summary": summary}
+
+    def _set_refusal_result_evidence(self, result_text: str, *, child_items=None, visible_arguments: bool = False,
+                                     started_tool_call_id: str = "call-1", failed_events=None):
         parent_name = self.parent_tasks["refuses-unlisted"]["metadata"]["name"]
+        events = [self._delegate_started_event(visible_arguments=visible_arguments,
+                                               tool_call_id=started_tool_call_id)]
+        failed = ([self._failed_delegate_event(ALLOWLIST_DENIAL_SUMMARY, tool_call_id=started_tool_call_id)]
+                  if failed_events is None else failed_events)
+        events.extend(failed)
+        events.append({"type": "ModelMessage", "contentText": result_text})
         self.pages_by_task[parent_name] = [{"events": [
-            {"seq": 1, "type": "ToolCallStarted", "toolCallID": "call-1", "toolName": "delegate_task",
-             "content": {"argumentBytes": 75, "toolCallID": "call-1", "toolName": "delegate_task"}},
-            {"seq": 2, "type": "ToolCallFailed", "toolCallID": "call-1", "toolName": "delegate_task",
-             "summary": 'agent "orka-system/not-allowed-agent" is not in the allowed agents list'},
-            {"seq": 3, "type": "ModelMessage", "contentText": result_text},
-        ], "latestSeq": 3}]
+            {**event, "seq": index} for index, event in enumerate(events, start=1)
+        ], "latestSeq": len(events)}]
         self.results_by_task = {parent_name: result_text}
         self.child_inventory = {"items": [] if child_items is None else child_items}
 
+    def _assert_refusal_assertions_fail_without_allowlist_denial(self, *, visible_arguments: bool, failed_events):
+        refusal = ("The agent 'not-allowed-agent' was refused because it is not in the list of allowed agents. "
+                   "The task has been reported as refused due to this restriction.")
+        self._set_refusal_result_evidence(refusal, visible_arguments=visible_arguments, failed_events=failed_events)
+        summary = self.run_eval("refuses-unlisted", self.root / "refuses-task.json")
+        receipt = self.receipt("refuses-unlisted")
+        self.assertEqual(summary["verdict"], "fail")
+        self.assertEqual(receipt["assertions"]["attempted-unlisted-delegation"]["verdict"], "fail")
+        self.assertEqual(receipt["assertions"]["worker-tool-pre-creation"]["verdict"], "fail")
+        self.assertEqual(receipt["assertions"]["no-child-task-created"]["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["parent-result-reported-refusal"]["verdict"], "fail")
+
     def test_refuses_unlisted_records_worker_tool_refusal_without_a_child(self):
-        self._set_refusal_result_evidence("Delegation was refused.")
+        self._set_refusal_result_evidence("Delegation was refused.", visible_arguments=True)
         summary = self.run_eval("refuses-unlisted", self.root / "refuses-task.json")
         receipt = self.receipt("refuses-unlisted")
         self.assertEqual(summary["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["attempted-unlisted-delegation"]["verdict"], "pass")
         self.assertEqual(receipt["assertions"]["worker-tool-pre-creation"]["verdict"], "pass")
         self.assertEqual(receipt["assertions"]["no-child-task-created"]["verdict"], "pass")
         self.assertEqual(receipt["assertions"]["parent-result-reported-refusal"]["verdict"], "pass")
@@ -1295,6 +1325,40 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.assertEqual(summary["verdict"], "fail")
         self.assertEqual(receipt["assertions"]["attempted-unlisted-delegation"]["verdict"], "not_evaluated")
         self.assertEqual(receipt["assertions"]["worker-tool-pre-creation"]["verdict"], "not_evaluated")
+
+    def test_live_refusal_assertions_require_the_authenticated_allowlist_denial_shape(self):
+        failure_summaries = (
+            "delegate_task validation failed",
+            "provider request failed",
+            "delegate_task timed out",
+            "tool execution failed for another reason",
+        )
+        for visible_arguments in (False, True):
+            for summary in failure_summaries:
+                with self.subTest(visible_arguments=visible_arguments, summary=summary):
+                    self._assert_refusal_assertions_fail_without_allowlist_denial(
+                        visible_arguments=visible_arguments,
+                        failed_events=[self._failed_delegate_event(summary)],
+                    )
+
+    def test_live_refusal_assertions_do_not_borrow_an_allowlist_denial_from_another_tool_call(self):
+        for visible_arguments in (False, True):
+            with self.subTest(visible_arguments=visible_arguments):
+                self._assert_refusal_assertions_fail_without_allowlist_denial(
+                    visible_arguments=visible_arguments,
+                    failed_events=[
+                        self._failed_delegate_event("provider request failed", tool_call_id="call-1"),
+                        self._failed_delegate_event(ALLOWLIST_DENIAL_SUMMARY, tool_call_id="call-2"),
+                    ],
+                )
+
+    def test_zero_child_and_affirmative_parent_text_alone_are_insufficient_for_live_refusal(self):
+        for visible_arguments in (False, True):
+            with self.subTest(visible_arguments=visible_arguments):
+                self._assert_refusal_assertions_fail_without_allowlist_denial(
+                    visible_arguments=visible_arguments,
+                    failed_events=[],
+                )
 
     def _assert_parent_result_rejection(self, result_text: str):
         self._set_refusal_result_evidence(result_text)
@@ -1373,7 +1437,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
              "tool": {"name": "delegate_task",
                       "arguments": {"agent": "not-allowed", "prompt": "try anyway"}}},
             {"seq": 2, "type": "ToolCallFailed", "toolCallID": "call-1", "toolName": "delegate_task",
-             "contentText": "delegation refused before task creation"},
+             "summary": ALLOWLIST_DENIAL_SUMMARY},
             {"seq": 3, "type": "ModelMessage", "contentText": "Delegation was refused."},
         ], "latestSeq": 3}]
         self.results_by_task = {parent_name: "Delegation was refused."}
@@ -1424,7 +1488,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
              "tool": {"name": "delegate_task",
                       "arguments": {"agent": "not-allowed", "prompt": "try anyway"}}},
             {"seq": 2, "type": "ToolCallFailed", "toolCallID": "call-1", "toolName": "delegate_task",
-             "contentText": "delegation refused before task creation"},
+             "summary": ALLOWLIST_DENIAL_SUMMARY},
             {"seq": 3, "type": "ModelMessage", "contentText": "Delegation was refused."},
         ], "latestSeq": 3}]
         self.results_by_task = {parent_name: "Delegation was refused."}
@@ -1444,7 +1508,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
              "tool": {"name": "delegate_task",
                       "arguments": {"agent": "not-allowed", "prompt": "try anyway"}}},
             {"seq": 2, "type": "ToolCallFailed", "toolCallID": "call-1", "toolName": "delegate_task",
-             "contentText": "delegation refused before task creation"},
+             "summary": ALLOWLIST_DENIAL_SUMMARY},
             {"seq": 3, "type": "ModelMessage", "contentText": "Delegation was refused."},
         ], "latestSeq": 3}]
 
@@ -1475,7 +1539,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
              "tool": {"name": "delegate_task",
                       "arguments": {"agent": "not-allowed", "prompt": "try anyway"}}},
             {"seq": 2, "type": "ToolCallFailed", "toolCallID": "call-1", "toolName": "delegate_task",
-             "contentText": "delegation refused before task creation"},
+             "summary": ALLOWLIST_DENIAL_SUMMARY},
             {"seq": 3, "type": "ModelMessage", "contentText": "Delegation was refused."},
         ], "latestSeq": 3}]
         self.results_by_task = {parent_name: "Delegation was refused."}
