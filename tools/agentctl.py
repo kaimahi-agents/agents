@@ -68,6 +68,10 @@ def _is_date(value) -> bool:
     return True
 def _json_text(data) -> str:
     return json.dumps(data, indent=2, sort_keys=True) + "\n"
+def _canonical_json_text(data) -> str:
+    return json.dumps(data, sort_keys=True, separators=(",", ":"))
+def _json_objects_equal(left, right) -> bool:
+    return isinstance(left, dict) and isinstance(right, dict) and _canonical_json_text(left) == _canonical_json_text(right)
 def _write_json(path: Path, data) -> str:
     """Write one deterministic JSON document; return its SHA-256."""
     text = _json_text(data)
@@ -1393,6 +1397,52 @@ def load_composed_coordination_case(agent_dir, case_id: str, environment: str) -
                        "for this environment; refusing to evaluate")
     return case
 
+def _load_bound_composed_case_task(agent_dir, case: dict) -> dict:
+    case_id = case["case_id"]
+    label = f"eval/cases/{case_id}.yaml"
+    case_path = Path(agent_dir) / "eval" / "cases" / f"{case_id}.yaml"
+    try:
+        raw = case_path.read_bytes()
+    except OSError as exc:
+        raise CliError(f"could not read {label}") from exc
+    if sha256_hex(raw) != case["case_sha256"]:
+        raise CliError("eval case file content does not match acceptance.md's declared SHA-256")
+    try:
+        return load_json_object(label, raw)
+    except BundleError as exc:
+        raise CliError(str(exc)) from exc
+
+def _task_declares_explicit_zero_retries(task) -> bool:
+    return check_zero_retries(task) == []
+
+def _require_valid_bound_composed_case_task(case_task, *, coordinator_name: str, namespace: str) -> None:
+    metadata = case_task.get("metadata") if isinstance(case_task, dict) else None
+    spec = case_task.get("spec") if isinstance(case_task, dict) else None
+    annotations = metadata.get("annotations") if isinstance(metadata, dict) else None
+    agent_ref = spec.get("agentRef") if isinstance(spec, dict) else None
+    if (not isinstance(metadata, dict) or metadata.get("namespace") != namespace
+            or not isinstance(agent_ref, dict) or agent_ref.get("name") != coordinator_name):
+        raise CliError("committed eval case task must target the current rendered coordinator Agent in the rendered namespace")
+    if not isinstance(spec, dict) or spec.get("type") != "ai":
+        raise CliError("committed eval case task must set spec.type to 'ai'")
+    if not isinstance(annotations, dict) or annotations.get(_DISABLE_COORDINATION_TOOL_INJECTION) != "true":
+        raise CliError("committed eval case task must set orka.ai/disable-coordination-tool-injection to 'true'")
+    if not _task_declares_explicit_zero_retries(case_task):
+        raise CliError("committed eval case task must declare explicit zero retries")
+
+def _load_validated_composed_case_task(agent_dir, case: dict, *, render_context: dict, namespace: str) -> dict:
+    case_task = _load_bound_composed_case_task(agent_dir, case)
+    _require_valid_bound_composed_case_task(
+        case_task,
+        coordinator_name=render_context["coordinator_agent_name"],
+        namespace=namespace,
+    )
+    return case_task
+
+def _require_task_manifest_matches_committed_case(task_manifest, case_task, *, label: str) -> None:
+    if not _json_objects_equal(task_manifest, case_task):
+        raise CliError(f"{label} does not match the committed eval case task")
+
 _DISABLE_COORDINATION_TOOL_INJECTION = "orka.ai/disable-coordination-tool-injection"
 _PARENT_TASK_LABEL = "orka.ai/parent-task"
 _PARENT_TASK_NAME_ANNOTATION = "orka.ai/parent-task-name"
@@ -2662,6 +2712,10 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict, dict | No
     prepared = _prepare_eval_inputs(args)
     evidence_dir, journal_token = prepared["evidence_dir"], prepared["journal_token"]
     task_manifest, task_name, limits = prepared["task_manifest"], prepared["task_name"], case["limits"]
+    preflight_render_context = _prepare_composed_render_context(args, evidence_dir=None)
+    case_task = _load_validated_composed_case_task(
+        args.agent_dir, case, render_context=preflight_render_context, namespace=args.namespace)
+    _require_task_manifest_matches_committed_case(task_manifest, case_task, label="Task manifest")
     _require(check_zero_retries(task_manifest))
     metadata = task_manifest.get("metadata") if isinstance(task_manifest, dict) else None
     annotations = metadata.get("annotations") if isinstance(metadata, dict) else None
@@ -2793,9 +2847,13 @@ def _reuse_composed_coordination(args, case: dict) -> tuple[dict, dict, dict | N
     reuse_args.window_start = window_payload["window_start"]
     reuse_args.window_end = window_payload["window_end"]
     render_context = _prepare_composed_render_context(reuse_args, evidence_dir=None)
+    case_task = _load_validated_composed_case_task(
+        args.agent_dir, case, render_context=render_context, namespace=args.namespace)
     _require_reusable_composed_evidence(args.agent_dir, render_context["bundle_digest"], args.case_id,
                                         evidence_dir, render_context)
     task_manifest = _read_json(evidence_dir / "task-manifest.json", "existing evidence task-manifest.json")
+    _require_task_manifest_matches_committed_case(
+        task_manifest, case_task, label="existing evidence task-manifest.json")
     terminal_task = _read_json(evidence_dir / "terminal-task.json", "existing evidence terminal-task.json")
     journal_payload = _read_json(evidence_dir / "journal-events.json", "existing evidence journal-events.json")
     events = journal_payload.get("events") if isinstance(journal_payload, dict) else None

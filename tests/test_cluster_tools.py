@@ -807,21 +807,44 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             cases=(composed_case("delegates"), composed_case("refuses-unlisted")),
             catalogue_agents={"hello": pins},
             prompt="Delegate only to hello and report refusals truthfully.")
+        self.case_tasks = {
+            "delegates": {
+                "apiVersion": "core.orka.ai/v1alpha1",
+                "kind": "Task",
+                "metadata": {
+                    "name": "coordinator-delegates",
+                    "namespace": NAMESPACE,
+                    "annotations": {"orka.ai/disable-coordination-tool-injection": "true"},
+                },
+                "spec": {
+                    "type": "ai",
+                    "agentRef": {"name": "coordinator"},
+                    "prompt": DELEGATES_PROMPT,
+                    "retryPolicy": {"maxRetries": 0},
+                },
+            },
+            "refuses-unlisted": {
+                "apiVersion": "core.orka.ai/v1alpha1",
+                "kind": "Task",
+                "metadata": {
+                    "name": "coordinator-refuses-unlisted",
+                    "namespace": NAMESPACE,
+                    "annotations": {"orka.ai/disable-coordination-tool-injection": "true"},
+                },
+                "spec": {
+                    "type": "ai",
+                    "agentRef": {"name": "coordinator"},
+                    "prompt": REFUSAL_PROMPT,
+                    "retryPolicy": {"maxRetries": 0},
+                },
+            },
+        }
+        self._refresh_committed_composed_cases()
         self.evidence = self.root / "evidence"
         (self.root / "token").write_text("journal-token\n", encoding="utf-8")
         (self.root / "provider.log").write_text(json.dumps(composed_provider_rows()), encoding="utf-8")
-        write_json(self.root / "delegates-task.json",
-                   {"apiVersion": "core.orka.ai/v1alpha1", "kind": "Task",
-                    "metadata": {"name": "coordinator-delegates", "namespace": NAMESPACE,
-                                 "annotations": {"orka.ai/disable-coordination-tool-injection": "true"}},
-                    "spec": {"type": "ai", "agentRef": {"name": "coordinator"},
-                             "prompt": DELEGATES_PROMPT, "retryPolicy": {"maxRetries": 0}}})
-        write_json(self.root / "refuses-task.json",
-                   {"apiVersion": "core.orka.ai/v1alpha1", "kind": "Task",
-                    "metadata": {"name": "coordinator-refuses-unlisted", "namespace": NAMESPACE,
-                                 "annotations": {"orka.ai/disable-coordination-tool-injection": "true"}},
-                    "spec": {"type": "ai", "agentRef": {"name": "coordinator"},
-                             "prompt": REFUSAL_PROMPT, "retryPolicy": {"maxRetries": 0}}})
+        write_json(self.root / "delegates-task.json", self.case_tasks["delegates"])
+        write_json(self.root / "refuses-task.json", self.case_tasks["refuses-unlisted"])
         hello_rendered = json.loads(Path(agentctl.render_agent(
             self.hello, "trial", self.root / "hello-probe.json")["bundle_path"]).read_text(encoding="utf-8"))
         coordinator_rendered = json.loads(Path(agentctl.render_agent(
@@ -870,6 +893,26 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             },
         })
         self._set_probe_suffix("abc12345")
+
+    def _refresh_committed_composed_cases(self):
+        cases = []
+        for case_id, task in self.case_tasks.items():
+            path = self.coordinator / "eval" / "cases" / f"{case_id}.yaml"
+            write_json(path, task)
+            cases.append(composed_case(case_id, case_sha256=agentctl.sha256_hex(path.read_bytes())))
+        (self.coordinator / "eval" / "acceptance.md").write_text(acceptance_block(*cases), encoding="utf-8")
+
+    def _assert_rejected_before_side_effects(self, code, out, err, *, message: str, forbidden=()):
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn(message, err)
+        for text in forbidden:
+            self.assertNotIn(text, err)
+        self.assertEqual([argv for argv, _ in self.kubectl.calls if argv and argv[0] == "kubectl"], [])
+        self.assertEqual(self.http_calls, [])
+        self.assertFalse(self.evidence.exists())
+        self.assertFalse((self.evidence / "campaign-ledger.json").exists())
+        self.assertEqual(sorted((self.coordinator / "eval" / "receipts").rglob("*.json")), [])
 
     def _task_list_response(self, argv, _kwargs):
         if "-A" in argv:
@@ -962,6 +1005,93 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         with self.assertRaises(agentctl.CliError):
             self.run_eval("delegates", self.root / "delegates-task.json")
         self.assertEqual([argv for argv, _ in self.kubectl.calls if argv and argv[0] == "kubectl"], [])
+
+    def _assert_live_manifest_mismatch(self, case_id: str, mutate, *, forbidden=()):
+        task = copy.deepcopy(self.case_tasks[case_id])
+        mutate(task)
+        path = self.root / f"{case_id}-variant-task.json"
+        write_json(path, task)
+        code, out, err = self.run_eval_main(case_id, path)
+        self._assert_rejected_before_side_effects(
+            code, out, err,
+            message="eval failed: Task manifest does not match the committed eval case task",
+            forbidden=forbidden,
+        )
+
+    def test_composed_live_eval_rejects_any_supplied_task_override_before_side_effects(self):
+        cases = (
+            ("wrong-agent", lambda task: task["spec"]["agentRef"].update({"name": "other-agent"}),
+             ("other-agent",)),
+            ("easier-prompt", lambda task: task["spec"].update({"prompt": "Delegate once and stop."}),
+             ("Delegate once and stop.",)),
+            ("changed-type", lambda task: task["spec"].update({"type": "workflow"}), ("workflow",)),
+            ("changed-retry", lambda task: task["spec"].update({"retryPolicy": {"maxRetries": 1}}), ("1",)),
+            ("added-tools", lambda task: task["spec"].update({"tools": [{"name": "Write"}]}), ("Write",)),
+            ("changed-namespace", lambda task: task["metadata"].update({"namespace": "other-namespace"}),
+             ("other-namespace",)),
+            ("changed-name", lambda task: task["metadata"].update({"name": "other-task"}), ("other-task",)),
+            ("changed-annotation",
+             lambda task: task["metadata"]["annotations"].update(
+                 {"orka.ai/disable-coordination-tool-injection": "false"}),
+             ("false",)),
+        )
+        for label, mutate, forbidden in cases:
+            with self.subTest(case=label):
+                self._assert_live_manifest_mismatch("delegates", mutate, forbidden=forbidden)
+
+    def test_composed_live_eval_keeps_case_hash_binding_before_side_effects(self):
+        self.case_tasks["delegates"]["spec"]["prompt"] = "Delegation contract drifted."
+        write_json(self.coordinator / "eval" / "cases" / "delegates.yaml", self.case_tasks["delegates"])
+        code, out, err = self.run_eval_main("delegates", self.root / "delegates-task.json")
+        self._assert_rejected_before_side_effects(
+            code, out, err,
+            message="eval failed: eval case file content does not match acceptance.md's declared SHA-256",
+            forbidden=("Delegation contract drifted.",),
+        )
+
+    def test_committed_case_task_must_target_the_rendered_coordinator_and_namespace_before_side_effects(self):
+        original = copy.deepcopy(self.case_tasks["delegates"])
+        cases = (
+            ("wrong-agent", lambda task: task["spec"]["agentRef"].update({"name": "other-agent"}),
+             ("other-agent",)),
+            ("wrong-namespace", lambda task: task["metadata"].update({"namespace": "other-namespace"}),
+             ("other-namespace",)),
+        )
+        for label, mutate, forbidden in cases:
+            with self.subTest(case=label):
+                self.case_tasks["delegates"] = copy.deepcopy(original)
+                mutate(self.case_tasks["delegates"])
+                self._refresh_committed_composed_cases()
+                code, out, err = self.run_eval_main("delegates", self.root / "delegates-task.json")
+                self._assert_rejected_before_side_effects(
+                    code, out, err,
+                    message=("eval failed: committed eval case task must target the current rendered coordinator "
+                             "Agent in the rendered namespace"),
+                    forbidden=forbidden,
+                )
+
+    def test_committed_case_task_must_keep_ai_disable_injection_and_zero_retry_before_side_effects(self):
+        original = copy.deepcopy(self.case_tasks["delegates"])
+        cases = (
+            ("wrong-type", lambda task: task["spec"].update({"type": "workflow"}),
+             "eval failed: committed eval case task must set spec.type to 'ai'", ("workflow",)),
+            ("annotation",
+             lambda task: task["metadata"]["annotations"].update(
+                 {"orka.ai/disable-coordination-tool-injection": "false"}),
+             "eval failed: committed eval case task must set orka.ai/disable-coordination-tool-injection to 'true'",
+             ("false",)),
+            ("retry", lambda task: task["spec"].update({"retryPolicy": {"maxRetries": 1}}),
+             "eval failed: committed eval case task must declare explicit zero retries", ("1",)),
+        )
+        for label, mutate, message, forbidden in cases:
+            with self.subTest(case=label):
+                self.case_tasks["delegates"] = copy.deepcopy(original)
+                mutate(self.case_tasks["delegates"])
+                self._refresh_committed_composed_cases()
+                code, out, err = self.run_eval_main("delegates", self.root / "delegates-task.json")
+                self._assert_rejected_before_side_effects(
+                    code, out, err, message=message, forbidden=forbidden,
+                )
 
     def seed_refusal_evidence(self):
         parent_name = self.parent_tasks["refuses-unlisted"]["metadata"]["name"]
@@ -1405,6 +1535,89 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             {path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
              for path in sorted(self.evidence.rglob("*")) if path.is_file()},
             raw_hashes,
+        )
+
+    def test_reuse_evidence_fails_closed_when_saved_task_manifest_drifts(self):
+        self.seed_refusal_evidence()
+        drifted = copy.deepcopy(self.case_tasks["refuses-unlisted"])
+        drifted["metadata"]["annotations"]["orka.ai/disable-coordination-tool-injection"] = "false"
+        write_json(self.evidence / "refuses-unlisted" / "task-manifest.json", drifted)
+        raw_hashes = {
+            path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
+            for path in sorted(self.evidence.rglob("*")) if path.is_file()
+        }
+        receipt_hashes = {
+            path.relative_to(self.coordinator).as_posix(): agentctl.sha256_hex(path.read_bytes())
+            for path in sorted((self.coordinator / "eval" / "receipts").rglob("*.json"))
+        }
+        original_run = agentctl.subprocess.run
+
+        def forbid_kubectl(argv, **kwargs):
+            if argv and argv[0] == "kubectl":
+                raise AssertionError("unexpected kubectl")
+            return original_run(argv, **kwargs)
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(agentctl.subprocess, "run", forbid_kubectl), \
+                mock.patch.object(agentctl, "http_get_json", side_effect=AssertionError("unexpected HTTP")), \
+                redirect_stdout(out), redirect_stderr(err):
+            code = agentctl.main_eval(self.reuse_eval_argv())
+        self.assertEqual(code, 1)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("eval failed: existing evidence task-manifest.json does not match the committed eval case task",
+                      err.getvalue())
+        self.assertNotIn("false", err.getvalue())
+        self.assertEqual(
+            {path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
+             for path in sorted(self.evidence.rglob("*")) if path.is_file()},
+            raw_hashes,
+        )
+        self.assertEqual(
+            {path.relative_to(self.coordinator).as_posix(): agentctl.sha256_hex(path.read_bytes())
+             for path in sorted((self.coordinator / "eval" / "receipts").rglob("*.json"))},
+            receipt_hashes,
+        )
+
+    def test_reuse_evidence_fails_closed_when_the_committed_case_task_no_longer_targets_the_current_coordinator(self):
+        self.seed_refusal_evidence()
+        self.case_tasks["refuses-unlisted"]["spec"]["agentRef"]["name"] = "other-agent"
+        self._refresh_committed_composed_cases()
+        raw_hashes = {
+            path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
+            for path in sorted(self.evidence.rglob("*")) if path.is_file()
+        }
+        receipt_hashes = {
+            path.relative_to(self.coordinator).as_posix(): agentctl.sha256_hex(path.read_bytes())
+            for path in sorted((self.coordinator / "eval" / "receipts").rglob("*.json"))
+        }
+        original_run = agentctl.subprocess.run
+
+        def forbid_kubectl(argv, **kwargs):
+            if argv and argv[0] == "kubectl":
+                raise AssertionError("unexpected kubectl")
+            return original_run(argv, **kwargs)
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(agentctl.subprocess, "run", forbid_kubectl), \
+                mock.patch.object(agentctl, "http_get_json", side_effect=AssertionError("unexpected HTTP")), \
+                redirect_stdout(out), redirect_stderr(err):
+            code = agentctl.main_eval(self.reuse_eval_argv())
+        self.assertEqual(code, 1)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn(
+            "eval failed: committed eval case task must target the current rendered coordinator Agent in the rendered namespace",
+            err.getvalue(),
+        )
+        self.assertNotIn("other-agent", err.getvalue())
+        self.assertEqual(
+            {path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
+             for path in sorted(self.evidence.rglob("*")) if path.is_file()},
+            raw_hashes,
+        )
+        self.assertEqual(
+            {path.relative_to(self.coordinator).as_posix(): agentctl.sha256_hex(path.read_bytes())
+             for path in sorted((self.coordinator / "eval" / "receipts").rglob("*.json"))},
+            receipt_hashes,
         )
 
     def test_reuse_evidence_fails_closed_when_saved_coordinator_bundle_drifts(self):
