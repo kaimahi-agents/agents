@@ -1031,6 +1031,18 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def _rewrite_coordinator_agent_resource(self, mutate, *, refresh_live_readback=False):
+        path = self.coordinator / "resources" / "agent.yaml"
+        agent_resource = json.loads(path.read_text(encoding="utf-8"))
+        mutate(agent_resource)
+        write_json(path, agent_resource)
+        if refresh_live_readback:
+            rendered = json.loads(Path(agentctl.render_agent(
+                self.coordinator, "trial", self.root / "coordinator-probe.json")["bundle_path"]
+            ).read_text(encoding="utf-8"))
+            self.coordinator_spec = next(item["spec"] for item in rendered["items"] if item["kind"] == "Agent")
+            self.kubectl.responses[("agents.core.orka.ai", "coordinator")]["spec"] = self.coordinator_spec
+
     def _assert_rejected_before_side_effects(self, code, out, err, *, message: str, forbidden=()):
         self.assertEqual(code, 1)
         self.assertEqual(out, "")
@@ -1211,6 +1223,60 @@ class ComposedEvalCliTestCase(unittest.TestCase):
                 mutate()
                 code, out, err = self.run_eval_main("delegates", self.root / "delegates-task.json")
                 self._assert_rejected_before_side_effects(code, out, err, message=message, forbidden=("Drifted.",))
+
+    def test_composed_live_eval_rejects_model_mismatch_before_side_effects(self):
+        code, out, err = self.run_eval_main(
+            "delegates", self.root / "delegates-task.json", **{"--model": "other-model"})
+        self._assert_rejected_before_side_effects(
+            code, out, err,
+            message="eval failed: --model must match rendered coordinator Agent spec.model.name",
+            forbidden=("other-model",),
+        )
+
+    def test_composed_live_eval_requires_nonempty_rendered_model_before_side_effects(self):
+        cases = (
+            ("missing-model", lambda resource: resource["spec"].pop("model", None)),
+            ("non-object-model", lambda resource: resource["spec"].__setitem__("model", "qwen2.5:3b")),
+            ("empty-name", lambda resource: resource["spec"].__setitem__(
+                "model", {"name": "", "temperature": 0, "maxTokens": 512})),
+            ("non-string-name", lambda resource: resource["spec"].__setitem__(
+                "model", {"name": 7, "temperature": 0, "maxTokens": 512})),
+        )
+        for label, mutate in cases:
+            with self.subTest(case=label):
+                self.setUp()
+                self._rewrite_coordinator_agent_resource(mutate)
+                code, out, err = self.run_eval_main("delegates", self.root / "delegates-task.json")
+                self._assert_rejected_before_side_effects(
+                    code, out, err,
+                    message="eval failed: rendered coordinator Agent spec.model.name must be a non-empty string",
+                )
+
+    def test_composed_live_eval_supports_future_arbitrary_model_names(self):
+        self._rewrite_coordinator_agent_resource(
+            lambda resource: resource["spec"].__setitem__(
+                "model", {"name": "future-model-v9", "temperature": 0, "maxTokens": 512}),
+            refresh_live_readback=True,
+        )
+        parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
+        self.pages_by_task[parent_name] = [{"events": [
+            {"seq": 1, "type": "ToolCallStarted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "tool": {"name": "delegate_task",
+                      "arguments": {"agent": "hello", "prompt": f"Reply exactly: {FIXED_PHRASE}"}}},
+            {"seq": 2, "type": "ToolCallCompleted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "contentText": "delegated"},
+            {"seq": 3, "type": "ToolCallStarted", "toolCallID": "call-2", "toolName": "wait_for_tasks",
+             "tool": {"name": "wait_for_tasks", "arguments": {"tasks": [self.child_task["metadata"]["name"]]}}},
+            {"seq": 4, "type": "ToolCallCompleted", "toolCallID": "call-2", "toolName": "wait_for_tasks",
+             "contentText": "done"},
+            {"seq": 5, "type": "ModelMessage", "contentText": FIXED_PHRASE},
+        ], "latestSeq": 5}]
+        self.results_by_task = {parent_name: FIXED_PHRASE, self.child_task["metadata"]["name"]: FIXED_PHRASE}
+        summary = self.run_eval("delegates", self.root / "delegates-task.json", **{"--model": "future-model-v9"})
+        receipt = self.receipt("delegates")
+        self.assertEqual(summary["verdict"], "pass")
+        self.assertEqual(receipt["verdict"], "pass")
+        self.assertEqual(receipt["model"], "future-model-v9")
 
     def test_composed_live_eval_blocks_a_nonterminal_task_before_any_apply(self):
         self.cluster_inventory = {"items": [{
@@ -1496,6 +1562,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         receipt = self.receipt("delegates")
         self.assertEqual(summary["verdict"], "pass")
         self.assertEqual(receipt["verdict"], "pass")
+        self.assertEqual(receipt["model"], "qwen2.5:3b")
         self.assertEqual(receipt["request_count"], 3)
         self.assertEqual(receipt["tool_calls"], {"total": 2, "redacted": 0})
         self.assertEqual(receipt["assertions"]["expected-delegation-tool-calls"]["verdict"], "pass")
@@ -2464,6 +2531,22 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self._assert_reuse_failure_preserves_bytes(
             self.reuse_eval_argv(**{"--source": "imported"}),
             "eval failed: --reuse-evidence requires --source live",
+        )
+
+    def test_reuse_evidence_rejects_model_mismatch_without_side_effects(self):
+        self.seed_refusal_evidence()
+        self._assert_reuse_failure_preserves_bytes(
+            self.reuse_eval_argv(**{"--model": "other-model"}),
+            "eval failed: --model must match rendered coordinator Agent spec.model.name",
+            forbidden=("other-model",),
+        )
+
+    def test_reuse_evidence_requires_nonempty_rendered_model_without_side_effects(self):
+        self.seed_refusal_evidence()
+        self._rewrite_coordinator_agent_resource(lambda resource: resource["spec"].pop("model", None))
+        self._assert_reuse_failure_preserves_bytes(
+            self.reuse_eval_argv(),
+            "eval failed: rendered coordinator Agent spec.model.name must be a non-empty string",
         )
 
     def test_imported_reuse_migration_helpers_are_removed(self):

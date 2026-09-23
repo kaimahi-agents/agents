@@ -2795,6 +2795,20 @@ def _eval_missing_toolchain(args, case: dict) -> tuple[dict, dict[str, dict], di
     return {"bundle_digest": bundle_digest, "case_id": args.case_id,
             "verdict": receipt["verdict"], "request_count": receipt["request_count"]}, {args.case_id: receipt}, None
 
+def _require_rendered_coordinator_model_name(coordinator_agent_item) -> str:
+    spec = coordinator_agent_item.get("spec") if isinstance(coordinator_agent_item, dict) else None
+    model = spec.get("model") if isinstance(spec, dict) else None
+    name = model.get("name") if isinstance(model, dict) else None
+    if not isinstance(name, str) or not name:
+        raise CliError("rendered coordinator Agent spec.model.name must be a non-empty string")
+    return name
+
+
+def _require_supplied_model_matches_rendered_coordinator(supplied_model: str, rendered_model_name: str) -> None:
+    if supplied_model != rendered_model_name:
+        raise CliError("--model must match rendered coordinator Agent spec.model.name")
+
+
 def _prepare_composed_render_context(args, *, evidence_dir: Path | None) -> dict:
     coordinator_dir = Path(args.agent_dir)
     graph = load_catalogue_graph(coordinator_dir.parent.parent)
@@ -2834,6 +2848,7 @@ def _prepare_composed_render_context(args, *, evidence_dir: Path | None) -> dict
     coordinator_agent_name = (coordinator_agent_item.get("metadata") or {}).get("name")
     if not all(isinstance(name, str) and name for name in (child_agent_name, coordinator_agent_name)):
         raise CliError("rendered Agent resources are missing metadata.name")
+    coordinator_model_name = _require_rendered_coordinator_model_name(coordinator_agent_item)
     return {
         "environment": args.environment,
         "bundle_digest": bundle_digest,
@@ -2845,6 +2860,7 @@ def _prepare_composed_render_context(args, *, evidence_dir: Path | None) -> dict
         "coordinator_agent_name": coordinator_agent_name,
         "child_bundle_sha256": child_bundle_sha256,
         "coordinator_bundle_sha256": coordinator_bundle_sha256,
+        "coordinator_model_name": coordinator_model_name,
     }
 
 
@@ -3138,7 +3154,7 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
         "bundle_digest": render_context["bundle_digest"],
         "date": args.date,
         "source": args.source,
-        "model": args.model,
+        "model": render_context["coordinator_model_name"],
         "request_count": count if established else None,
         "verdict": "pass" if all_assertions_pass_and_complete(assertions) else "fail",
         "assertions": assertions,
@@ -3183,6 +3199,7 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict]
     evidence_dir, journal_token = prepared["evidence_dir"], prepared["journal_token"]
     task_manifest, task_name, limits = prepared["task_manifest"], prepared["task_name"], case["limits"]
     preflight_render_context = _prepare_composed_render_context(args, evidence_dir=None)
+    _require_supplied_model_matches_rendered_coordinator(args.model, preflight_render_context["coordinator_model_name"])
     case_bindings = _load_validated_composed_case_bindings(
         args.agent_dir, case, render_context=preflight_render_context, namespace=args.namespace)
     source_case_id = _composed_evidence_source_case_id(args.case_id)
@@ -3316,6 +3333,7 @@ def _reuse_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict
     evidence_dir = Path(args.evidence_root) / source_case_id
     reuse_args = argparse.Namespace(**vars(args))
     render_context = _prepare_composed_render_context(reuse_args, evidence_dir=None)
+    _require_supplied_model_matches_rendered_coordinator(args.model, render_context["coordinator_model_name"])
     case_bindings = _load_validated_composed_case_bindings(
         args.agent_dir, case, render_context=render_context, namespace=args.namespace)
     prior_receipt = _require_reusable_composed_evidence(

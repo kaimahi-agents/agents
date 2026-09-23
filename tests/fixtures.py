@@ -149,6 +149,7 @@ def write_native_agent(agent_dir, *, namespace="trial-namespace", cases=(), agen
 
 def write_native_coordinator(agent_dir, *, namespace="trial-namespace", cases=(), agent_name="coordinator",
                              provider_name="hello", allowed_agents=("hello",), catalogue_agents=None,
+                             model_name="qwen2.5:3b",
                              prompt="Delegate to exactly one allowed catalogue agent when needed.") -> Path:
     """Write a native coordinating Agent with explicit delegation tools and promotion pins."""
     agent_dir = Path(agent_dir)
@@ -159,6 +160,7 @@ def write_native_coordinator(agent_dir, *, namespace="trial-namespace", cases=()
                {"apiVersion": "core.orka.ai/v1alpha1", "kind": "Agent",
                 "metadata": {"name": agent_name},
                 "spec": {"providerRef": {"name": provider_name},
+                         "model": {"name": model_name, "temperature": 0, "maxTokens": 512},
                          "systemPrompt": {"inline": prompt},
                          "coordination": {"enabled": True,
                                           "allowedAgents": [{"name": name} for name in allowed_agents],
