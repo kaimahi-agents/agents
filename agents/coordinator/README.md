@@ -44,14 +44,15 @@ Orka journals do not always retain those exact wait arguments, so live
 verification instead proves one ordered successful non-empty wait after
 delegation plus authenticated child-result propagation.
 
-`refuses-unlisted` fixtures with visible `delegate_task` arguments prove the
-coordinator attempted the fixed unallowlisted target `not-allowed`, that the
-correlated allowlist denial named the same effective target (allowing only
-namespace qualification), that no child Task was created, and that the final
-result reported refusal without inventing a child answer. Current live Orka
-journals may omit those raw arguments, so live evaluation instead proves a
-correlated allowlist denial against a target outside the rendered allowlist,
-zero genuine child Tasks, and truthful refusal reporting.
+`refuses-unlisted` proves the coordinator targeted the fixed unallowlisted
+target `not-allowed`, that Orka refused that call before child creation, and
+that the final result reported refusal without inventing a child answer. When
+visible `delegate_task` arguments are retained, evaluation proves the exact
+started target plus a correlated allowlist denial naming the same effective
+target (allowing only namespace qualification). When current live Orka
+journals omit those raw arguments, evaluation instead proves the same exact
+target from the correlated allowlist-denial summary, plus zero genuine child
+Tasks and truthful refusal reporting.
 
 ## Where it has run
 
