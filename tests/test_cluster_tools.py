@@ -9,6 +9,7 @@ import copy
 import io
 import json
 import multiprocessing
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1135,6 +1136,16 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             self.coordinator_spec = next(item["spec"] for item in rendered["items"] if item["kind"] == "Agent")
             self.kubectl.responses[("agents.core.orka.ai", "coordinator")]["spec"] = self.coordinator_spec
 
+    def _rewrite_coordinator_provider_resource(self, mutate, *, file_name: str = "provider.yaml"):
+        path = self.coordinator / "resources" / file_name
+        provider_resource = json.loads(path.read_text(encoding="utf-8"))
+        mutate(provider_resource)
+        write_json(path, provider_resource)
+
+    def _duplicate_coordinator_provider_resource(self, *, file_name: str = "provider-duplicate.yaml"):
+        provider_resource = json.loads((self.coordinator / "resources" / "provider.yaml").read_text(encoding="utf-8"))
+        write_json(self.coordinator / "resources" / file_name, provider_resource)
+
     def _switch_coordinator_to_azure(self, *, base_url=AZURE_ENDPOINT):
         provider_resource = {"apiVersion": "core.orka.ai/v1alpha1", "kind": "Provider",
                              "metadata": {"name": AZURE_PROVIDER_NAME, "namespace": NAMESPACE},
@@ -1413,6 +1424,25 @@ class ComposedEvalCliTestCase(unittest.TestCase):
                     message="eval failed: rendered Azure provider baseURL",
                 )
 
+    def test_composed_live_eval_requires_exact_rendered_provider_resolution_for_non_legacy_routes_before_side_effects(self):
+        cases = (
+            ("missing", lambda: (self.coordinator / "resources" / "provider.yaml").unlink()),
+            ("mismatch", lambda: self._rewrite_coordinator_provider_resource(
+                lambda provider: provider["metadata"].update({"name": "other-provider"}))),
+            ("duplicate", lambda: self._duplicate_coordinator_provider_resource()),
+        )
+        for label, mutate in cases:
+            with self.subTest(case=label):
+                self.setUp()
+                self._switch_coordinator_to_azure()
+                mutate()
+                code, out, err = self.run_eval_main(
+                    "delegates", self.root / "delegates-task.json", **{"--model": AZURE_DEPLOYMENT})
+                self._assert_rejected_before_side_effects(
+                    code, out, err,
+                    message="eval failed: rendered bundle does not resolve exactly one coordinator Provider",
+                )
+
     def test_azure_delegate_receipt_derives_provider_route_token_usage_and_request_count_from_the_journal(self):
         self._switch_coordinator_to_azure()
         events = [
@@ -1430,21 +1460,29 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             {"seq": 7, "type": "ModelRequestFailed", "contentText": "upstream reset"},
             {"seq": 8, "type": "ModelMessage", "contentText": FIXED_PHRASE},
         ]
-        self._set_delegate_result_evidence(events)
+        child_journal = self._child_journal_payload(self._child_journal_events(
+            {"type": "ModelRequestCompleted", "contentText": "child request"},
+            {"type": "ModelRequestFailed", "contentText": "child backend unavailable"},
+        ))
+        self._set_delegate_result_evidence(events, child_journals=[child_journal])
         summary = self.run_eval(
             "delegates", self.root / "delegates-task.json", **{"--model": AZURE_DEPLOYMENT})
         receipt = self.receipt("delegates")
         provider_readback = self.evidence / "delegates" / "coordinator-provider-readback.json"
+        child_journal_path = self.evidence / "delegates" / "child-journal-events.json"
+        child_journal_payload = json.loads(child_journal_path.read_text(encoding="utf-8"))
         self.assertEqual(summary["verdict"], "pass")
         self.assertEqual(receipt["provider_route"], azure_provider_route())
-        self.assertEqual(receipt["request_count"], 2)
+        self.assertEqual(receipt["request_count"], 4)
         self.assertEqual(receipt["token_usage"], {"input": 12, "output": 5, "total": 17})
+        self.assertEqual(child_journal_payload, {"items": [child_journal]})
         self.assertEqual(
             receipt["assertions"]["stayed-within-limits"]["note"],
             "counts for authenticated model-request events, child Tasks, tool calls, and retries stayed within limits",
         )
         self.assertFalse((self.evidence / "delegates" / "provider-records.json").exists())
         self.assertIn(agentctl.sha256_hex(provider_readback.read_bytes()), receipt["evidence_sha256"])
+        self.assertIn(agentctl.sha256_hex(child_journal_path.read_bytes()), receipt["evidence_sha256"])
         self.assertEqual(agentctl.find_prohibited_in_document(receipt, "receipt"), [])
 
     def test_azure_delegate_passes_without_provider_log_or_window_dependence(self):
@@ -1494,6 +1532,46 @@ class ComposedEvalCliTestCase(unittest.TestCase):
                 self.setUp()
                 self._switch_coordinator_to_azure()
                 self._set_delegate_result_payload(events, latest_seq)
+                summary = self.run_eval(
+                    "delegates", self.root / "delegates-task.json", **{"--model": AZURE_DEPLOYMENT})
+                receipt = self.receipt("delegates")
+                self.assertEqual(summary["verdict"], "fail")
+                self.assertIsNone(receipt["request_count"])
+                self.assertEqual(receipt["assertions"]["stayed-within-limits"]["verdict"], "not_evaluated")
+                self.assertEqual(
+                    receipt["assertions"]["stayed-within-limits"]["note"],
+                    "counts for authenticated model-request events, child Tasks, tool calls, or retries were not fully established",
+                )
+
+    def test_azure_delegate_request_count_requires_a_complete_authenticated_child_journal(self):
+        parent_events = self._delegate_events_with_usage(
+            {"type": "ModelRequestCompleted", "inputTokens": 1, "outputTokens": 1},
+        )
+        duplicate_child_events = self._child_journal_events(
+            {"type": "ModelRequestCompleted", "contentText": "child request"},
+            {"type": "ModelMessage", "contentText": FIXED_PHRASE},
+        )
+        duplicate_child_events[-1]["seq"] = duplicate_child_events[0]["seq"]
+        incomplete_child_journal = self._child_journal_payload(
+            self._child_journal_events({"type": "ModelRequestCompleted", "contentText": "child request"}),
+            latest_seq=2,
+        )
+        cases = (
+            ("duplicate-seq",
+             self._child_journal_payload(duplicate_child_events, latest_seq=duplicate_child_events[-1]["seq"]),
+             None),
+            ("incomplete", incomplete_child_journal, [
+                {"events": incomplete_child_journal["events"], "latestSeq": incomplete_child_journal["latestSeq"]},
+                {"events": [], "latestSeq": incomplete_child_journal["latestSeq"]},
+            ]),
+        )
+        for label, child_journal, child_pages in cases:
+            with self.subTest(case=label):
+                self.setUp()
+                self._switch_coordinator_to_azure()
+                self._set_delegate_result_evidence(parent_events, child_journals=[child_journal])
+                if child_pages is not None:
+                    self.pages_by_task[self.child_task["metadata"]["name"]] = child_pages
                 summary = self.run_eval(
                     "delegates", self.root / "delegates-task.json", **{"--model": AZURE_DEPLOYMENT})
                 receipt = self.receipt("delegates")
@@ -1783,13 +1861,31 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         combined = [*base_events[:-1], *usage_events, base_events[-1]]
         return [{**event, "seq": index} for index, event in enumerate(combined, start=1)]
 
+    def _child_journal_events(self, *events) -> list[dict]:
+        journal_events = events or ({"type": "ModelMessage", "contentText": FIXED_PHRASE},)
+        return [{**event, "seq": index} for index, event in enumerate(journal_events, start=1)]
+
+    def _child_journal_payload(self, events: list[dict] | None = None, *, latest_seq: int | None = None,
+                               task_name: str | None = None) -> dict:
+        child_events = self._child_journal_events() if events is None else events
+        return {
+            "task": self.child_task["metadata"]["name"] if task_name is None else task_name,
+            "events": child_events,
+            "latestSeq": (max((event["seq"] for event in child_events), default=0)
+                          if latest_seq is None else latest_seq),
+        }
+
     def _set_delegate_result_payload(self, events: list[dict], latest_seq: int, *,
                                      parent_result: str = FIXED_PHRASE, child_items=None,
-                                     child_results: dict | None = None):
+                                     child_results: dict | None = None, child_journals: list[dict] | None = None):
         parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
         self.pages_by_task[parent_name] = [{"events": events, "latestSeq": latest_seq}]
         items = [self.child_task] if child_items is None else child_items
         self.child_inventory = {"items": items}
+        journals = ([self._child_journal_payload(task_name=item["metadata"]["name"]) for item in items]
+                    if child_journals is None else child_journals)
+        for journal in journals:
+            self.pages_by_task[journal["task"]] = [{"events": journal["events"], "latestSeq": journal["latestSeq"]}]
         self.results_by_task = {parent_name: parent_result}
         if child_results is None:
             self.results_by_task.update({item["metadata"]["name"]: FIXED_PHRASE for item in items})
@@ -1797,13 +1893,15 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             self.results_by_task.update(child_results)
 
     def _set_delegate_result_evidence(self, events: list[dict], *, parent_result: str = FIXED_PHRASE,
-                                      child_items=None, child_results: dict | None = None):
+                                      child_items=None, child_results: dict | None = None,
+                                      child_journals: list[dict] | None = None):
         self._set_delegate_result_payload(
             events,
             max(event["seq"] for event in events),
             parent_result=parent_result,
             child_items=child_items,
             child_results=child_results,
+            child_journals=child_journals,
         )
 
     def reuse_eval_argv(self, case_id=REFUSAL_DENIAL_CASE_ID, **overrides):
@@ -2134,7 +2232,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
 
     def _set_refusal_result_evidence(self, result_text: str, *, child_items=None, visible_arguments: bool = False,
                                      started_tool_call_id: str = "call-1", failed_events=None,
-                                     target: str = FIXED_REFUSAL_TARGET):
+                                     target: str = FIXED_REFUSAL_TARGET, extra_events=None):
         parent_name = self.parent_tasks["refuses-unlisted"]["metadata"]["name"]
         events = [self._delegate_started_event(visible_arguments=visible_arguments,
                                                tool_call_id=started_tool_call_id, target=target)]
@@ -2143,6 +2241,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             tool_call_id=started_tool_call_id,
         )] if failed_events is None else failed_events)
         events.extend(failed)
+        events.extend([] if extra_events is None else extra_events)
         events.append({"type": "ModelMessage", "contentText": result_text})
         self.pages_by_task[parent_name] = [{"events": [
             {**event, "seq": index} for index, event in enumerate(events, start=1)
@@ -2162,6 +2261,31 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.assertEqual(denial["assertions"]["worker-tool-pre-creation"]["verdict"], "fail")
         self.assertEqual(denial["assertions"]["no-child-task-created"]["verdict"], "pass")
         self.assertEqual(report["assertions"]["parent-result-named-requested-agent"]["verdict"], "fail")
+
+    def test_azure_refusal_receipts_bind_zero_child_journal_events_and_parent_only_request_count(self):
+        refusal = ("The agent 'not-allowed-agent' was refused because it is not in the list of allowed agents. "
+                   "The task has been reported as refused due to this restriction.")
+        self._switch_coordinator_to_azure()
+        self._set_refusal_result_evidence(
+            refusal,
+            extra_events=[{"type": "ModelRequestCompleted", "inputTokens": 1, "outputTokens": 2}],
+        )
+        summary = self.run_refusal_eval(**{"--model": AZURE_DEPLOYMENT})
+        denial = self.denial_receipt()
+        report = self.report_receipt()
+        child_journal_path = self.evidence / "refuses-unlisted" / "child-journal-events.json"
+        self.assertEqual(summary["verdict"], "pass")
+        self.assertEqual(denial["provider_route"], azure_provider_route())
+        self.assertEqual(report["provider_route"], azure_provider_route())
+        self.assertEqual(denial["request_count"], 1)
+        self.assertEqual(report["request_count"], 1)
+        self.assertEqual(denial["token_usage"], {"input": 1, "output": 2, "total": 3})
+        self.assertEqual(report["token_usage"], {"input": 1, "output": 2, "total": 3})
+        self.assertEqual(json.loads(child_journal_path.read_text(encoding="utf-8")), {"items": []})
+        self.assertFalse((self.evidence / "refuses-unlisted" / "provider-records.json").exists())
+        child_journal_digest = agentctl.sha256_hex(child_journal_path.read_bytes())
+        self.assertIn(child_journal_digest, denial["evidence_sha256"])
+        self.assertIn(child_journal_digest, report["evidence_sha256"])
 
     def test_refuses_unlisted_visible_arguments_require_the_requested_target_to_pass_both_receipts(self):
         self._set_refusal_result_evidence(
@@ -2830,6 +2954,23 @@ class ComposedEvalCliTestCase(unittest.TestCase):
                     message,
                 )
 
+    def test_reuse_current_azure_anchor_requires_exact_rendered_provider_resolution_for_non_legacy_routes(self):
+        cases = (
+            ("missing", lambda: (self.coordinator / "resources" / "provider.yaml").unlink()),
+            ("mismatch", lambda: self._rewrite_coordinator_provider_resource(
+                lambda provider: provider["metadata"].update({"name": "other-provider"}))),
+            ("duplicate", lambda: self._duplicate_coordinator_provider_resource()),
+        )
+        for label, mutate in cases:
+            with self.subTest(case=label):
+                self.setUp()
+                self.seed_azure_delegate_evidence()
+                mutate()
+                self._assert_reuse_failure_preserves_bytes(
+                    self.reuse_eval_argv("delegates", **{"--model": AZURE_DEPLOYMENT}),
+                    "eval failed: rendered bundle does not resolve exactly one coordinator Provider",
+                )
+
     def test_reuse_current_azure_anchor_requires_receipt_bound_provider_readback_and_current_provider_equality(self):
         self.seed_azure_delegate_evidence()
         provider_path = self.evidence / "delegates" / "coordinator-provider-readback.json"
@@ -2916,7 +3057,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
                     {"type": "ModelRequestFailed", "contentText": "throttled"},
                 ),
                 7,
-                "eval failed: existing evidence journal-events.json does not reproduce the original live receipt request_count",
+                "eval failed: existing evidence authenticated request journals do not reproduce the original live receipt request_count",
             ),
             (
                 "incomplete-journal",
@@ -2935,6 +3076,40 @@ class ComposedEvalCliTestCase(unittest.TestCase):
                 receipt = self.receipt("delegates")
                 old_digest = agentctl.sha256_hex(journal_path.read_bytes())
                 write_json(journal_path, {"events": events, "latestSeq": latest_seq})
+                new_digest = agentctl.sha256_hex(journal_path.read_bytes())
+                receipt["evidence_sha256"] = [new_digest if digest == old_digest else digest for digest in receipt["evidence_sha256"]]
+                agentctl._write_json(self.receipt_path("delegates"), receipt)
+                self._assert_reuse_failure_preserves_bytes(
+                    self.reuse_eval_argv("delegates", **{"--model": AZURE_DEPLOYMENT}),
+                    message,
+                )
+
+    def test_reuse_current_azure_anchor_requires_authenticated_child_request_count_evidence(self):
+        cases = (
+            (
+                "count-drift",
+                {"items": [self._child_journal_payload(self._child_journal_events(
+                    {"type": "ModelRequestCompleted", "contentText": "child request"},
+                ))]},
+                "eval failed: existing evidence authenticated request journals do not reproduce the original live receipt request_count",
+            ),
+            (
+                "incomplete",
+                {"items": [self._child_journal_payload(
+                    self._child_journal_events({"type": "ModelRequestCompleted", "contentText": "child request"}),
+                    latest_seq=2,
+                )]},
+                "eval failed: existing evidence child-journal-events.json does not prove authenticated child model-request count for the original live receipt",
+            ),
+        )
+        for label, payload, message in cases:
+            with self.subTest(case=label):
+                self.setUp()
+                self.seed_azure_delegate_evidence()
+                journal_path = self.evidence / "delegates" / "child-journal-events.json"
+                receipt = self.receipt("delegates")
+                old_digest = agentctl.sha256_hex(journal_path.read_bytes())
+                write_json(journal_path, payload)
                 new_digest = agentctl.sha256_hex(journal_path.read_bytes())
                 receipt["evidence_sha256"] = [new_digest if digest == old_digest else digest for digest in receipt["evidence_sha256"]]
                 agentctl._write_json(self.receipt_path("delegates"), receipt)
@@ -3717,6 +3892,10 @@ class LifecycleCliTestCase(unittest.TestCase):
 
     def setup_native_composition(self):
         self.native_root = self.root / "native-catalogue"
+        self.native_evidence = self.root / "native-evidence"
+        for path in (self.native_root, self.native_evidence):
+            if path.exists():
+                shutil.rmtree(path)
         (self.native_root / "agents").mkdir(parents=True, exist_ok=True)
         self.hello = write_native_agent(self.native_root / "agents" / "hello", namespace=NAMESPACE,
                                         agent_name="hello", provider_name="hello")
@@ -3728,7 +3907,6 @@ class LifecycleCliTestCase(unittest.TestCase):
             namespace=NAMESPACE,
             catalogue_agents={"hello": pins},
         )
-        self.native_evidence = self.root / "native-evidence"
         hello_render = agentctl.render_agent(self.hello, "trial", self.native_root / "hello-probe.json")
         coordinator_render = agentctl.render_agent(
             self.coordinator, "trial", self.native_root / "coordinator-probe.json")
@@ -3781,6 +3959,16 @@ class LifecycleCliTestCase(unittest.TestCase):
             uid="coordinator-provider-uid",
             conditions=[{"type": "Ready", "status": "True", "observedGeneration": 1}],
         )
+
+    def _rewrite_native_coordinator_provider_resource(self, mutate, *, file_name: str = "provider.yaml"):
+        path = self.coordinator / "resources" / file_name
+        provider_resource = json.loads(path.read_text(encoding="utf-8"))
+        mutate(provider_resource)
+        write_json(path, provider_resource)
+
+    def _duplicate_native_coordinator_provider_resource(self, *, file_name: str = "provider-duplicate.yaml"):
+        provider_resource = json.loads((self.coordinator / "resources" / "provider.yaml").read_text(encoding="utf-8"))
+        write_json(self.coordinator / "resources" / file_name, provider_resource)
 
     def native_argv(self, **overrides):
         args = {"--mode": "native-composition", "--context": "ctx", "--kubeconfig": "cred",
@@ -4126,6 +4314,27 @@ class LifecycleCliTestCase(unittest.TestCase):
         self.assertNotIn("token_usage", receipt)
         self.assertNotIn(AZURE_CREDENTIAL_NAME, json.dumps(receipt))
         self.assertNotIn(AZURE_CREDENTIAL_ENTRY, json.dumps(receipt))
+
+    def test_native_lifecycle_requires_exact_rendered_provider_resolution_for_non_legacy_routes_before_cluster_calls(self):
+        cases = (
+            ("missing", lambda: (self.coordinator / "resources" / "provider.yaml").unlink()),
+            ("mismatch", lambda: self._rewrite_native_coordinator_provider_resource(
+                lambda provider: provider["metadata"].update({"name": "other-provider"}))),
+            ("duplicate", lambda: self._duplicate_native_coordinator_provider_resource()),
+        )
+        for kind in ("deploy", "rollback"):
+            for label, mutate in cases:
+                with self.subTest(kind=kind, case=label):
+                    self.setup_native_composition()
+                    self._switch_native_coordinator_to_azure()
+                    mutate()
+                    with self.assertRaises(agentctl.CliError) as caught:
+                        self.run_native_lifecycle(kind)
+                    self.assertIn("rendered bundle does not resolve exactly one coordinator Provider", str(caught.exception))
+                    self.assertEqual(
+                        [argv for argv, _ in self.native_kubectl.calls if argv and argv[0] == "kubectl"],
+                        [],
+                    )
 
     def test_native_azure_provider_readback_must_be_present_ready_and_spec_identical(self):
         cases = (

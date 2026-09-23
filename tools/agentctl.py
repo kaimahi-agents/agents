@@ -1530,7 +1530,8 @@ def _require_reusable_provider_capture_established(receipt: dict, records, holde
     return window_start, window_end
 
 
-def _require_reusable_azure_request_count_established(receipt: dict, events, latest_seq) -> int:
+def _require_reusable_azure_request_count_established(receipt: dict, case_id: str, events, latest_seq,
+                                                      child_journal_holder, expected_child_tasks) -> int:
     request_count = receipt.get("request_count") if isinstance(receipt, dict) else None
     assertions = receipt.get("assertions") if isinstance(receipt, dict) else None
     bounded = assertions.get("stayed-within-limits") if isinstance(assertions, dict) else None
@@ -1539,13 +1540,22 @@ def _require_reusable_azure_request_count_established(receipt: dict, events, lat
             or bounded.get("evidence_completeness") is not True
             or bounded.get("verdict") not in _VERDICTS):
         raise CliError("existing live receipt does not prove authenticated model-request count was established for reuse")
-    if check_journal_completeness(events, latest_seq):
+    if not _authenticated_request_count_from_journal(events, latest_seq)[1]:
         raise CliError("existing evidence journal-events.json does not prove authenticated parent model-request count for the original live receipt")
-    current_count, established = summarize_parent_request_count(events)
+    child_items = child_journal_holder.get("items") if isinstance(child_journal_holder, dict) else None
+    if not isinstance(child_items, list):
+        raise CliError(f"existing evidence {_CHILD_JOURNAL_EVENTS_FILE} must contain an items array")
+    current_count, established = summarize_case_wide_request_count(
+        case_id,
+        events,
+        latest_seq,
+        child_items,
+        expected_child_tasks=expected_child_tasks,
+    )
     if not established:
-        raise CliError("existing evidence journal-events.json does not prove authenticated parent model-request count for the original live receipt")
+        raise CliError(f"existing evidence {_CHILD_JOURNAL_EVENTS_FILE} does not prove authenticated child model-request count for the original live receipt")
     if current_count != request_count:
-        raise CliError("existing evidence journal-events.json does not reproduce the original live receipt request_count")
+        raise CliError("existing evidence authenticated request journals do not reproduce the original live receipt request_count")
     return current_count
 
 
@@ -1664,6 +1674,7 @@ TOOL_CALL_EVENT_TYPES = frozenset({"ToolCallStarted", "ToolCallCompleted", "Tool
 _TOOL_CALL_STARTED_TYPE = "ToolCallStarted"
 _MODEL_MESSAGE_EVENT_TYPE = "ModelMessage"
 _MODEL_REQUEST_TERMINAL_EVENT_TYPES = frozenset({"ModelRequestCompleted", "ModelRequestFailed"})
+_CHILD_JOURNAL_EVENTS_FILE = "child-journal-events.json"
 DELIVERY_VALIDATED_STATE = "ReadValidated"
 ALLOWED_TASK_TOOLS = frozenset({"Read", "Write", "Edit", "Bash", "Glob", "Grep"})
 # Any of these keys anywhere in a Task spec is a request this policy must refuse to certify as
@@ -1703,6 +1714,43 @@ def summarize_parent_request_count(events) -> tuple[int | None, bool]:
         if isinstance(event, dict) and event.get("type") in _MODEL_REQUEST_TERMINAL_EVENT_TYPES:
             count += 1
     return count, True
+
+
+def _authenticated_request_count_from_journal(events, latest_seq) -> tuple[int | None, bool]:
+    return ((None, False) if check_journal_completeness(events, latest_seq)
+            else summarize_parent_request_count(events))
+
+
+def summarize_case_wide_request_count(case_id: str, parent_events, parent_latest_seq,
+                                      child_journals, *, expected_child_tasks) -> tuple[int | None, bool]:
+    """Azure delegates count authenticated parent + child model-request terminal events case-wide."""
+    if (not isinstance(expected_child_tasks, list)
+            or any(not isinstance(task_name, str) or not task_name for task_name in expected_child_tasks)):
+        return None, False
+    if case_id == "delegates":
+        if len(expected_child_tasks) != 1:
+            return None, False
+    elif expected_child_tasks:
+        return None, False
+    if not isinstance(child_journals, list) or len(child_journals) != len(expected_child_tasks):
+        return None, False
+    total, established = _authenticated_request_count_from_journal(parent_events, parent_latest_seq)
+    if not established:
+        return None, False
+    observed_tasks = set()
+    for journal in child_journals:
+        task_name = journal.get("task") if isinstance(journal, dict) else None
+        events = journal.get("events") if isinstance(journal, dict) else None
+        latest_seq = journal.get("latestSeq") if isinstance(journal, dict) else None
+        if (not isinstance(task_name, str) or not task_name or task_name in observed_tasks
+                or not isinstance(events, list)):
+            return None, False
+        observed_tasks.add(task_name)
+        child_count, child_established = _authenticated_request_count_from_journal(events, latest_seq)
+        if not child_established:
+            return None, False
+        total += child_count
+    return (total, True) if observed_tasks == set(expected_child_tasks) else (None, False)
 
 
 def _complete_model_request_token_pair(event) -> tuple[tuple[int, int] | None, bool]:
@@ -1958,11 +2006,13 @@ _COMPOSED_EVIDENCE_FILES = (
 )
 
 
-def _composed_evidence_files(*, include_provider_records: bool,
+def _composed_evidence_files(*, include_provider_records: bool, include_child_journal: bool,
                              include_provider_readback: bool) -> tuple[str, ...]:
     files = _COMPOSED_EVIDENCE_FILES[:3]
     if include_provider_records:
         files += (_COMPOSED_PROVIDER_RECORDS_FILE,)
+    if include_child_journal:
+        files += (_CHILD_JOURNAL_EVENTS_FILE,)
     files += _COMPOSED_EVIDENCE_FILES[3:]
     return files + ((_COORDINATOR_PROVIDER_READBACK_FILE,) if include_provider_readback else ())
 
@@ -3231,12 +3281,14 @@ def _resolve_rendered_coordinator_provider(rendered_bundle) -> tuple[dict, dict 
     provider_name, provider_namespace = _referenced_provider_identity(coordinator_agent)
     if provider_name is None or provider_namespace is None:
         return coordinator_agent, None, provider_name, provider_namespace
-    providers = [item for item in items
-                 if isinstance(item, dict) and item.get("kind") == "Provider"
-                 and ((item.get("metadata") or {}).get("name") == provider_name)
+    all_providers = [item for item in items if isinstance(item, dict) and item.get("kind") == "Provider"]
+    providers = [item for item in all_providers
+                 if ((item.get("metadata") or {}).get("name") == provider_name)
                  and ((item.get("metadata") or {}).get("namespace") == provider_namespace)]
     if not providers:
-        return coordinator_agent, None, provider_name, provider_namespace
+        if provider_name == _EXPECTED_COMPOSED_CHILD and not all_providers:
+            return coordinator_agent, None, provider_name, provider_namespace
+        raise CliError("rendered bundle does not resolve exactly one coordinator Provider")
     if len(providers) != 1:
         raise CliError("rendered bundle does not resolve exactly one coordinator Provider")
     return coordinator_agent, providers[0], provider_name, provider_namespace
@@ -3343,8 +3395,8 @@ def _prepare_composed_render_context(args, *, evidence_dir: Path | None) -> dict
 
 
 def _score_composed_coordination(args, case: dict, *, render_context: dict, task_manifest, terminal_task,
-                                 events, latest_seq, records, child_live, coordinator_live, parent_result,
-                                 raw_child_inventory, child_terminal_tasks, child_results,
+                                 events, latest_seq, records, child_journals, child_live, coordinator_live,
+                                 parent_result, raw_child_inventory, child_terminal_tasks, child_results,
                                  provider_route: dict | None,
                                  requested_agent: str | None = None,
                                  observation: dict | None = None) -> tuple[dict, dict]:
@@ -3363,10 +3415,17 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
     completeness_errors = check_journal_completeness(events, latest_seq)
     journal_complete = not completeness_errors
     incomplete_journal_note = f"journal is incomplete: {'; '.join(completeness_errors)}"
+    expected_child_tasks = ([(child.get("metadata") or {}).get("name") for child in genuine_children]
+                            if child_inventory_known else None)
     azure_authoritative_requests = provider_route is not None
     if azure_authoritative_requests:
-        count, established = summarize_parent_request_count(events)
-        established = journal_complete and established
+        count, established = summarize_case_wide_request_count(
+            args.case_id,
+            events,
+            latest_seq,
+            child_journals,
+            expected_child_tasks=expected_child_tasks,
+        )
     else:
         window = (parse_timestamp(args.window_start), parse_timestamp(args.window_end))
         try:
@@ -3666,7 +3725,7 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
 
 def _score_composed_coordination_receipts(args, case_bindings: dict[str, dict], *, render_context: dict,
                                           task_manifest, terminal_task, events, latest_seq, records,
-                                          child_live, coordinator_live, parent_result,
+                                          child_journals, child_live, coordinator_live, parent_result,
                                           raw_child_inventory, child_terminal_tasks, child_results,
                                           provider_route: dict | None,
                                           observation: dict | None = None) -> tuple[dict[str, dict], dict[str, dict]]:
@@ -3677,10 +3736,10 @@ def _score_composed_coordination_receipts(args, case_bindings: dict[str, dict], 
         summary, receipt = _score_composed_coordination(
             score_args, binding["case"], render_context=render_context, task_manifest=task_manifest,
             terminal_task=terminal_task, events=events, latest_seq=latest_seq, records=records,
-            child_live=child_live, coordinator_live=coordinator_live, parent_result=parent_result,
-            raw_child_inventory=raw_child_inventory, child_terminal_tasks=child_terminal_tasks,
-            child_results=child_results, provider_route=provider_route,
-            requested_agent=binding["requested_agent"],
+            child_journals=child_journals, child_live=child_live, coordinator_live=coordinator_live,
+            parent_result=parent_result, raw_child_inventory=raw_child_inventory,
+            child_terminal_tasks=child_terminal_tasks, child_results=child_results,
+            provider_route=provider_route, requested_agent=binding["requested_agent"],
             observation=(observation if case_id == COMPOSED_REFUSAL_DENIAL_CASE_ID else None))
         summaries[case_id] = summary
         receipts[case_id] = receipt
@@ -3795,6 +3854,18 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict]
                                                         token=journal_token)
         except CliError:
             pass
+    child_journals = []
+    if provider_route is not None:
+        for child in child_terminal_tasks:
+            child_name = (child.get("metadata") or {}).get("name") if isinstance(child, dict) else None
+            child_events, child_latest_seq = [], None
+            if isinstance(child_name, str) and child_name:
+                try:
+                    child_events, child_latest_seq = page_journal(
+                        args.journal_base_url, child_name, args.namespace, token=journal_token)
+                except (CliError, HttpError):
+                    child_events, child_latest_seq = [], None
+            child_journals.append({"task": child_name, "events": child_events, "latestSeq": child_latest_seq})
     reconcile_campaign_entry(args.evidence_root, source_case_id, reserved["attempt"], parent_count=1,
                              child_count=len(genuine_children), probe_count=0)
     records = ([] if provider_route is not None
@@ -3812,9 +3883,10 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict]
     summaries, receipts = _score_composed_coordination_receipts(
         args, case_bindings, render_context=render_context, task_manifest=task_manifest,
         terminal_task=terminal_task, events=events, latest_seq=latest_seq, records=records,
-        child_live=child_live, coordinator_live=coordinator_live, parent_result=parent_result,
-        raw_child_inventory=raw_child_inventory, child_terminal_tasks=child_terminal_tasks,
-        child_results=child_results, provider_route=provider_route, observation=observation)
+        child_journals=child_journals, child_live=child_live, coordinator_live=coordinator_live,
+        parent_result=parent_result, raw_child_inventory=raw_child_inventory,
+        child_terminal_tasks=child_terminal_tasks, child_results=child_results,
+        provider_route=provider_route, observation=observation)
     evidence_pairs = [
         ("task-manifest.json", task_manifest),
         ("terminal-task.json", terminal_task),
@@ -3828,6 +3900,8 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict]
     ]
     if provider_route is None:
         evidence_pairs.insert(3, (_COMPOSED_PROVIDER_RECORDS_FILE, records))
+    else:
+        evidence_pairs.insert(3, (_CHILD_JOURNAL_EVENTS_FILE, {"items": child_journals}))
     if render_context["coordinator_provider_item"] is not None:
         evidence_pairs.append((_COORDINATOR_PROVIDER_READBACK_FILE, provider_live))
     evidence_sha256 = list(dict.fromkeys(
@@ -3875,6 +3949,15 @@ def _reuse_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict
                      if isinstance(parent_result_holder, dict) and isinstance(parent_result_holder.get("result"), str)
                      else None)
     raw_child_inventory = _read_receipt_bound_json(prior_receipt, evidence_dir, "child-inventory.json")
+    raw_child_items = (raw_child_inventory.get("items")
+                       if isinstance(raw_child_inventory, dict) and isinstance(raw_child_inventory.get("items"), list)
+                       else None)
+    task_name = (task_manifest.get("metadata") or {}).get("name") if isinstance(task_manifest, dict) else None
+    parent_uid = ((terminal_task.get("metadata") or {}).get("uid") if isinstance(terminal_task, dict) else None)
+    child_inventory_known = (isinstance(task_name, str) and task_name and isinstance(parent_uid, str) and parent_uid
+                             and raw_child_items is not None)
+    genuine_children = (genuine_child_tasks(raw_child_items or [], task_name, parent_uid)
+                        if child_inventory_known else [])
     child_tasks_holder = _read_receipt_bound_json(prior_receipt, evidence_dir, "child-tasks.json")
     child_terminal_tasks = child_tasks_holder.get("items") if isinstance(child_tasks_holder, dict) else None
     if not isinstance(child_terminal_tasks, list):
@@ -3886,11 +3969,20 @@ def _reuse_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict
         records = _read_receipt_bound_json(prior_receipt, evidence_dir, _COMPOSED_PROVIDER_RECORDS_FILE)
         if not isinstance(records, list):
             raise CliError("existing evidence provider-records.json must contain an array")
+        child_journal_holder = {"items": []}
         reuse_args.window_start, reuse_args.window_end = _require_reusable_provider_capture_established(
             prior_receipt, records, [terminal_task, *child_terminal_tasks])
     else:
         records = []
-        _require_reusable_azure_request_count_established(prior_receipt, events, latest_seq)
+        child_journal_holder = _read_receipt_bound_json(prior_receipt, evidence_dir, _CHILD_JOURNAL_EVENTS_FILE)
+        _require_reusable_azure_request_count_established(
+            prior_receipt,
+            args.case_id,
+            events,
+            latest_seq,
+            child_journal_holder,
+            [(child.get("metadata") or {}).get("name") for child in genuine_children],
+        )
     if args.case_id == "delegates":
         observation, probe_evidence_sha256 = None, []
     elif args.source == "live" and args.case_id == COMPOSED_REFUSAL_DENIAL_CASE_ID:
@@ -3902,6 +3994,7 @@ def _reuse_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict
     summaries, receipts = _score_composed_coordination_receipts(
         reuse_args, case_bindings, render_context=render_context, task_manifest=task_manifest,
         terminal_task=terminal_task, events=events, latest_seq=latest_seq, records=records,
+        child_journals=(child_journal_holder.get("items") if isinstance(child_journal_holder, dict) else []),
         child_live=child_live, coordinator_live=coordinator_live, parent_result=parent_result,
         raw_child_inventory=raw_child_inventory, child_terminal_tasks=child_terminal_tasks,
         child_results=child_results, provider_route=provider_route, observation=observation)
@@ -3909,6 +4002,7 @@ def _reuse_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict
         evidence_dir,
         _composed_evidence_files(
             include_provider_records=render_context["provider_route"] is None,
+            include_child_journal=render_context["provider_route"] is not None,
             include_provider_readback=render_context["coordinator_provider_item"] is not None))
     for case_id, receipt in receipts.items():
         receipt["evidence_sha256"] = (list(dict.fromkeys([*evidence_sha256, *probe_evidence_sha256]))
