@@ -930,16 +930,21 @@ _SENSITIVE_KEYS = ("password", "passwd", "pwd", "secret", "apikey", "api_key", "
                    "authtoken", "auth_token", "auth-token", "accesstoken", "access_token", "access-token")
 _PLACEHOLDERS = frozenset({"", "changeme", "change-me", "placeholder", "redacted", "example", "xxx", "xxxx",
                            "todo", "n/a", "na", "null", "none", "true", "false"})
+_JSON_COMPATIBLE_SCAN_SUFFIXES = frozenset({".json", ".yaml", ".yml"})
+_REF_BINDING_SHAPE_RULE = "secret-ref-structure"
+_REF_KEY_LINE_RE = re.compile(r'(?:["\']secretRef["\']|\bsecretRef\b)\s*:')
+_REF_ALLOWED_KEYS = frozenset({"name", "key"})
 def _unquote(value: str) -> str:
     return value[1:-1] if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'" else value
 def _is_credential_assignment(line: str) -> bool:
     match = _ASSIGNMENT_RE.match(line)
-    key = _unquote(match.group(1)).lower() if match else ""
+    raw_key = _unquote(match.group(1)) if match else ""
+    key = raw_key.lower()
     if not match or not any(part in key for part in _SENSITIVE_KEYS):
         return False
     value = _unquote(match.group(2).strip())
     normalized = value.rstrip(",").strip()
-    if normalized in ("{", "[") and any(part in key for part in ("secretref", "secret_ref", "secret-ref")):
+    if normalized in ("{", "[") and raw_key == "secretRef":
         return False
     if value.lower() in _PLACEHOLDERS or value.lower().startswith(("$", "{{", "<")):
         return False
@@ -948,6 +953,32 @@ def scan_line(line: str) -> list[str]:
     """Rule IDs matched by one line, in fixed rule order; never the matched text itself."""
     rule_ids = [rule_id for rule_id, pattern in _LINE_RULES if pattern.search(line)]
     return rule_ids + ["credential-assignment"] if _is_credential_assignment(line) else list(rule_ids)
+
+def _walk_invalid_ref_bindings(node):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "secretRef":
+                valid = (isinstance(value, dict) and set(value) <= _REF_ALLOWED_KEYS and "name" in value
+                         and all(isinstance(value.get(part), str) and is_safe_slug(value.get(part))
+                                 for part in value))
+                yield not valid
+            yield from _walk_invalid_ref_bindings(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _walk_invalid_ref_bindings(item)
+
+
+def _scan_json_compatible_ref_bindings(relative_path: str, text: str) -> list[tuple[str, int, str]]:
+    if Path(relative_path).suffix not in _JSON_COMPATIBLE_SCAN_SUFFIXES:
+        return []
+    try:
+        document = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    ref_lines = [number for number, line in enumerate(text.splitlines(), start=1) if _REF_KEY_LINE_RE.search(line)]
+    ref_validity = list(_walk_invalid_ref_bindings(document))
+    return [(relative_path, ref_lines[index] if index < len(ref_lines) else 1, _REF_BINDING_SHAPE_RULE)
+            for index, bad in enumerate(ref_validity) if bad]
 def _walk_failed(exc: OSError) -> None:
     raise CliError(f"directory walk failed ({type(exc).__name__})")
 def _is_plain_file(root: Path, relative_path: str) -> bool:
@@ -991,9 +1022,12 @@ def scan_file(root: Path, relative_path: str) -> list[tuple[str, int, str]]:
         raise CliError(f"could not read {relative_path} ({type(exc).__name__})") from exc
     if b"\x00" in data[:_BINARY_PROBE_BYTES]:
         return []
-    return [(relative_path, number, rule_id)
-            for number, line in enumerate(data.decode("utf-8", errors="replace").splitlines(), start=1)
-            for rule_id in scan_line(line)]
+    text = data.decode("utf-8", errors="replace")
+    findings = [(relative_path, number, rule_id)
+                for number, line in enumerate(text.splitlines(), start=1)
+                for rule_id in scan_line(line)]
+    findings += _scan_json_compatible_ref_bindings(relative_path, text)
+    return sorted(findings, key=lambda item: (item[1], item[2]))
 def scan_repository(root: Path) -> list[tuple[str, int, str]]:
     """Every finding under `root`, sorted by path, then line, then rule ID."""
     return sorted(finding for path in iter_candidate_files(root) for finding in scan_file(root, path))
@@ -1648,7 +1682,7 @@ def summarize_parent_token_usage(events) -> tuple[dict[str, int] | None, bool]:
     totals = {"input": 0, "output": 0, "total": 0}
     seen = set()
     redacted = set(find_redacted_sequences(events))
-    established = False
+    saw_input, saw_output = False, False
     for event in events:
         seq = event_sequence_number(event)
         if seq is None or seq in seen or seq in redacted:
@@ -1663,10 +1697,13 @@ def summarize_parent_token_usage(events) -> tuple[dict[str, int] | None, bool]:
             continue
         if input_invalid or output_invalid:
             return None, False
-        established = True
-        totals["input"] += input_tokens
-        totals["output"] += output_tokens
-    if not established:
+        if has_input:
+            saw_input = True
+            totals["input"] += input_tokens
+        if has_output:
+            saw_output = True
+            totals["output"] += output_tokens
+    if not (saw_input and saw_output):
         return None, False
     totals["total"] = totals["input"] + totals["output"]
     return totals, True

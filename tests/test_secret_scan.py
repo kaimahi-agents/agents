@@ -17,6 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tools import agentctl  # noqa: E402
 
+REF_SHAPE_RULE_ID = "secret-ref-structure"
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HOME_PATH = "/" + "home/someone/notes.txt"
 CONTEXT_NAME = "kind-" + "example-test"
@@ -95,6 +97,7 @@ class CredentialAssignmentTestCase(unittest.TestCase):
         for line in lines:
             with self.subTest(line=line):
                 self.assertEqual(agentctl.scan_line(line), [])
+        self.assertIn("credential-assignment", agentctl.scan_line('api_' + 'key_' + 'secret' + 'Ref: {'))
 
     def test_inline_secret_ref_objects_and_arrays_still_flag(self):
         lines = ('secret' + 'Ref: {name: provider-key}', 'secret' + 'Ref: {"value":"real-secret"}',
@@ -123,6 +126,9 @@ class ScanFileTestCase(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
 
+    def _write_lines(self, path: str, *lines: str) -> None:
+        (self.root / path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
     def test_findings_carry_path_line_and_rule_but_never_the_value(self):
         (self.root / "notes.md").write_text(f"one\ntwo\n{HOME_PATH}\n", encoding="utf-8")
         findings = agentctl.scan_file(self.root, "notes.md")
@@ -134,6 +140,78 @@ class ScanFileTestCase(unittest.TestCase):
         self.assertEqual(agentctl.scan_file(self.root, "blob.bin"), [])
         (self.root / "big.txt").write_bytes(b"x" * (agentctl.MAX_SCAN_BYTES + 1) + HOME_PATH.encode("utf-8"))
         self.assertEqual(agentctl.scan_file(self.root, "big.txt"), [])
+
+    def test_document_scan_accepts_the_supported_secret_ref_shape(self):
+        self._write_lines(
+            "provider.yaml",
+            "{",
+            '  "kind": "Provider",',
+            '  "spec": {',
+            '    "secret' + 'Ref": {',
+            '      "name": "provider-key",',
+            '      "key": "api-key"',
+            '    }',
+            '  }',
+            "}",
+        )
+        self.assertEqual(agentctl.scan_file(self.root, "provider.yaml"), [])
+
+    def test_document_scan_reports_malformed_secret_ref_structures_by_position_only(self):
+        cases = (
+            (
+                "extra-field",
+                [
+                    "{",
+                    '  "spec": {',
+                    '    "secret' + 'Ref": {',
+                    '      "name": "provider-key",',
+                    '      "value": {',
+                    '        "token": "real-secret"',
+                    '      }',
+                    '    }',
+                    '  }',
+                    "}",
+                ],
+                3,
+            ),
+            (
+                "nested-name",
+                [
+                    "{",
+                    '  "items": [',
+                    '    {',
+                    '      "secret' + 'Ref": {',
+                    '        "name": {',
+                    '          "nested": "bad"',
+                    '        }',
+                    '      }',
+                    '    }',
+                    '  ]',
+                    "}",
+                ],
+                4,
+            ),
+            (
+                "array-value",
+                [
+                    "{",
+                    '  "spec": {',
+                    '    "secret' + 'Ref": [',
+                    '      {"name": "provider-key"}',
+                    '    ]',
+                    '  }',
+                    "}",
+                ],
+                3,
+            ),
+        )
+        for label, lines, line_number in cases:
+            with self.subTest(case=label):
+                self.setUp()
+                self._write_lines("bad.yaml", *lines)
+                findings = agentctl.scan_file(self.root, "bad.yaml")
+                self.assertIn(("bad.yaml", line_number, REF_SHAPE_RULE_ID), findings)
+                self.assertFalse(any("real-secret" in str(item) or "provider-key" in str(item) for item in findings))
 
     @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root can read any file")
     def test_an_unreadable_file_fails_closed(self):
