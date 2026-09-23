@@ -3064,7 +3064,7 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
             "provider, child, tool, and retry counts stayed within limits" if within
             else "provider, child, tool, or retry count exceeded limits"))(
                 count <= limits["provider_requests"] and total_calls <= limits["tool_calls"]
-                and len(genuine_children) <= limits["child_tasks"] and retry_ok)
+                and len(linked_children) <= limits["child_tasks"] and retry_ok)
             if established and journal_complete and child_inventory_known else
             not_evaluated("provider, child, tool, or retry bounds were not fully established")),
     }
@@ -3084,8 +3084,9 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
         assertions |= {
             "expected-delegation-tool-calls": expected_call_assertion(),
             "exactly-one-child-task": ((lambda exact: settled(
-                exact, "exactly one genuine child Task was captured" if exact
-                else "the genuine child Task count was not exactly one"))(len(genuine_children) == 1)
+                exact, "exactly one linked child Task was captured and it was genuine" if exact
+                else "the linked child Task count was not exactly one genuine child"))(
+                    len(linked_children) == 1 and len(genuine_children) == 1)
                 if child_inventory_known else
                 not_evaluated("genuine child Task identity could not be established")),
             "child-targeted-hello": tri_state(child_targeted, "the genuine child targeted hello",

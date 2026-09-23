@@ -1654,6 +1654,68 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.assertEqual(summary["verdict"], "fail")
         self.assertEqual(receipt["assertions"]["exactly-one-child-task"]["verdict"], "fail")
 
+    def _partial_delegate_child(self, suffix: str, *, link: str):
+        parent = self.parent_tasks["delegates"]
+        child = native_terminal_task(
+            f"coordinator-delegates-extra-{suffix}",
+            uid=f"delegates-extra-{suffix}-uid",
+            agent_name="hello",
+            prompt=f"Reply exactly: {FIXED_PHRASE}",
+            parent_name=parent["metadata"]["name"],
+            owner_uid=parent["metadata"]["uid"],
+            delegated_agent="hello",
+        )
+        if link != "owner":
+            child["metadata"].pop("ownerReferences", None)
+        if link != "annotation":
+            child["metadata"].pop("annotations", None)
+        if link != "label":
+            child["metadata"].pop("labels", None)
+        return child
+
+    def _assert_delegate_extra_partial_linked_child_fails(self, extra_child):
+        self._set_delegate_result_evidence(self._delegate_events(), child_items=[self.child_task, extra_child])
+        summary = self.run_eval("delegates", self.root / "delegates-task.json")
+        receipt = self.receipt("delegates")
+        self.assertEqual(summary["verdict"], "fail")
+        self.assertEqual(receipt["assertions"]["exactly-one-child-task"]["verdict"], "fail")
+        self.assertEqual(receipt["assertions"]["stayed-within-limits"]["verdict"], "fail")
+        self.assertEqual(receipt["assertions"]["child-targeted-hello"]["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["child-task-succeeded"]["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["child-result-contained-fixed-phrase"]["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["parent-result-contained-fixed-phrase"]["verdict"], "pass")
+
+    def _assert_delegate_only_partial_linked_child_fails(self, partial_child):
+        self._set_delegate_result_evidence(self._delegate_events(), child_items=[partial_child])
+        summary = self.run_eval("delegates", self.root / "delegates-task.json")
+        receipt = self.receipt("delegates")
+        self.assertEqual(summary["verdict"], "fail")
+        self.assertEqual(receipt["assertions"]["exactly-one-child-task"]["verdict"], "fail")
+        self.assertEqual(receipt["assertions"]["stayed-within-limits"]["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["child-targeted-hello"]["verdict"], "not_evaluated")
+        self.assertEqual(receipt["assertions"]["child-task-succeeded"]["verdict"], "not_evaluated")
+        self.assertEqual(receipt["assertions"]["child-result-contained-fixed-phrase"]["verdict"], "not_evaluated")
+        self.assertEqual(receipt["assertions"]["parent-result-contained-fixed-phrase"]["verdict"], "not_evaluated")
+
+    def test_delegates_rejects_one_strict_child_plus_owner_only_extra(self):
+        self._assert_delegate_extra_partial_linked_child_fails(
+            self._partial_delegate_child("owner-only", link="owner"))
+
+    def test_delegates_rejects_one_strict_child_plus_annotation_only_extra(self):
+        self._assert_delegate_extra_partial_linked_child_fails(
+            self._partial_delegate_child("annotation-only", link="annotation"))
+
+    def test_delegates_rejects_one_strict_child_plus_label_only_extra(self):
+        self._assert_delegate_extra_partial_linked_child_fails(
+            self._partial_delegate_child("label-only", link="label"))
+
+    def test_delegates_rejects_only_partial_linked_children(self):
+        for link in ("owner", "annotation", "label"):
+            with self.subTest(link=link):
+                self.setUp()
+                self._assert_delegate_only_partial_linked_child_fails(
+                    self._partial_delegate_child(f"partial-{link}", link=link))
+
     def test_live_delegate_shape_without_visible_arguments_uses_child_identity_and_attempt_fields(self):
         parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
         child = copy.deepcopy(self.child_task)
