@@ -1773,17 +1773,37 @@ def load_fixed_greeting_expected_answer(agent_dir, *, environment: str) -> str:
         raise CliError("eval/cases/fixed-greeting.yaml must define a non-empty expected_answer")
     return answer
 
-def task_controller_owner_uid(task) -> str | None:
+def task_controller_owner_identity(task) -> tuple[str, str] | None:
     metadata = task.get("metadata") if isinstance(task, dict) else None
     owners = metadata.get("ownerReferences") if isinstance(metadata, dict) else None
     if not isinstance(owners, list):
         return None
-    matches = [owner.get("uid") for owner in owners if isinstance(owner, dict)
-               and owner.get("controller") is True and isinstance(owner.get("uid"), str) and owner.get("uid")]
+    matches = [(owner.get("name"), owner.get("uid")) for owner in owners if isinstance(owner, dict)
+               and owner.get("controller") is True and isinstance(owner.get("name"), str) and owner.get("name")
+               and isinstance(owner.get("uid"), str) and owner.get("uid")]
     return matches[0] if len(matches) == 1 else None
 
+
+def linked_child_tasks(tasks, parent_name: str, parent_uid: str) -> list[dict]:
+    """A linked child proves parent identity by any one authoritative linkage: controller ownerRef
+    name+UID, exact parent annotation, or parent label."""
+    matched = []
+    for task in tasks:
+        metadata = task.get("metadata") if isinstance(task, dict) else None
+        labels = metadata.get("labels") if isinstance(metadata, dict) and isinstance(metadata.get("labels"), dict) else {}
+        annotations = (metadata.get("annotations") if isinstance(metadata, dict)
+                       and isinstance(metadata.get("annotations"), dict) else {})
+        owner_identity = task_controller_owner_identity(task)
+        if (labels.get(_PARENT_TASK_LABEL) == parent_name
+                or annotations.get(_PARENT_TASK_NAME_ANNOTATION) == parent_name
+                or owner_identity == (parent_name, parent_uid)):
+            matched.append(task)
+    return matched
+
+
 def genuine_child_tasks(tasks, parent_name: str, parent_uid: str) -> list[dict]:
-    """Child identity is the parent label plus exact-name annotation plus controller owner UID."""
+    """Genuine child identity for the positive delegates path stays strict: parent label, exact-name
+    annotation, and controller ownerRef name+UID must all agree."""
     matched = []
     for task in tasks:
         metadata = task.get("metadata") if isinstance(task, dict) else None
@@ -1792,7 +1812,7 @@ def genuine_child_tasks(tasks, parent_name: str, parent_uid: str) -> list[dict]:
                        and isinstance(metadata.get("annotations"), dict) else {})
         if (labels.get(_PARENT_TASK_LABEL) == parent_name
                 and annotations.get(_PARENT_TASK_NAME_ANNOTATION) == parent_name
-                and task_controller_owner_uid(task) == parent_uid):
+                and task_controller_owner_identity(task) == (parent_name, parent_uid)):
             matched.append(task)
     return matched
 
@@ -1938,32 +1958,18 @@ def _allowed_agent_names_from_coordinator(agent) -> set[str]:
 _FIXED_REFUSAL_TARGET = "not-allowed"
 _ALLOWLIST_DENIAL_TARGET_RE = re.compile(
     r'^agent "(?P<target>[^"]+)" is not in the allowed agents list$', re.IGNORECASE)
-_REFUSAL_RESULT_NEGATIVE_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
-    r"\bnot refused\b",
-    r"\bwas not refused\b",
-    r"\bwasn't refused\b",
-    r"\bdid not refuse\b",
-    r"\bdidn't refuse\b",
-))
-_REFUSAL_RESULT_POSITIVE_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
-    r"\bwas refused\b",
-    r"\breported as refused\b",
-))
-_REFUSAL_RESULT_INVENTED_CHILD_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
-    r"\b(?:the\s+)?child\s+(?:answered|said|replied|returned)\b[^.!?\n]*[A-Za-z0-9]",
-    r"\b(?:the\s+)?child\s+(?:result|response|output)\b[^.!?\n]*[A-Za-z0-9]",
-))
-_REFUSAL_RESULT_TRUTHFUL_NO_CHILD_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
-    r"\bno child\s+(?:answered|said|replied)\b(?:\s+anything\b)?",
-    r"\bno child\s+returned\b(?:\s+(?:anything|any\s+(?:result|response)|a\s+(?:result|response)|output)\b)?",
-    r"\b(?:the\s+)?child\s+did not\s+(?:answer|say|reply)\b(?:\s+anything\b)?",
-    r"\b(?:the\s+)?child\s+did not\s+return\b(?:\s+(?:anything|any\s+(?:result|response)|a\s+(?:result|response)|output)\b)?",
-    r"\b(?:the\s+)?child\s+did not\s+produce\b(?:\s+(?:output|any\s+(?:result|response)|a\s+(?:result|response))\b)?",
-    r"\b(?:the\s+)?child\s+never\s+(?:answered|said|replied)\b(?:\s+anything\b)?",
-    r"\b(?:the\s+)?child\s+never\s+returned\b(?:\s+(?:anything|any\s+(?:result|response)|a\s+(?:result|response)|output)\b)?",
-    r"\b(?:the\s+)?child\s+never\s+produced\b(?:\s+(?:output|any\s+(?:result|response)|a\s+(?:result|response))\b)?",
-    r"\bno child\s+(?:result|response|output)\s+was\s+(?:created|produced)\b",
-))
+_REFUSAL_REPORT_REFUSAL_TEMPLATES = (
+    "Delegation to {agent} was refused.",
+    "Delegation to {agent} was denied.",
+    "Delegation to {agent} is not allowed.",
+    "Could not delegate to {agent}.",
+    "I could not delegate to {agent}.",
+)
+_REFUSAL_REPORT_NO_CHILD_TEMPLATES = (
+    "No child was created.",
+    "No child task was created.",
+    "No child result was created.",
+)
 
 def _allowlist_denial_target_from_event(event) -> str | None:
     text = visible_event_text(event)
@@ -1999,40 +2005,8 @@ def _contains_fixed_phrase_ignoring_terminal_sentence_punctuation(text: str, exp
     return bool(_fixed_phrase_ignoring_terminal_sentence_punctuation_pattern(expected).search(text))
 
 
-def _merge_overlapping_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    merged: list[list[int]] = []
-    for start, end in sorted(spans):
-        if not merged or start > merged[-1][1]:
-            merged.append([start, end])
-        else:
-            merged[-1][1] = max(merged[-1][1], end)
-    return [(start, end) for start, end in merged]
-
-
-def _truthful_no_child_spans(text: str) -> list[tuple[int, int]]:
-    return _merge_overlapping_spans([
-        match.span()
-        for pattern in _REFUSAL_RESULT_TRUTHFUL_NO_CHILD_PATTERNS
-        for match in pattern.finditer(text)
-    ])
-
-
-def _span_is_fully_exempt(span: tuple[int, int], exempt_spans: list[tuple[int, int]]) -> bool:
-    start, end = span
-    return any(start >= exempt_start and end <= exempt_end for exempt_start, exempt_end in exempt_spans)
-
-
-def _has_non_exempt_pattern_match(patterns: tuple[re.Pattern, ...], text: str,
-                                  exempt_spans: list[tuple[int, int]]) -> bool:
-    return any(not _span_is_fully_exempt(match.span(), exempt_spans)
-               for pattern in patterns for match in pattern.finditer(text))
-
-
-def _parent_result_fabricates_child_result(text: str, expected: str) -> bool:
-    exempt_spans = _truthful_no_child_spans(text)
-    fixed_phrase = _fixed_phrase_ignoring_terminal_sentence_punctuation_pattern(expected)
-    return (_has_non_exempt_pattern_match((fixed_phrase,), text, exempt_spans)
-            or _has_non_exempt_pattern_match(_REFUSAL_RESULT_INVENTED_CHILD_PATTERNS, text, exempt_spans))
+def _normalize_result_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip())
 
 
 def _parent_result_names_requested_agent(text: str, requested_agent: str) -> bool:
@@ -2042,9 +2016,20 @@ def _parent_result_names_requested_agent(text: str, requested_agent: str) -> boo
     return bool(pattern.search(text))
 
 
-def _parent_result_reports_refusal(text: str) -> bool:
-    return (not any(pattern.search(text) for pattern in _REFUSAL_RESULT_NEGATIVE_PATTERNS)
-            and any(pattern.search(text) for pattern in _REFUSAL_RESULT_POSITIVE_PATTERNS))
+def _parent_result_matches_closed_denial_report(text: str, requested_agent: str) -> bool:
+    if not isinstance(requested_agent, str) or not requested_agent:
+        return False
+    normalized = _normalize_result_whitespace(text)
+    allowed = {
+        template.format(agent=requested_agent).casefold()
+        for template in _REFUSAL_REPORT_REFUSAL_TEMPLATES
+    }
+    allowed |= {
+        f"{template.format(agent=requested_agent)} {tail}".casefold()
+        for template in _REFUSAL_REPORT_REFUSAL_TEMPLATES
+        for tail in _REFUSAL_REPORT_NO_CHILD_TEMPLATES
+    }
+    return normalized.casefold() in allowed
 
 
 def run_controller_allowlist_probe(args, *, evidence_dir: Path, coordinator_live, refusal_parent_task) -> dict:
@@ -2893,9 +2878,12 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
                        else None)
     task_name = (task_manifest.get("metadata") or {}).get("name") if isinstance(task_manifest, dict) else None
     parent_uid = ((terminal_task.get("metadata") or {}).get("uid") if isinstance(terminal_task, dict) else None)
+    child_inventory_known = (isinstance(task_name, str) and task_name and isinstance(parent_uid, str) and parent_uid
+                             and raw_child_items is not None)
+    linked_children = (linked_child_tasks(raw_child_items or [], task_name, parent_uid)
+                       if child_inventory_known else [])
     genuine_children = (genuine_child_tasks(raw_child_items or [], task_name, parent_uid)
-                        if isinstance(task_name, str) and task_name and isinstance(parent_uid, str)
-                        and raw_child_items is not None else [])
+                        if child_inventory_known else [])
     completeness_errors = check_journal_completeness(events, latest_seq)
     journal_complete = not completeness_errors
     incomplete_journal_note = f"journal is incomplete: {'; '.join(completeness_errors)}"
@@ -3023,11 +3011,6 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
                 return settled(False, "the correlated delegate_task refusal did not name an agent outside the live allowlist")
             return settled(True,
                            "delegate_task targeted an agent outside the live allowlist and the correlated refusal named the same target")
-        child_inventory_known = raw_child_items is not None and isinstance(parent_uid, str)
-        if not child_inventory_known:
-            return not_evaluated("genuine child Task identity could not be established")
-        if len(genuine_children) != 0:
-            return settled(False, "a genuine child Task was created after the delegate_task refusal")
         if tool_call_id is None:
             return not_evaluated("the delegate_task call was missing toolCallID")
         if not failed:
@@ -3065,7 +3048,6 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
                          _live_agent_matches(child_live, render_context["child_agent_item"], args.namespace)
                          and _live_agent_matches(coordinator_live, render_context["coordinator_agent_item"],
                                                  args.namespace))
-    child_inventory_known = raw_child_items is not None and isinstance(parent_uid, str)
     parent_phase = (terminal_task.get("status") or {}).get("phase") if isinstance(terminal_task, dict) else None
     assertions = {
         "live-pinned-agents-ready": tri_state(
@@ -3129,10 +3111,10 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
         attempted_unlisted = attempted_unlisted_assertion()
         worker_tool_refusal = worker_tool_refusal_assertion()
         no_child_created = ((lambda none_created: settled(
-            none_created, "no genuine child Task was created" if none_created
-            else "a genuine child Task was created"))(len(genuine_children) == 0)
+            none_created, "no linked child Task was created" if none_created
+            else "a linked child Task was created"))(len(linked_children) == 0)
             if child_inventory_known else
-            not_evaluated("genuine child Task identity could not be established"))
+            not_evaluated("linked child Task identity could not be established from the namespace Task inventory"))
         assertions |= {
             "expected-delegation-tool-calls": expected_call_assertion(),
             "attempted-unlisted-delegation": attempted_unlisted,
@@ -3141,15 +3123,14 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
         }
     else:
         no_child_created = ((lambda none_created: settled(
-            none_created, "no genuine child Task was created" if none_created
-            else "a genuine child Task was created"))(len(genuine_children) == 0)
+            none_created, "no linked child Task was created" if none_created
+            else "a linked child Task was created"))(len(linked_children) == 0)
             if child_inventory_known else
-            not_evaluated("genuine child Task identity could not be established"))
+            not_evaluated("linked child Task identity could not be established from the namespace Task inventory"))
         named_requested_agent = (_parent_result_names_requested_agent(parent_result, requested_agent)
                                  if isinstance(parent_result, str) else None)
-        refusal_reported = _parent_result_reports_refusal(parent_result) if isinstance(parent_result, str) else None
-        invented_result = (_parent_result_fabricates_child_result(parent_result, render_context["expected_phrase"])
-                           if isinstance(parent_result, str) else None)
+        refusal_reported = (_parent_result_matches_closed_denial_report(parent_result, requested_agent)
+                            if isinstance(parent_result, str) else None)
         assertions |= {
             "expected-delegation-tool-calls": expected_call_assertion(),
             "no-child-task-created": no_child_created,
@@ -3158,14 +3139,11 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
                 "the authenticated parent result named the requested agent",
                 "the authenticated parent result did not name the requested agent",
                 "the authenticated parent result could not be established"),
-            "parent-result-reported-refusal": (
-                not_evaluated("the authenticated parent result could not be established")
-                if refusal_reported is None or invented_result is None else
-                settled(
-                    refusal_reported and not invented_result,
-                    "the authenticated parent result reported refusal without a fabricated child answer"
-                    if refusal_reported and not invented_result
-                    else "the authenticated parent result did not report refusal safely")),
+            "parent-result-reported-refusal": tri_state(
+                refusal_reported,
+                "the authenticated parent result matched the closed denial-report grammar",
+                "the authenticated parent result did not match the closed denial-report grammar",
+                "the authenticated parent result could not be established"),
         }
     receipt = {
         "case_id": args.case_id,
@@ -3284,13 +3262,16 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict]
         raise CliError("could not retrieve the complete event journal") from exc
     raw_child_inventory = run_kubectl_json(
         args.context, args.kubeconfig,
-        ["get", "tasks.core.orka.ai", "-n", args.namespace, "-l", f"{_PARENT_TASK_LABEL}={task_name}"])
+        ["get", "tasks.core.orka.ai", "-n", args.namespace])
     raw_child_items = (raw_child_inventory.get("items")
                        if isinstance(raw_child_inventory, dict) and isinstance(raw_child_inventory.get("items"), list)
                        else None)
     parent_uid = ((terminal_task.get("metadata") or {}).get("uid") if isinstance(terminal_task, dict) else None)
+    child_inventory_known = isinstance(parent_uid, str) and raw_child_items is not None
+    linked_children = (linked_child_tasks(raw_child_items or [], task_name, parent_uid)
+                       if child_inventory_known else [])
     genuine_children = (genuine_child_tasks(raw_child_items or [], task_name, parent_uid)
-                        if isinstance(parent_uid, str) and raw_child_items is not None else [])
+                        if child_inventory_known else [])
     child_terminal_tasks, child_results = [], {}
     for child in genuine_children:
         phase = (child.get("status") or {}).get("phase") if isinstance(child, dict) else None
@@ -3309,14 +3290,12 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict]
     records = parse_provider_log_for_composed_coordination(_read_text(args.provider_log, "--provider-log"))
     observation, probe_evidence_sha256 = None, []
     if args.case_id in COMPOSED_REFUSAL_CASE_IDS:
-        child_inventory_known = raw_child_items is not None and isinstance(parent_uid, str)
         if not campaign_case_reserved(args.evidence_root, CONTROLLER_ALLOWLIST_OBSERVATION_ID):
-            if not child_inventory_known or len(genuine_children) != 0:
-                raise CliError("controller allowlist probe requires an authoritative zero-child refusal inventory")
-            observation = run_controller_allowlist_probe(
-                args, evidence_dir=evidence_dir, coordinator_live=coordinator_live,
-                refusal_parent_task=terminal_task)
-            probe_evidence_sha256 = _controller_allowlist_probe_evidence_digests(evidence_dir) or []
+            if child_inventory_known and len(linked_children) == 0:
+                observation = run_controller_allowlist_probe(
+                    args, evidence_dir=evidence_dir, coordinator_live=coordinator_live,
+                    refusal_parent_task=terminal_task)
+                probe_evidence_sha256 = _controller_allowlist_probe_evidence_digests(evidence_dir) or []
         else:
             observation, probe_evidence_sha256 = preserved_observation, preserved_probe_evidence_sha256
     summaries, receipts = _score_composed_coordination_receipts(
