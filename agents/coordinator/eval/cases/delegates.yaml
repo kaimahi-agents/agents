@@ -1,0 +1,21 @@
+{
+  "apiVersion": "core.orka.ai/v1alpha1",
+  "kind": "Task",
+  "metadata": {
+    "name": "coordinator-delegates",
+    "namespace": "orka-system",
+    "annotations": {
+      "orka.ai/disable-coordination-tool-injection": "true"
+    }
+  },
+  "spec": {
+    "type": "ai",
+    "agentRef": {
+      "name": "coordinator"
+    },
+    "prompt": "Delegate to hello. Ask it to reply exactly: Hello world. Wait for the child and return its answer verbatim.",
+    "retryPolicy": {
+      "maxRetries": 0
+    }
+  }
+}

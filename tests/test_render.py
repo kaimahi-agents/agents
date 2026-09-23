@@ -20,6 +20,28 @@ POLICY_CASE = {"case_id": "toolchain-unavailable", "environment": "trial", "case
               "required": False, "policy": agentctl.MISSING_TOOLCHAIN_POLICY,
               "assertions": sorted(agentctl.MISSING_TOOLCHAIN_ASSERTIONS),
               "limits": dict(agentctl.MISSING_TOOLCHAIN_LIMITS)}
+COMPOSED_POLICY_CASES = (
+    {"case_id": "delegates", "environment": "trial", "case_sha256": "a" * 64, "required": False,
+     "policy": "composed-coordination-v1",
+     "assertions": ["live-pinned-agents-ready", "parent-task-succeeded", "expected-delegation-tool-calls",
+                    "no-unexpected-tool-calls", "exactly-one-child-task", "child-targeted-hello",
+                    "child-task-succeeded", "child-result-contained-fixed-phrase",
+                    "parent-result-contained-fixed-phrase", "stayed-within-limits"],
+     "limits": {"provider_requests": 10, "tool_calls": 2, "child_tasks": 1, "retries": 0}},
+    {"case_id": "orka-denies-unlisted", "environment": "trial", "case_sha256": "a" * 64, "required": False,
+     "policy": "composed-coordination-v1",
+     "assertions": ["live-pinned-agents-ready", "parent-task-succeeded", "expected-delegation-tool-calls",
+                    "attempted-unlisted-delegation", "worker-tool-pre-creation", "no-child-task-created",
+                    "no-unexpected-tool-calls", "stayed-within-limits"],
+     "limits": {"provider_requests": 10, "tool_calls": 1, "child_tasks": 0, "retries": 0}},
+    {"case_id": "coordinator-reports-denial", "environment": "trial", "case_sha256": "a" * 64, "required": False,
+     "policy": "composed-coordination-v1",
+     "assertions": ["live-pinned-agents-ready", "parent-task-succeeded", "expected-delegation-tool-calls",
+                    "no-child-task-created", "no-unexpected-tool-calls",
+                    "parent-result-named-requested-agent", "parent-result-reported-refusal",
+                    "stayed-within-limits"],
+     "limits": {"provider_requests": 10, "tool_calls": 1, "child_tasks": 0, "retries": 0}},
+)
 
 
 class RenderTestCase(unittest.TestCase):
@@ -217,6 +239,13 @@ class RenderTestCase(unittest.TestCase):
         (self.agent / "eval" / "policies" / "missing-toolchain.md").write_text("policy text\n", encoding="utf-8")
         self.assertEqual(self.render(name="unreferenced.yaml")["bundle_digest"], baseline)
 
+    def test_an_unreferenced_composed_policy_file_never_affects_the_digest(self):
+        baseline = self.render()["bundle_digest"]
+        (self.agent / "eval" / "policies").mkdir(parents=True, exist_ok=True)
+        (self.agent / "eval" / "policies" / "composed-coordination.md").write_text("policy text\n",
+                                                                                           encoding="utf-8")
+        self.assertEqual(self.render(name="unreferenced-composed.yaml")["bundle_digest"], baseline)
+
     def test_a_declared_policy_requires_its_policy_file_to_render(self):
         (self.agent / "eval" / "acceptance.md").write_text(acceptance_block(POLICY_CASE), encoding="utf-8")
         with self.assertRaises(agentctl.BundleError):
@@ -231,6 +260,23 @@ class RenderTestCase(unittest.TestCase):
         self.assertNotEqual(with_policy, baseline)
         (self.agent / "eval" / "policies" / "missing-toolchain.md").write_text("different text\n", encoding="utf-8")
         self.assertNotEqual(self.render(name="changed-policy.yaml")["bundle_digest"], with_policy)
+
+    def test_a_declared_composed_policy_requires_its_policy_file_to_render(self):
+        (self.agent / "eval" / "acceptance.md").write_text(acceptance_block(*COMPOSED_POLICY_CASES), encoding="utf-8")
+        with self.assertRaises(agentctl.BundleError):
+            self.render(name="missing-composed-policy.yaml")
+
+    def test_declaring_the_composed_policy_changes_the_digest(self):
+        baseline = self.render()["bundle_digest"]
+        (self.agent / "eval" / "policies").mkdir(parents=True, exist_ok=True)
+        (self.agent / "eval" / "policies" / "composed-coordination.md").write_text("policy text\n",
+                                                                                           encoding="utf-8")
+        (self.agent / "eval" / "acceptance.md").write_text(acceptance_block(*COMPOSED_POLICY_CASES), encoding="utf-8")
+        with_policy = self.render(name="with-composed-policy.yaml")["bundle_digest"]
+        self.assertNotEqual(with_policy, baseline)
+        (self.agent / "eval" / "policies" / "composed-coordination.md").write_text("different text\n",
+                                                                                           encoding="utf-8")
+        self.assertNotEqual(self.render(name="changed-composed-policy.yaml")["bundle_digest"], with_policy)
 
     def test_the_missing_toolchain_policy_requires_the_exact_bound_limits(self):
         for limits in ({"provider_requests": 10, "tool_calls": 5}, {"provider_requests": 9, "tool_calls": 4}, {}):

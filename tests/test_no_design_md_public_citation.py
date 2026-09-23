@@ -33,7 +33,8 @@ class NoDesignMdCitationTestCase(unittest.TestCase):
 
     def test_no_shipped_file_cites_the_unpublished_design_document(self):
         offenders = [path for path in tracked_files()
-                     if NEEDLE in (REPO_ROOT / path).read_text(encoding="utf-8", errors="replace")]
+                     if (REPO_ROOT / path).is_file()
+                     and NEEDLE in (REPO_ROOT / path).read_text(encoding="utf-8", errors="replace")]
         self.assertEqual(offenders, [], f"shipped file(s) cite the unpublished planning document: {offenders}")
 
 

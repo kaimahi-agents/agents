@@ -5,6 +5,7 @@ Agents that run on Orka, and the tests that gate changes to them.
 | Agent | What it does | Runtime | Status |
 |---|---|---|---|
 | [a2a-assistant](agents/a2a-assistant/) | A no-tools assistant exercised over A2A | native | tested |
+| [coordinator](agents/coordinator/) | Delegates one level deep to the catalogue/promotion-pinned `hello` child | native | tested, trial red on report receipt |
 | [dependabot-repair](agents/dependabot-repair/) | Fixes failing CI on dependency update PRs | claude | tested, ran on real PRs |
 | [hello](agents/hello/) | The smallest possible agent. Start here. | native | tested |
 | [release-notes](agents/release-notes/) | Drafts release notes from a list of merged changes | claude | tested in simulation |
@@ -55,6 +56,7 @@ mechanism](docs/versioning-and-rollback.md).
 ```text
 agents/
   a2a-assistant/
+  coordinator/
   dependabot-repair/
   hello/
   release-notes/
