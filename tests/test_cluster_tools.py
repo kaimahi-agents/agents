@@ -1021,6 +1021,26 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         ]
         (self.coordinator / "eval" / "acceptance.md").write_text(acceptance_block(*rewritten), encoding="utf-8")
 
+    def _set_required_composed_cases(self, *required_case_ids):
+        required = set(required_case_ids)
+        acceptance_cases = agentctl.parse_acceptance_cases(
+            (self.coordinator / "eval" / "acceptance.md").read_text(encoding="utf-8"))
+        rewritten = [{**case, "required": case["case_id"] in required} for case in acceptance_cases]
+        (self.coordinator / "eval" / "acceptance.md").write_text(acceptance_block(*rewritten), encoding="utf-8")
+
+    def _configure_passing_required_refusal_cases(self):
+        self._set_required_composed_cases(REFUSAL_DENIAL_CASE_ID, REFUSAL_REPORT_CASE_ID)
+        for case_id in (REFUSAL_DENIAL_CASE_ID, REFUSAL_REPORT_CASE_ID):
+            self._rewrite_split_refusal_case(case_id, requested_agent="not-allowed-agent")
+
+    def _receipt_file(self, case_id, bundle_digest):
+        return self.coordinator / "eval" / "receipts" / bundle_digest / f"{case_id}.json"
+
+    def _assert_required_composed_cases_missing(self, *case_ids):
+        errors = agentctl.verify_agent(self.coordinator, "trial")
+        for case_id in case_ids:
+            self.assertTrue(any(f"required case {case_id!r}: no receipt found" in error for error in errors))
+
     def _refresh_hello_fixed_greeting_acceptance(self, *, raw_bytes=None, case_id="fixed-greeting",
                                                  environment="trial"):
         case_path = self.hello / "eval" / "cases" / "fixed-greeting.yaml"
@@ -2189,6 +2209,116 @@ class ComposedEvalCliTestCase(unittest.TestCase):
              "child_count": 0, "actual_child_count": 0, "probe_count": 0, "cumulative_total": 2},
         ]})
 
+    def test_live_same_digest_refusal_rerun_invalidates_both_receipts_before_shared_evidence_changes(self):
+        refusal = ("The agent 'not-allowed-agent' was refused because it is not in the list of allowed agents. "
+                   "The task has been reported as refused due to this restriction.")
+        self._configure_passing_required_refusal_cases()
+        self.seed_refusal_evidence()
+        self.seed_delegate_evidence()
+        self._set_refusal_result_evidence(refusal)
+        self.assertEqual(agentctl.verify_agent(self.coordinator, "trial"), [])
+        bundle_digest = self.denial_receipt()["bundle_digest"]
+        denial_path = self._receipt_file(REFUSAL_DENIAL_CASE_ID, bundle_digest)
+        report_path = self._receipt_file(REFUSAL_REPORT_CASE_ID, bundle_digest)
+        delegate_path = self._receipt_file("delegates", bundle_digest)
+        other_digest = "c" * 64
+        write_json(self._receipt_file(REFUSAL_DENIAL_CASE_ID, other_digest), {
+            **self.denial_receipt(), "bundle_digest": other_digest,
+        })
+        write_json(self._receipt_file(REFUSAL_REPORT_CASE_ID, other_digest), {
+            **self.report_receipt(), "bundle_digest": other_digest,
+        })
+        evidence_dir = self.evidence / "refuses-unlisted"
+        stale_hello_bundle = "stale hello bundle\n"
+        stale_bundle = "stale coordinator bundle\n"
+        (evidence_dir / "hello-bundle.yaml").write_text(stale_hello_bundle, encoding="utf-8")
+        (evidence_dir / "bundle.yaml").write_text(stale_bundle, encoding="utf-8")
+        original_render_agent = agentctl.render_agent
+
+        def fail_on_second_shared_render(agent_dir, environment, output):
+            if Path(output) == evidence_dir / "bundle.yaml":
+                raise agentctl.BundleError("synthetic second render failure")
+            return original_render_agent(agent_dir, environment, output)
+
+        self.kubectl.calls = []
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(agentctl.subprocess, "run", self.kubectl), \
+                mock.patch.object(agentctl, "http_get_json", self._http_get), \
+                mock.patch.object(agentctl, "render_agent", fail_on_second_shared_render), \
+                mock.patch.object(agentctl, "_controller_allowlist_probe_name_suffix", return_value=self.probe_suffix), \
+                mock.patch.object(agentctl.time, "sleep"), redirect_stdout(out), redirect_stderr(err):
+            code = agentctl.main_eval(self.argv(REFUSAL_DENIAL_CASE_ID, self.root / "refuses-task.json"))
+        self.assertEqual(code, 1)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("eval failed: render: synthetic second render failure", err.getvalue())
+        self.assertFalse(denial_path.exists())
+        self.assertFalse(report_path.exists())
+        self.assertTrue(delegate_path.is_file())
+        self.assertTrue(self._receipt_file(REFUSAL_DENIAL_CASE_ID, other_digest).is_file())
+        self.assertTrue(self._receipt_file(REFUSAL_REPORT_CASE_ID, other_digest).is_file())
+        self.assertNotEqual((evidence_dir / "hello-bundle.yaml").read_text(encoding="utf-8"), stale_hello_bundle)
+        self.assertEqual((evidence_dir / "bundle.yaml").read_text(encoding="utf-8"), stale_bundle)
+        self.assertNotIn("apply", self.kubectl.verbs())
+        self.assertNotIn("create", self.kubectl.verbs())
+        self.assertNotIn("delete", self.kubectl.verbs())
+        self._assert_required_composed_cases_missing(REFUSAL_DENIAL_CASE_ID, REFUSAL_REPORT_CASE_ID)
+
+    def test_live_same_digest_refusal_rerun_journal_failure_leaves_required_receipts_missing(self):
+        refusal = ("The agent 'not-allowed-agent' was refused because it is not in the list of allowed agents. "
+                   "The task has been reported as refused due to this restriction.")
+        self._configure_passing_required_refusal_cases()
+        self.seed_refusal_evidence()
+        self._set_refusal_result_evidence(refusal)
+        self.assertEqual(agentctl.verify_agent(self.coordinator, "trial"), [])
+        bundle_digest = self.denial_receipt()["bundle_digest"]
+        denial_path = self._receipt_file(REFUSAL_DENIAL_CASE_ID, bundle_digest)
+        report_path = self._receipt_file(REFUSAL_REPORT_CASE_ID, bundle_digest)
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(agentctl.subprocess, "run", self.kubectl), \
+                mock.patch.object(agentctl, "http_get_json", self._http_get), \
+                mock.patch.object(agentctl, "page_journal", side_effect=agentctl.HttpError("synthetic journal failure")), \
+                mock.patch.object(agentctl, "_controller_allowlist_probe_name_suffix", return_value=self.probe_suffix), \
+                mock.patch.object(agentctl.time, "sleep"), redirect_stdout(out), redirect_stderr(err):
+            code = agentctl.main_eval(self.argv(REFUSAL_DENIAL_CASE_ID, self.root / "refuses-task.json"))
+        self.assertEqual(code, 1)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("eval failed: could not retrieve the complete event journal", err.getvalue())
+        self.assertFalse(denial_path.exists())
+        self.assertFalse(report_path.exists())
+        self._assert_required_composed_cases_missing(REFUSAL_DENIAL_CASE_ID, REFUSAL_REPORT_CASE_ID)
+
+    def test_live_same_digest_refusal_rerun_receipt_write_failure_leaves_required_receipts_missing(self):
+        refusal = ("The agent 'not-allowed-agent' was refused because it is not in the list of allowed agents. "
+                   "The task has been reported as refused due to this restriction.")
+        self._configure_passing_required_refusal_cases()
+        self.seed_refusal_evidence()
+        self._set_refusal_result_evidence(refusal)
+        self.assertEqual(agentctl.verify_agent(self.coordinator, "trial"), [])
+        bundle_digest = self.denial_receipt()["bundle_digest"]
+        denial_path = self._receipt_file(REFUSAL_DENIAL_CASE_ID, bundle_digest)
+        report_path = self._receipt_file(REFUSAL_REPORT_CASE_ID, bundle_digest)
+        original_write_json = agentctl._write_json
+
+        def fail_on_receipt(path, data):
+            if Path(path) == denial_path:
+                raise agentctl.CliError("synthetic refusal receipt write failure")
+            return original_write_json(path, data)
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(agentctl.subprocess, "run", self.kubectl), \
+                mock.patch.object(agentctl, "http_get_json", self._http_get), \
+                mock.patch.object(agentctl, "_write_json", fail_on_receipt), \
+                mock.patch.object(agentctl, "_controller_allowlist_probe_name_suffix", return_value=self.probe_suffix), \
+                mock.patch.object(agentctl.time, "sleep"), redirect_stdout(out), redirect_stderr(err):
+            code = agentctl.main_eval(self.argv(REFUSAL_DENIAL_CASE_ID, self.root / "refuses-task.json"))
+        self.assertEqual(code, 1)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("eval failed: synthetic refusal receipt write failure", err.getvalue())
+        self.assertFalse(denial_path.exists())
+        self.assertFalse(report_path.exists())
+        self._assert_required_composed_cases_missing(REFUSAL_DENIAL_CASE_ID, REFUSAL_REPORT_CASE_ID)
+
     def test_reuse_evidence_rescores_without_cluster_side_effects_and_preserves_probe_hashes(self):
         first_summary = self.seed_refusal_evidence()
         raw_hashes = {
@@ -2216,6 +2346,24 @@ class ComposedEvalCliTestCase(unittest.TestCase):
              for path in sorted(self.evidence.rglob("*")) if path.is_file()},
             raw_hashes,
         )
+
+    def test_reuse_evidence_receipt_write_failure_preserves_existing_receipts(self):
+        self.seed_refusal_evidence()
+        denial_path = self.receipt_path(REFUSAL_DENIAL_CASE_ID)
+        original_write_json = agentctl._write_json
+
+        def fail_on_receipt(path, data):
+            if Path(path) == denial_path:
+                raise agentctl.CliError("synthetic refusal receipt write failure")
+            return original_write_json(path, data)
+
+        with mock.patch.object(agentctl, "_write_json", fail_on_receipt):
+            self._assert_reuse_failure_preserves_bytes(
+                self.reuse_eval_argv(),
+                "eval failed: synthetic refusal receipt write failure",
+            )
+        self.assertTrue(denial_path.is_file())
+        self.assertTrue(self.receipt_path(REFUSAL_REPORT_CASE_ID).is_file())
 
     def test_reuse_only_migrates_the_exact_legacy_current_live_receipt_shape(self):
         cases = (

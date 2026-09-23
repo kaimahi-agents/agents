@@ -1280,8 +1280,26 @@ def _controller_allowlist_probe_evidence_digests(evidence_dir) -> list[str] | No
         digests.append(sha256_hex(path.read_bytes()))
     return digests
 
+
+def _evaluation_receipt_path(agent_dir, bundle_digest: str, case_id: str) -> Path:
+    return Path(agent_dir) / "eval" / "receipts" / bundle_digest / f"{case_id}.json"
+
+
+def _invalidate_live_composed_receipts(agent_dir, bundle_digest: str, case_id: str) -> None:
+    for bound_case_id in _paired_composed_receipt_case_ids(case_id):
+        receipt_path = _evaluation_receipt_path(agent_dir, bundle_digest, bound_case_id)
+        if not receipt_path.exists():
+            continue
+        if not receipt_path.is_file():
+            raise CliError("could not invalidate current live evaluation receipts")
+        try:
+            receipt_path.unlink()
+        except OSError as exc:
+            raise CliError("could not invalidate current live evaluation receipts") from exc
+
+
 def _load_existing_live_evaluation_receipt(agent_dir, bundle_digest: str, case_id: str) -> dict | None:
-    receipt_path = Path(agent_dir) / "eval" / "receipts" / bundle_digest / f"{case_id}.json"
+    receipt_path = _evaluation_receipt_path(agent_dir, bundle_digest, case_id)
     if not receipt_path.is_file():
         return None
     receipt = _read_json(receipt_path, "existing evaluation receipt")
@@ -1301,7 +1319,7 @@ def _legacy_composed_reuse_anchor_key_sets(case_id: str) -> set[frozenset[str]]:
 
 def _load_existing_live_reuse_anchor_receipt(agent_dir, bundle_digest: str, case_id: str,
                                              expected_dependency_digests: dict[str, str]) -> dict | None:
-    receipt_path = Path(agent_dir) / "eval" / "receipts" / bundle_digest / f"{case_id}.json"
+    receipt_path = _evaluation_receipt_path(agent_dir, bundle_digest, case_id)
     if not receipt_path.is_file():
         return None
     receipt = _read_json(receipt_path, "existing evaluation receipt")
@@ -3211,6 +3229,13 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict]
     if not isinstance(annotations, dict) or annotations.get(_DISABLE_COORDINATION_TOOL_INJECTION) != "true":
         raise CliError("Task manifest must set orka.ai/disable-coordination-tool-injection to 'true'")
     _require_task_inventory_clear(args.context, args.kubeconfig)
+    preserved_observation, preserved_probe_evidence_sha256 = ((None, []) if args.case_id not in COMPOSED_REFUSAL_CASE_IDS
+                                                              else _load_preserved_controller_allowlist_observation(
+                                                                  args.agent_dir,
+                                                                  preflight_render_context["bundle_digest"],
+                                                                  args.case_id,
+                                                                  evidence_dir))
+    _invalidate_live_composed_receipts(args.agent_dir, preflight_render_context["bundle_digest"], args.case_id)
     render_context = _prepare_composed_render_context(args, evidence_dir=evidence_dir)
 
     def apply_bundle(path: Path) -> None:
@@ -3293,8 +3318,7 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict]
                 refusal_parent_task=terminal_task)
             probe_evidence_sha256 = _controller_allowlist_probe_evidence_digests(evidence_dir) or []
         else:
-            observation, probe_evidence_sha256 = _load_preserved_controller_allowlist_observation(
-                args.agent_dir, render_context["bundle_digest"], args.case_id, evidence_dir)
+            observation, probe_evidence_sha256 = preserved_observation, preserved_probe_evidence_sha256
     summaries, receipts = _score_composed_coordination_receipts(
         args, case_bindings, render_context=render_context, task_manifest=task_manifest,
         terminal_task=terminal_task, events=events, latest_seq=latest_seq, records=records,
