@@ -1668,42 +1668,56 @@ def count_tool_calls(events) -> tuple[int, int]:
     redacted_seqs = set(find_redacted_sequences(events))
     return len(identity_seqs), sum(1 for seqs in identity_seqs.values() if seqs & redacted_seqs)
 
-def _event_token_count(holders, key: str) -> tuple[int, bool, bool]:
-    values = [holder.get(key) for holder in holders if isinstance(holder, dict) and key in holder]
-    if not values:
-        return 0, False, False
-    if not all(_is_count(value) for value in values) or len(set(values)) != 1:
-        return 0, True, True
-    return values[0], True, False
+def _complete_model_request_token_pair(event) -> tuple[tuple[int, int] | None, bool]:
+    if not isinstance(event, dict) or event.get("type") != "ModelRequestCompleted":
+        return None, False
+    holders = [event, event.get("content") if isinstance(event.get("content"), dict) else None]
+    pairs = []
+    saw_usage_field = False
+    for holder in holders:
+        if not isinstance(holder, dict):
+            continue
+        has_input, has_output = "inputTokens" in holder, "outputTokens" in holder
+        if not (has_input or has_output):
+            continue
+        saw_usage_field = True
+        if not (has_input and has_output):
+            return None, True
+        input_tokens, output_tokens = holder.get("inputTokens"), holder.get("outputTokens")
+        if not (_is_count(input_tokens) and _is_count(output_tokens)):
+            return None, True
+        pairs.append((input_tokens, output_tokens))
+    if not saw_usage_field:
+        return None, True
+    if len(set(pairs)) != 1:
+        return None, True
+    return pairs[0], False
 
 
 def summarize_parent_token_usage(events) -> tuple[dict[str, int] | None, bool]:
-    """Sum non-redacted parent token counts by unique seq; None means usage was not established."""
+    """Sum non-redacted parent ModelRequestCompleted token pairs by unique seq; None means usage was not established."""
     totals = {"input": 0, "output": 0, "total": 0}
     seen = set()
     redacted = set(find_redacted_sequences(events))
-    saw_input, saw_output = False, False
+    established = False
     for event in events:
         seq = event_sequence_number(event)
-        if seq is None or seq in seen or seq in redacted:
+        if seq is None or seq in seen:
             continue
         seen.add(seq)
-        if not isinstance(event, dict):
+        if not isinstance(event, dict) or event.get("type") != "ModelRequestCompleted":
             continue
-        holders = (event, event.get("content") if isinstance(event.get("content"), dict) else None)
-        input_tokens, has_input, input_invalid = _event_token_count(holders, "inputTokens")
-        output_tokens, has_output, output_invalid = _event_token_count(holders, "outputTokens")
-        if not has_input and not has_output:
-            continue
-        if input_invalid or output_invalid:
+        if seq in redacted:
             return None, False
-        if has_input:
-            saw_input = True
-            totals["input"] += input_tokens
-        if has_output:
-            saw_output = True
-            totals["output"] += output_tokens
-    if not (saw_input and saw_output):
+        pair, invalid = _complete_model_request_token_pair(event)
+        if invalid:
+            return None, False
+        if pair is None:
+            continue
+        established = True
+        totals["input"] += pair[0]
+        totals["output"] += pair[1]
+    if not established:
         return None, False
     totals["total"] = totals["input"] + totals["output"]
     return totals, True

@@ -516,20 +516,17 @@ class PolicyMechanicsTestCase(unittest.TestCase):
     def test_the_real_pr3_replay_reduces_to_two_distinct_tool_calls_both_redacted(self):
         self.assertEqual(agentctl.count_tool_calls(PR3_REPLAY_EVENTS), (2, 2))
 
-    def test_parent_token_usage_sums_only_when_both_sides_are_established(self):
+    def test_parent_token_usage_sums_only_complete_model_request_completed_pairs(self):
         events = [
-            {"seq": 1, "type": "ModelUsageUpdated", "inputTokens": 5},
-            {"seq": 1, "type": "ModelUsageUpdated", "inputTokens": 99, "outputTokens": 99},
-            {"seq": 2, "type": "ModelUsageUpdated", "outputTokens": 7},
-            {"seq": 3, "type": "ModelUsageUpdated", "inputTokens": 0, "outputTokens": 0,
-             "contentOmitted": "policy"},
-            {"seq": 4, "type": "ModelRequestCompleted", "content": {"inputTokens": 11}},
-            {"seq": 5, "type": "ModelRequestCompleted", "content": {"outputTokens": 13}},
+            {"seq": 1, "type": "ModelRequestCompleted", "inputTokens": 5, "outputTokens": 7},
+            {"seq": 1, "type": "ModelRequestCompleted", "inputTokens": 99, "outputTokens": 99},
+            {"seq": 2, "type": "ModelUsageUpdated", "inputTokens": 100, "outputTokens": 100},
+            {"seq": 3, "type": "ModelRequestCompleted", "content": {"inputTokens": 11, "outputTokens": 13}},
         ]
         self.assertEqual(agentctl.summarize_parent_token_usage(events),
                          ({"input": 16, "output": 20, "total": 36}, True))
 
-    def test_parent_token_usage_distinguishes_valid_zero_from_missing_partial_or_malformed_usage(self):
+    def test_parent_token_usage_distinguishes_valid_zero_from_missing_partial_wrong_type_or_malformed_usage(self):
         self.assertEqual(
             agentctl.summarize_parent_token_usage(
                 [{"seq": 1, "type": "ModelRequestCompleted", "inputTokens": 0, "outputTokens": 0}]),
@@ -537,10 +534,13 @@ class PolicyMechanicsTestCase(unittest.TestCase):
         )
         for events in (
                 [{"seq": 1, "type": "ModelMessage", "contentText": "no usage"}],
-                [{"seq": 1, "type": "ModelUsageUpdated", "inputTokens": 1}],
-                [{"seq": 1, "type": "ModelUsageUpdated", "outputTokens": 1, "contentOmitted": "policy"}],
+                [{"seq": 1, "type": "ModelUsageUpdated", "inputTokens": 1, "outputTokens": 1}],
+                [{"seq": 1, "type": "ModelRequestCompleted", "inputTokens": 1},
+                 {"seq": 2, "type": "ModelRequestCompleted", "outputTokens": 1}],
+                [{"seq": 1, "type": "ModelRequestCompleted", "inputTokens": 1, "outputTokens": 1,
+                  "contentOmitted": "policy"}],
                 [{"seq": 1, "type": "ModelRequestCompleted", "inputTokens": -1, "outputTokens": 1}],
-                [{"seq": 1, "type": "ModelUsageUpdated", "content": {"inputTokens": "bad", "outputTokens": 1}}],
+                [{"seq": 1, "type": "ModelRequestCompleted", "content": {"inputTokens": "bad", "outputTokens": 1}}],
         ):
             with self.subTest(events=events):
                 self.assertEqual(agentctl.summarize_parent_token_usage(events), (None, False))
@@ -1407,8 +1407,8 @@ class ComposedEvalCliTestCase(unittest.TestCase):
              "tool": {"name": "wait_for_tasks", "arguments": {"tasks": [self.child_task["metadata"]["name"]]}}},
             {"seq": 4, "type": "ToolCallCompleted", "toolCallID": "call-2", "toolName": "wait_for_tasks",
              "contentText": "done"},
-            {"seq": 5, "type": "ModelUsageUpdated", "inputTokens": 12},
-            {"seq": 6, "type": "ModelRequestCompleted", "outputTokens": 5},
+            {"seq": 5, "type": "ModelUsageUpdated", "inputTokens": 12, "outputTokens": 99},
+            {"seq": 6, "type": "ModelRequestCompleted", "inputTokens": 12, "outputTokens": 5},
             {"seq": 7, "type": "ModelMessage", "contentText": FIXED_PHRASE},
         ]
         self._set_delegate_result_evidence(events)
@@ -1425,8 +1425,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
     def test_azure_delegate_usage_allows_a_valid_zero_event(self):
         self._switch_coordinator_to_azure()
         self._set_delegate_result_evidence(self._delegate_events_with_usage(
-            {"type": "ModelUsageUpdated", "inputTokens": 0},
-            {"type": "ModelRequestCompleted", "outputTokens": 0}))
+            {"type": "ModelRequestCompleted", "inputTokens": 0, "outputTokens": 0}))
         summary = self.run_eval(
             "delegates", self.root / "delegates-task.json", **{"--model": AZURE_DEPLOYMENT})
         receipt = self.receipt("delegates")
@@ -1436,12 +1435,13 @@ class ComposedEvalCliTestCase(unittest.TestCase):
     def test_azure_delegate_requires_established_non_redacted_token_usage_to_pass(self):
         cases = (
             ("missing", self._delegate_events(), "fail"),
-            ("partial-input-only", self._delegate_events_with_usage(
-                {"type": "ModelUsageUpdated", "inputTokens": 1}), "fail"),
-            ("partial-output-only", self._delegate_events_with_usage(
+            ("wrong-type", self._delegate_events_with_usage(
+                {"type": "ModelUsageUpdated", "inputTokens": 1, "outputTokens": 1}), "fail"),
+            ("partial-across-two-events", self._delegate_events_with_usage(
+                {"type": "ModelRequestCompleted", "inputTokens": 1},
                 {"type": "ModelRequestCompleted", "outputTokens": 1}), "fail"),
             ("all-redacted", self._delegate_events_with_usage(
-                {"type": "ModelUsageUpdated", "inputTokens": 1, "outputTokens": 1,
+                {"type": "ModelRequestCompleted", "inputTokens": 1, "outputTokens": 1,
                  "contentOmitted": "policy"}), "fail"),
             ("malformed", self._delegate_events_with_usage(
                 {"type": "ModelRequestCompleted", "inputTokens": 1, "outputTokens": -1}), "fail"),
@@ -2788,11 +2788,15 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         cases = (
             ("missing", self._delegate_events(),
              "eval failed: existing evidence journal-events.json does not prove authenticated parent token usage for the original live receipt"),
-            ("partial", self._delegate_events_with_usage(
-                {"type": "ModelUsageUpdated", "inputTokens": 1}),
+            ("wrong-type", self._delegate_events_with_usage(
+                {"type": "ModelUsageUpdated", "inputTokens": 1, "outputTokens": 1}),
+             "eval failed: existing evidence journal-events.json does not prove authenticated parent token usage for the original live receipt"),
+            ("partial-across-two-events", self._delegate_events_with_usage(
+                {"type": "ModelRequestCompleted", "inputTokens": 1},
+                {"type": "ModelRequestCompleted", "outputTokens": 1}),
              "eval failed: existing evidence journal-events.json does not prove authenticated parent token usage for the original live receipt"),
             ("all-redacted", self._delegate_events_with_usage(
-                {"type": "ModelUsageUpdated", "inputTokens": 1, "outputTokens": 1, "contentOmitted": "policy"}),
+                {"type": "ModelRequestCompleted", "inputTokens": 1, "outputTokens": 1, "contentOmitted": "policy"}),
              "eval failed: existing evidence journal-events.json does not prove authenticated parent token usage for the original live receipt"),
             ("malformed", self._delegate_events_with_usage(
                 {"type": "ModelRequestCompleted", "inputTokens": 1, "outputTokens": -1}),
