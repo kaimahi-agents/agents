@@ -8,9 +8,11 @@ JSON handling, guards and receipt building.
 import copy
 import io
 import json
+import multiprocessing
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -37,8 +39,31 @@ CASE_ID = "demo-case"
 RUNTIME_IMAGE = "registry.example.com/agent@" + RUNTIME_DIGEST
 # A Task spec that independently proves read-only, forbidden-action-free authority: read intent,
 # no createPR, no credential/publication request key, and an allowed-tools list inside the safe five.
-READ_ONLY_SPEC = {"maxRetries": 0, "workspace": {"intent": "read"},
-                 "agentRuntime": {"allowedTools": ["Read", "Bash", "Glob", "Grep"]}}
+READ_ONLY_SPEC = {"maxRetries": 0, "workspace": {"intent": "read"}, "createPR": False,
+                  "agentRuntime": {"allowedTools": ["Read", "Bash", "Glob", "Grep"]}}
+
+
+def _reserve_campaign_entry_in_process(root: Path, case_id: str, start_event, load_barrier, results) -> None:
+    target_name = ("_load_campaign_ledger_unlocked"
+                   if hasattr(agentctl, "_load_campaign_ledger_unlocked") else "_load_campaign_ledger")
+    original = getattr(agentctl, target_name)
+
+    def coordinated_load(evidence_root):
+        ledger = original(evidence_root)
+        try:
+            load_barrier.wait(timeout=2.0)
+        except threading.BrokenBarrierError:
+            pass
+        return ledger
+
+    try:
+        if not start_event.wait(timeout=5.0):
+            raise RuntimeError("test start barrier timed out")
+        with mock.patch.object(agentctl, target_name, coordinated_load):
+            entry = agentctl.reserve_campaign_entry(root, case_id, parent_count=1, child_count=0, probe_count=0)
+        results.put({"case": case_id, "status": "ok", "entry": entry})
+    except Exception as exc:
+        results.put({"case": case_id, "status": "err", "type": type(exc).__name__, "message": str(exc)})
 # Replays the real run this policy formalizes (PR 3): two distinct tool calls (by `toolCallID`,
 # deduplicated across Started/Completed), both redacted at their Started event, and one visible
 # final report. This is the shape `count_tool_calls` must reduce to (2, 2), never (4, 4).
@@ -265,6 +290,47 @@ class EvaluationMechanicsTestCase(unittest.TestCase):
             second = agentctl.reserve_campaign_entry(root, "delegates", parent_count=1, child_count=1, probe_count=0)
             self.assertEqual(second["attempt"], 2)
             self.assertEqual(second["cumulative_total"], 4)
+
+    def test_campaign_ledger_reservations_are_interprocess_serialized_near_cap(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            write_json(root / "campaign-ledger.json", {"entries": [{
+                "case": "seed", "attempt": 1, "parent_count": 9, "child_count": 0,
+                "probe_count": 0, "cumulative_total": 9,
+            }]})
+            ctx = multiprocessing.get_context("fork")
+            start_event = ctx.Event()
+            load_barrier = ctx.Barrier(2)
+            results = ctx.Queue()
+            cases = ("delegates", "refuses-unlisted")
+            processes = [ctx.Process(target=_reserve_campaign_entry_in_process,
+                                     args=(root, case_id, start_event, load_barrier, results))
+                         for case_id in cases]
+            for process in processes:
+                process.start()
+            start_event.set()
+            observed = [results.get(timeout=10.0) for _ in processes]
+            for process in processes:
+                process.join(timeout=10.0)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=10.0)
+            self.assertTrue(all(process.exitcode == 0 for process in processes))
+            successes = [result for result in observed if result["status"] == "ok"]
+            failures = [result for result in observed if result["status"] == "err"]
+            self.assertEqual(len(successes), 1)
+            self.assertEqual(len(failures), 1)
+            self.assertEqual(failures[0]["type"], "CliError")
+            self.assertIn("ten-Task campaign cap", failures[0]["message"])
+            ledger = json.loads((root / "campaign-ledger.json").read_text(encoding="utf-8"))
+            self.assertEqual(ledger, {"entries": [
+                {"case": "seed", "attempt": 1, "parent_count": 9, "child_count": 0,
+                 "probe_count": 0, "cumulative_total": 9},
+                successes[0]["entry"],
+            ]})
+            self.assertEqual(ledger["entries"][-1]["attempt"], 1)
+            self.assertEqual(ledger["entries"][-1]["cumulative_total"], 10)
+            self.assertIn(ledger["entries"][-1]["case"], cases)
 
     def test_campaign_ledger_fails_closed_on_malformed_content_and_above_ten(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

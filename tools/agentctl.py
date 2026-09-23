@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import copy
 import datetime
+import fcntl
 import hashlib
 import ipaddress
 import json
@@ -20,6 +21,7 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1108,6 +1110,7 @@ def count_provider_requests_in_window(records, window_start, window_end, *, key:
             raise CliError(f"provider record is missing required {key!r} field")
     return sum(1 for record in records if window_start <= parse_timestamp(record[key]) <= window_end)
 _CAMPAIGN_LEDGER_FILE = "campaign-ledger.json"
+_CAMPAIGN_LEDGER_LOCK_FILE = "campaign-ledger.lock"
 _CAMPAIGN_LEDGER_KEYS = frozenset({"entries"})
 _CAMPAIGN_LEDGER_ENTRY_REQUIRED_KEYS = frozenset({"case", "attempt", "parent_count", "child_count", "probe_count",
                                                   "cumulative_total"})
@@ -1117,6 +1120,26 @@ _MAX_CAMPAIGN_TASKS = 10
 
 def _campaign_ledger_path(evidence_root) -> Path:
     return Path(evidence_root) / _CAMPAIGN_LEDGER_FILE
+
+
+def _campaign_ledger_lock_path(evidence_root) -> Path:
+    return Path(evidence_root) / _CAMPAIGN_LEDGER_LOCK_FILE
+
+
+@contextmanager
+def _campaign_ledger_mutation_lock(evidence_root):
+    path = _campaign_ledger_lock_path(evidence_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with path.open("a+b") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError as exc:
+        raise CliError("could not lock campaign ledger") from exc
+
 
 def _campaign_entry_total(entry) -> int:
     return entry["parent_count"] + entry["child_count"] + entry["probe_count"]
@@ -1169,13 +1192,18 @@ def _write_json_atomic(path: Path, data) -> None:
         temp_name = handle.name
     os.replace(temp_name, path)
 
-def _load_campaign_ledger(evidence_root) -> dict:
+def _load_campaign_ledger_unlocked(evidence_root) -> dict:
     path = _campaign_ledger_path(evidence_root)
     if not path.exists():
         return {"entries": []}
     ledger = _read_json(path, _CAMPAIGN_LEDGER_FILE)
     _require(_validate_campaign_ledger(ledger))
     return ledger
+
+
+def _load_campaign_ledger(evidence_root) -> dict:
+    return _load_campaign_ledger_unlocked(evidence_root)
+
 
 def reserve_campaign_entry(evidence_root, case_id: str, *, parent_count: int, child_count: int, probe_count: int) -> dict:
     """Reserve projected campaign consumption before submission, failing closed above the hard cap."""
@@ -1184,15 +1212,16 @@ def reserve_campaign_entry(evidence_root, case_id: str, *, parent_count: int, ch
     counts = {"parent_count": parent_count, "child_count": child_count, "probe_count": probe_count}
     if not all(_is_count(value) for value in counts.values()):
         raise CliError("campaign ledger counts must be non-negative integers")
-    ledger = _load_campaign_ledger(evidence_root)
-    attempt = 1 + max((entry["attempt"] for entry in ledger["entries"] if entry["case"] == case_id), default=0)
-    cumulative = (ledger["entries"][-1]["cumulative_total"] if ledger["entries"] else 0) + sum(counts.values())
-    if cumulative > _MAX_CAMPAIGN_TASKS:
-        raise CliError("campaign ledger would exceed the ten-Task campaign cap")
-    entry = {"case": case_id, "attempt": attempt, **counts, "cumulative_total": cumulative}
-    ledger["entries"].append(entry)
-    _write_json_atomic(_campaign_ledger_path(evidence_root), ledger)
-    return entry
+    with _campaign_ledger_mutation_lock(evidence_root):
+        ledger = _load_campaign_ledger_unlocked(evidence_root)
+        attempt = 1 + max((entry["attempt"] for entry in ledger["entries"] if entry["case"] == case_id), default=0)
+        cumulative = (ledger["entries"][-1]["cumulative_total"] if ledger["entries"] else 0) + sum(counts.values())
+        if cumulative > _MAX_CAMPAIGN_TASKS:
+            raise CliError("campaign ledger would exceed the ten-Task campaign cap")
+        entry = {"case": case_id, "attempt": attempt, **counts, "cumulative_total": cumulative}
+        ledger["entries"].append(entry)
+        _write_json_atomic(_campaign_ledger_path(evidence_root), ledger)
+        return entry
 
 def reconcile_campaign_entry(evidence_root, case_id: str, attempt: int, *, parent_count: int, child_count: int,
                              probe_count: int) -> dict:
@@ -1204,25 +1233,26 @@ def reconcile_campaign_entry(evidence_root, case_id: str, attempt: int, *, paren
         raise CliError("campaign ledger attempt must be a positive integer")
     if not all(_is_count(value) for value in counts.values()):
         raise CliError("campaign ledger counts must be non-negative integers")
-    ledger = _load_campaign_ledger(evidence_root)
-    matched, cumulative = False, 0
-    for entry in ledger["entries"]:
-        if entry["case"] == case_id and entry["attempt"] == attempt:
-            if _campaign_entry_total(counts) > _campaign_entry_total(entry):
-                entry.update(counts)
-            entry["actual_child_count"] = child_count
-            matched = True
-        cumulative += _campaign_entry_total(entry)
-        entry["cumulative_total"] = cumulative
-    if not matched:
-        raise CliError("campaign ledger entry was not found for reconciliation")
-    validation_errors = _validate_campaign_ledger(ledger)
-    cap_error = "campaign ledger exceeds the ten-Task campaign cap"
-    _require([error for error in validation_errors if error != cap_error])
-    _write_json_atomic(_campaign_ledger_path(evidence_root), ledger)
-    if cap_error in validation_errors:
-        raise CliError(cap_error)
-    return next(entry for entry in ledger["entries"] if entry["case"] == case_id and entry["attempt"] == attempt)
+    with _campaign_ledger_mutation_lock(evidence_root):
+        ledger = _load_campaign_ledger_unlocked(evidence_root)
+        matched, cumulative = False, 0
+        for entry in ledger["entries"]:
+            if entry["case"] == case_id and entry["attempt"] == attempt:
+                if _campaign_entry_total(counts) > _campaign_entry_total(entry):
+                    entry.update(counts)
+                entry["actual_child_count"] = child_count
+                matched = True
+            cumulative += _campaign_entry_total(entry)
+            entry["cumulative_total"] = cumulative
+        if not matched:
+            raise CliError("campaign ledger entry was not found for reconciliation")
+        validation_errors = _validate_campaign_ledger(ledger)
+        cap_error = "campaign ledger exceeds the ten-Task campaign cap"
+        _require([error for error in validation_errors if error != cap_error])
+        _write_json_atomic(_campaign_ledger_path(evidence_root), ledger)
+        if cap_error in validation_errors:
+            raise CliError(cap_error)
+        return next(entry for entry in ledger["entries"] if entry["case"] == case_id and entry["attempt"] == attempt)
 
 def campaign_case_reserved(evidence_root, case_id: str) -> bool:
     if not is_safe_slug(case_id):
