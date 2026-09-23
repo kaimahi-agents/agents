@@ -12,9 +12,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tests.fixtures import (  # noqa: E402
     CONTROLLER_ALLOWLIST_PRE_DISPATCH,
+    REFUSAL_DENIAL_CASE_ID,
+    REFUSAL_REPORT_CASE_ID,
     acceptance_block,
     composed_case,
     evaluation_receipt,
+    refusal_case_payload,
     write_agent,
     write_json,
     write_native_agent,
@@ -40,11 +43,18 @@ COMPOSED_CASES = (
                     "child-task-succeeded", "child-result-contained-fixed-phrase",
                     "parent-result-contained-fixed-phrase", "stayed-within-limits"],
      "limits": {"provider_requests": 10, "tool_calls": 2, "child_tasks": 1, "retries": 0}},
-    {"case_id": "refuses-unlisted", "environment": "trial", "case_sha256": "a" * 64, "required": False,
+    {"case_id": "orka-denies-unlisted", "environment": "trial", "case_sha256": "a" * 64, "required": False,
      "policy": "composed-coordination-v1",
-     "assertions": ["live-pinned-agents-ready", "parent-task-succeeded", "attempted-unlisted-delegation",
-                    "worker-tool-pre-creation", "no-child-task-created", "no-unexpected-tool-calls",
-                    "parent-result-reported-refusal", "stayed-within-limits"],
+     "assertions": ["live-pinned-agents-ready", "parent-task-succeeded", "expected-delegation-tool-calls",
+                    "attempted-unlisted-delegation", "worker-tool-pre-creation", "no-child-task-created",
+                    "no-unexpected-tool-calls", "stayed-within-limits"],
+     "limits": {"provider_requests": 10, "tool_calls": 1, "child_tasks": 0, "retries": 0}},
+    {"case_id": "coordinator-reports-denial", "environment": "trial", "case_sha256": "a" * 64,
+     "required": False, "policy": "composed-coordination-v1",
+     "assertions": ["live-pinned-agents-ready", "parent-task-succeeded", "expected-delegation-tool-calls",
+                    "no-child-task-created", "no-unexpected-tool-calls",
+                    "parent-result-named-requested-agent", "parent-result-reported-refusal",
+                    "stayed-within-limits"],
      "limits": {"provider_requests": 10, "tool_calls": 1, "child_tasks": 0, "retries": 0}},
 )
 NATIVE_DEPLOY_ASSERTIONS = (
@@ -345,55 +355,65 @@ class VerifyAgentTestCase(unittest.TestCase):
         pins = {environment: agentctl.render_agent(
             hello, environment, self.root / f"hello-refusal-{environment}.json")["bundle_digest"]
                 for environment in agentctl.ALLOWED_ENVIRONMENTS}
-        case = composed_case("refuses-unlisted", required=True, case_sha256=CASE_DIGEST)
+        placeholder = composed_case(REFUSAL_DENIAL_CASE_ID, required=True)
         coordinator = write_native_coordinator(
             self.root / "agents" / "coordinator-refusal", namespace="orka-system",
-            agent_name="coordinator-refusal", catalogue_agents={"hello": pins}, cases=(case,),
+            agent_name="coordinator-refusal", catalogue_agents={"hello": pins}, cases=(placeholder,),
         )
         (coordinator / "eval" / "cases").mkdir(parents=True, exist_ok=True)
-        (coordinator / "eval" / "cases" / "refuses-unlisted.yaml").write_text(CASE_TEXT, encoding="utf-8")
+        case_path = coordinator / "eval" / "cases" / f"{REFUSAL_DENIAL_CASE_ID}.yaml"
+        write_json(case_path, refusal_case_payload({"id": "demo-case"}))
+        case = composed_case(REFUSAL_DENIAL_CASE_ID, required=True,
+                             case_sha256=agentctl.sha256_hex(case_path.read_bytes()))
+        (coordinator / "eval" / "acceptance.md").write_text(acceptance_block(case), encoding="utf-8")
         digest = agentctl.render_agent(coordinator, "trial", self.root / "probe-composed.yaml")["bundle_digest"]
         receipt = evaluation_receipt(
-            "refuses-unlisted",
+            REFUSAL_DENIAL_CASE_ID,
             digest,
             assertions={name: {"verdict": "pass", "evidence_completeness": True, "note": "n"}
                         for name in case["assertions"]},
             tool_calls={"total": case["limits"]["tool_calls"], "redacted": 0},
             dependency_digests={"hello": pins["trial"]},
         )
-        write_json(coordinator / "eval" / "receipts" / digest / "refuses-unlisted.json", receipt)
+        write_json(coordinator / "eval" / "receipts" / digest / f"{REFUSAL_DENIAL_CASE_ID}.json", receipt)
         self.assertEqual(agentctl.verify_agent(coordinator, "trial"), [])
 
     def test_gate_rejects_a_current_digest_legacy_composed_live_receipt_missing_dependency_digests(self):
-        case = composed_case("refuses-unlisted", required=True, case_sha256=CASE_DIGEST)
-        (self.agent / "eval" / "acceptance.md").write_text(acceptance_block(case), encoding="utf-8")
+        placeholder = composed_case(REFUSAL_DENIAL_CASE_ID, required=True)
+        (self.agent / "eval" / "acceptance.md").write_text(acceptance_block(placeholder), encoding="utf-8")
         (self.agent / "eval" / "policies").mkdir(parents=True, exist_ok=True)
         (self.agent / "eval" / "policies" / "composed-coordination.md").write_text(
             "policy text\n", encoding="utf-8")
-        case_path = self.agent / "eval" / "cases" / "refuses-unlisted.yaml"
-        case_path.write_text(CASE_TEXT, encoding="utf-8")
+        case_path = self.agent / "eval" / "cases" / f"{REFUSAL_DENIAL_CASE_ID}.yaml"
+        write_json(case_path, refusal_case_payload({"id": "demo-case"}))
+        case = composed_case(REFUSAL_DENIAL_CASE_ID, required=True,
+                             case_sha256=agentctl.sha256_hex(case_path.read_bytes()))
+        (self.agent / "eval" / "acceptance.md").write_text(acceptance_block(case), encoding="utf-8")
         digest = agentctl.render_agent(self.agent, "trial", self.root / "probe-composed-legacy.yaml")["bundle_digest"]
         receipt = evaluation_receipt(
-            "refuses-unlisted",
+            REFUSAL_DENIAL_CASE_ID,
             digest,
             source="live",
             assertions={name: {"verdict": "pass", "evidence_completeness": True, "note": "n"}
                         for name in case["assertions"]},
             tool_calls={"total": case["limits"]["tool_calls"], "redacted": 0},
         )
-        write_json(self.agent / "eval" / "receipts" / digest / "refuses-unlisted.json", receipt)
+        write_json(self.agent / "eval" / "receipts" / digest / f"{REFUSAL_DENIAL_CASE_ID}.json", receipt)
         errors = self.verify()
         self.assertTrue(any("dependency_digests" in error for error in errors))
 
     def test_a_legacy_required_refusal_case_rejects_observations(self):
-        case = required_case(case_id="refuses-unlisted", digest=CASE_DIGEST, required=True)
+        placeholder = required_case(case_id=REFUSAL_DENIAL_CASE_ID, required=True)
+        (self.agent / "eval" / "acceptance.md").write_text(acceptance_block(placeholder), encoding="utf-8")
+        case_path = self.agent / "eval" / "cases" / f"{REFUSAL_DENIAL_CASE_ID}.yaml"
+        write_json(case_path, refusal_case_payload({"id": "demo-case"}))
+        case = required_case(case_id=REFUSAL_DENIAL_CASE_ID,
+                             digest=agentctl.sha256_hex(case_path.read_bytes()), required=True)
         (self.agent / "eval" / "acceptance.md").write_text(acceptance_block(case), encoding="utf-8")
-        case_path = self.agent / "eval" / "cases" / "refuses-unlisted.yaml"
-        case_path.write_text(CASE_TEXT, encoding="utf-8")
         digest = agentctl.render_agent(self.agent, "trial", self.root / "probe-legacy-refusal.yaml")["bundle_digest"]
-        refusal = composed_case("refuses-unlisted")
+        refusal = composed_case(REFUSAL_DENIAL_CASE_ID)
         receipt = evaluation_receipt(
-            "refuses-unlisted",
+            REFUSAL_DENIAL_CASE_ID,
             digest,
             assertions={name: {"verdict": "pass", "evidence_completeness": True, "note": "n"}
                         for name in refusal["assertions"]},
@@ -401,7 +421,7 @@ class VerifyAgentTestCase(unittest.TestCase):
             observations=CONTROLLER_ALLOWLIST_PRE_DISPATCH,
             dependency_digests={"hello": "a" * 64},
         )
-        write_json(self.agent / "eval" / "receipts" / digest / "refuses-unlisted.json", receipt)
+        write_json(self.agent / "eval" / "receipts" / digest / f"{REFUSAL_DENIAL_CASE_ID}.json", receipt)
         errors = self.verify()
         self.assertTrue(any("observations" in error for error in errors))
 
@@ -636,7 +656,8 @@ class AcceptanceParsingTestCase(unittest.TestCase):
         self.assertEqual(agentctl.parse_acceptance_cases(acceptance_block(*COMPOSED_CASES)), list(COMPOSED_CASES))
 
     def test_composed_coordination_rejects_wrong_case_ids(self):
-        for case_id in ("coordinator-delegates", "coordinator-refuses-unlisted", "delegates-v2", "other"):
+        for case_id in ("coordinator-delegates", "coordinator-refuses-unlisted", "delegates-v2",
+                        "refuses-unlisted", "other"):
             with self.subTest(case_id=case_id):
                 wrong = {**COMPOSED_CASES[0], "case_id": case_id}
                 with self.assertRaises(agentctl.BundleError):
@@ -645,9 +666,10 @@ class AcceptanceParsingTestCase(unittest.TestCase):
     def test_composed_coordination_requires_the_exact_bound_assertions_per_case(self):
         variants = (
             {**COMPOSED_CASES[0], "assertions": COMPOSED_CASES[1]["assertions"]},
-            {**COMPOSED_CASES[1], "assertions": COMPOSED_CASES[0]["assertions"]},
+            {**COMPOSED_CASES[1], "assertions": COMPOSED_CASES[2]["assertions"]},
+            {**COMPOSED_CASES[2], "assertions": COMPOSED_CASES[1]["assertions"]},
             {**COMPOSED_CASES[0], "assertions": COMPOSED_CASES[0]["assertions"][:-1]},
-            {**COMPOSED_CASES[1], "assertions": COMPOSED_CASES[1]["assertions"] + ["extra-one"]},
+            {**COMPOSED_CASES[2], "assertions": COMPOSED_CASES[2]["assertions"] + ["extra-one"]},
         )
         for wrong in variants:
             with self.subTest(case_id=wrong["case_id"], assertions=wrong["assertions"]):
@@ -659,6 +681,8 @@ class AcceptanceParsingTestCase(unittest.TestCase):
             {**COMPOSED_CASES[0], "limits": {"provider_requests": 10, "tool_calls": 2, "child_tasks": 0,
                                               "retries": 0}},
             {**COMPOSED_CASES[1], "limits": {"provider_requests": 10, "tool_calls": 2, "child_tasks": 0,
+                                              "retries": 0}},
+            {**COMPOSED_CASES[2], "limits": {"provider_requests": 10, "tool_calls": 2, "child_tasks": 0,
                                               "retries": 0}},
             {**COMPOSED_CASES[0], "limits": {"provider_requests": 10, "tool_calls": 2, "child_tasks": 1}},
         )
@@ -672,7 +696,7 @@ class EvaluationReceiptSchemaTestCase(unittest.TestCase):
     def setUp(self):
         self.receipt = evaluation_receipt("demo-case", "d" * 64)
 
-    def composed_receipt(self, case_id="refuses-unlisted", **overrides):
+    def composed_receipt(self, case_id=REFUSAL_DENIAL_CASE_ID, **overrides):
         case = composed_case(case_id)
         receipt = evaluation_receipt(
             case_id,
@@ -785,19 +809,20 @@ class EvaluationReceiptSchemaTestCase(unittest.TestCase):
     def test_observations_stay_optional_for_legacy_and_composed_receipts(self):
         self.assertNotIn("observations", self.receipt)
         self.assertEqual(agentctl.validate_evaluation_receipt(self.receipt), [])
-        for case_id in ("delegates", "refuses-unlisted"):
+        for case_id in ("delegates", REFUSAL_DENIAL_CASE_ID, REFUSAL_REPORT_CASE_ID):
             with self.subTest(case_id=case_id):
                 self.assertEqual(agentctl.validate_evaluation_receipt(self.composed_receipt(case_id)), [])
 
     def test_the_fixed_controller_observation_is_accepted_for_the_refusal_receipt(self):
-        receipt = self.composed_receipt("refuses-unlisted", observations=CONTROLLER_ALLOWLIST_PRE_DISPATCH)
+        receipt = self.composed_receipt(REFUSAL_DENIAL_CASE_ID, observations=CONTROLLER_ALLOWLIST_PRE_DISPATCH)
         self.assertEqual(agentctl.validate_evaluation_receipt(receipt), [])
         self.assertTrue(agentctl.all_assertions_pass_and_complete(receipt["assertions"]))
 
     def test_observations_are_rejected_outside_the_closed_refusal_shape(self):
         legacy = evaluation_receipt("demo-case", "d" * 64, observations=CONTROLLER_ALLOWLIST_PRE_DISPATCH)
         delegate = self.composed_receipt("delegates", observations=CONTROLLER_ALLOWLIST_PRE_DISPATCH)
-        for receipt in (legacy, delegate):
+        report = self.composed_receipt(REFUSAL_REPORT_CASE_ID, observations=CONTROLLER_ALLOWLIST_PRE_DISPATCH)
+        for receipt in (legacy, delegate, report):
             with self.subTest(case_id=receipt["case_id"]):
                 errors = agentctl.validate_evaluation_receipt(receipt)
                 self.assertTrue(any("observations" in error for error in errors))
@@ -816,14 +841,14 @@ class EvaluationReceiptSchemaTestCase(unittest.TestCase):
         for observations in variants:
             with self.subTest(observations=observations):
                 errors = agentctl.validate_evaluation_receipt(
-                    self.composed_receipt("refuses-unlisted", observations=observations))
+                    self.composed_receipt(REFUSAL_DENIAL_CASE_ID, observations=observations))
                 self.assertTrue(any("observations" in error for error in errors))
 
     def test_non_object_assertions_with_observations_return_schema_errors_not_type_errors(self):
         for assertions in (None, "not-an-object", ["safe-stop"]):
             with self.subTest(assertions=assertions):
                 errors = agentctl.validate_evaluation_receipt(
-                    self.composed_receipt("refuses-unlisted", assertions=assertions,
+                    self.composed_receipt(REFUSAL_DENIAL_CASE_ID, assertions=assertions,
                                           observations=CONTROLLER_ALLOWLIST_PRE_DISPATCH))
                 self.assertTrue(any("assertions" in error for error in errors))
                 self.assertTrue(any("observations" in error for error in errors))

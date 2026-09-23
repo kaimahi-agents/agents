@@ -8,7 +8,13 @@ ROOT = Path(__file__).resolve().parent.parent
 README = ROOT / "README.md"
 VERSIONING_DOC = ROOT / "docs" / "versioning-and-rollback.md"
 AGENTS = ROOT / "agents"
-ALLOWED_STATUSES = {"tested", "tested in simulation", "ran, no tests yet", "tested, ran on real PRs"}
+ALLOWED_STATUSES = {
+    "tested",
+    "tested in simulation",
+    "ran, no tests yet",
+    "tested, ran on real PRs",
+    "tested, trial red on report receipt",
+}
 LINK_RE = re.compile(r"(?<!!)\[[^]]+\]\(([^)]+)\)")
 TOOL_COMMAND_RE = re.compile(r"^\s*(tools/[a-z0-9-]+)\b")
 REPO_PR_RE = re.compile(r"https://github\.com/kaimahi-agents/agents/pull/(2|3|4|7)\b")
@@ -58,7 +64,7 @@ class CatalogueTestCase(unittest.TestCase):
         rows = [line for line in README.read_text(encoding="utf-8").splitlines()
                 if line.startswith("| [coordinator](agents/coordinator/)")]
         self.assertEqual(len(rows), 1)
-        self.assertEqual(catalogue_rows().get("coordinator"), "tested")
+        self.assertEqual(catalogue_rows().get("coordinator"), "tested, trial red on report receipt")
         self.assertTrue((ROOT / "agents" / "coordinator" / "README.md").is_file())
 
     def test_versioning_docs_have_one_pinned_composition_paragraph(self):

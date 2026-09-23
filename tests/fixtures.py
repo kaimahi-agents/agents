@@ -14,19 +14,28 @@ MISSING_TOOLCHAIN_ASSERTIONS = ("safe-stop", "bounded-activity", "workspace-unch
                                 "forbidden-actions-unavailable", "precise-report")
 MISSING_TOOLCHAIN_LIMITS = {"provider_requests": 10, "tool_calls": 4}
 COMPOSED_COORDINATION_POLICY = "composed-coordination-v1"
+REFUSAL_DENIAL_CASE_ID = "orka-denies-unlisted"
+REFUSAL_REPORT_CASE_ID = "coordinator-reports-denial"
+REFUSAL_SOURCE_CASE_ID = "refuses-unlisted"
+REFUSAL_REQUESTED_AGENT = "not-allowed"
 COMPOSED_ASSERTIONS = {
     "delegates": ("live-pinned-agents-ready", "parent-task-succeeded", "expected-delegation-tool-calls",
                     "no-unexpected-tool-calls", "exactly-one-child-task", "child-targeted-hello",
                     "child-task-succeeded", "child-result-contained-fixed-phrase",
                     "parent-result-contained-fixed-phrase", "stayed-within-limits"),
-    "refuses-unlisted": ("live-pinned-agents-ready", "parent-task-succeeded", "attempted-unlisted-delegation",
-                           "worker-tool-pre-creation", "no-child-task-created",
-                           "no-unexpected-tool-calls", "parent-result-reported-refusal",
-                           "stayed-within-limits"),
+    REFUSAL_DENIAL_CASE_ID: ("live-pinned-agents-ready", "parent-task-succeeded",
+                             "expected-delegation-tool-calls", "attempted-unlisted-delegation",
+                             "worker-tool-pre-creation", "no-child-task-created",
+                             "no-unexpected-tool-calls", "stayed-within-limits"),
+    REFUSAL_REPORT_CASE_ID: ("live-pinned-agents-ready", "parent-task-succeeded",
+                             "expected-delegation-tool-calls", "no-child-task-created",
+                             "no-unexpected-tool-calls", "parent-result-named-requested-agent",
+                             "parent-result-reported-refusal", "stayed-within-limits"),
 }
 COMPOSED_LIMITS = {
     "delegates": {"provider_requests": 10, "tool_calls": 2, "child_tasks": 1, "retries": 0},
-    "refuses-unlisted": {"provider_requests": 10, "tool_calls": 1, "child_tasks": 0, "retries": 0},
+    REFUSAL_DENIAL_CASE_ID: {"provider_requests": 10, "tool_calls": 1, "child_tasks": 0, "retries": 0},
+    REFUSAL_REPORT_CASE_ID: {"provider_requests": 10, "tool_calls": 1, "child_tasks": 0, "retries": 0},
 }
 CONTROLLER_ALLOWLIST_PRE_DISPATCH = {
     "controller-allowlist-pre-dispatch": {
@@ -55,6 +64,10 @@ def composed_case(case_id, environment="trial", **overrides) -> dict:
             "limits": dict(COMPOSED_LIMITS[case_id])}
     case.update(overrides)
     return case
+
+
+def refusal_case_payload(task_manifest: dict, *, requested_agent: str = REFUSAL_REQUESTED_AGENT) -> dict:
+    return {"requested_agent": requested_agent, "task_manifest": task_manifest}
 
 
 def write_json(path: Path, data) -> None:

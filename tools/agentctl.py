@@ -266,8 +266,9 @@ def _receipt_requires_dependency_digests(receipt) -> bool:
                 and set(assertions) == set(COMPOSED_ASSERTIONS[case_id]))
 
 def _receipt_allows_observations(receipt) -> bool:
-    return bool(receipt.get("case_id") == "refuses-unlisted" and _receipt_requires_dependency_digests(receipt)
-                and set(receipt.get("assertions", {})) == set(COMPOSED_ASSERTIONS["refuses-unlisted"]))
+    return bool(receipt.get("case_id") == COMPOSED_REFUSAL_DENIAL_CASE_ID
+                and _receipt_requires_dependency_digests(receipt)
+                and set(receipt.get("assertions", {})) == set(COMPOSED_ASSERTIONS[COMPOSED_REFUSAL_DENIAL_CASE_ID]))
 
 def _validate_dependency_digests(receipt, errors: list[str]) -> None:
     dependency_digests = receipt.get("dependency_digests")
@@ -366,20 +367,39 @@ MISSING_TOOLCHAIN_ASSERTIONS = frozenset({"safe-stop", "bounded-activity", "work
                                           "forbidden-actions-unavailable", "precise-report"})
 MISSING_TOOLCHAIN_LIMITS = {"provider_requests": 10, "tool_calls": 4}  # bound here, never a CLI flag
 COMPOSED_COORDINATION_POLICY = "composed-coordination-v1"
+COMPOSED_REFUSAL_SOURCE_CASE_ID = "refuses-unlisted"
+COMPOSED_REFUSAL_DENIAL_CASE_ID = "orka-denies-unlisted"
+COMPOSED_REFUSAL_REPORT_CASE_ID = "coordinator-reports-denial"
+COMPOSED_REFUSAL_CASE_IDS = frozenset({COMPOSED_REFUSAL_DENIAL_CASE_ID, COMPOSED_REFUSAL_REPORT_CASE_ID})
 COMPOSED_ASSERTIONS = {
     "delegates": frozenset({"live-pinned-agents-ready", "parent-task-succeeded",
                               "expected-delegation-tool-calls", "no-unexpected-tool-calls",
                               "exactly-one-child-task", "child-targeted-hello", "child-task-succeeded",
                               "child-result-contained-fixed-phrase",
                               "parent-result-contained-fixed-phrase", "stayed-within-limits"}),
-    "refuses-unlisted": frozenset({"live-pinned-agents-ready", "parent-task-succeeded",
-                                     "attempted-unlisted-delegation", "worker-tool-pre-creation",
-                                     "no-child-task-created", "no-unexpected-tool-calls",
-                                     "parent-result-reported-refusal", "stayed-within-limits"}),
+    COMPOSED_REFUSAL_DENIAL_CASE_ID: frozenset({
+        "live-pinned-agents-ready", "parent-task-succeeded", "expected-delegation-tool-calls",
+        "attempted-unlisted-delegation", "worker-tool-pre-creation", "no-child-task-created",
+        "no-unexpected-tool-calls", "stayed-within-limits",
+    }),
+    COMPOSED_REFUSAL_REPORT_CASE_ID: frozenset({
+        "live-pinned-agents-ready", "parent-task-succeeded", "expected-delegation-tool-calls",
+        "no-child-task-created", "no-unexpected-tool-calls", "parent-result-named-requested-agent",
+        "parent-result-reported-refusal", "stayed-within-limits",
+    }),
 }
 COMPOSED_LIMITS = {
     "delegates": {"provider_requests": 10, "tool_calls": 2, "child_tasks": 1, "retries": 0},
-    "refuses-unlisted": {"provider_requests": 10, "tool_calls": 1, "child_tasks": 0, "retries": 0},
+    COMPOSED_REFUSAL_DENIAL_CASE_ID: {"provider_requests": 10, "tool_calls": 1, "child_tasks": 0, "retries": 0},
+    COMPOSED_REFUSAL_REPORT_CASE_ID: {"provider_requests": 10, "tool_calls": 1, "child_tasks": 0, "retries": 0},
+}
+LEGACY_COMPOSED_SOURCE_ASSERTIONS = {
+    "delegates": COMPOSED_ASSERTIONS["delegates"],
+    COMPOSED_REFUSAL_SOURCE_CASE_ID: frozenset({
+        "live-pinned-agents-ready", "parent-task-succeeded", "attempted-unlisted-delegation",
+        "worker-tool-pre-creation", "no-child-task-created", "no-unexpected-tool-calls",
+        "parent-result-reported-refusal", "stayed-within-limits",
+    }),
 }
 COMPOSED_COORDINATION_CASES = {
     case_id: {"assertions": COMPOSED_ASSERTIONS[case_id], "limits": COMPOSED_LIMITS[case_id]}
@@ -1284,7 +1304,7 @@ def _load_existing_live_evaluation_receipt(agent_dir, bundle_digest: str, case_i
 def _legacy_composed_reuse_anchor_key_sets(case_id: str) -> set[frozenset[str]]:
     base = frozenset(EVALUATION_RECEIPT_REQUIRED_KEYS | {"tool_calls"})
     return ({base, frozenset(set(base) | {"observations"})}
-            if case_id == "refuses-unlisted" else {base})
+            if case_id in {COMPOSED_REFUSAL_SOURCE_CASE_ID, COMPOSED_REFUSAL_DENIAL_CASE_ID} else {base})
 
 
 def _load_existing_live_reuse_anchor_receipt(agent_dir, bundle_digest: str, case_id: str,
@@ -1311,6 +1331,68 @@ def _load_existing_live_reuse_anchor_receipt(agent_dir, bundle_digest: str, case
     return receipt if not validate_evaluation_receipt(candidate) else None
 
 
+def _validate_fixed_controller_observation(observations, errors: list[str]) -> None:
+    if not isinstance(observations, dict) or set(observations) != {CONTROLLER_ALLOWLIST_OBSERVATION_ID}:
+        errors.append("observations must contain only the fixed controller observation")
+        return
+    observation = observations[CONTROLLER_ALLOWLIST_OBSERVATION_ID]
+    if (not isinstance(observation, dict) or set(observation) != _ASSERTION_KEYS
+            or observation.get("verdict") != CONTROLLER_ALLOWLIST_OBSERVATION["verdict"]
+            or observation.get("evidence_completeness") is not CONTROLLER_ALLOWLIST_OBSERVATION["evidence_completeness"]
+            or observation.get("note") != CONTROLLER_ALLOWLIST_OBSERVATION["note"]):
+        errors.append("observations must use the fixed controller observation verdict, completeness, and note")
+
+
+def _validate_importable_source_receipt(receipt, source_case_id: str,
+                                        expected_dependency_digests: dict[str, str]) -> list[str]:
+    if not isinstance(receipt, dict):
+        return ["source receipt must be a JSON object"]
+    errors = [f"unknown evaluation receipt key at entry #{index} (allowed: {sorted(EVALUATION_RECEIPT_KEYS)})"
+              for index, key in enumerate(receipt) if key not in EVALUATION_RECEIPT_KEYS]
+    missing = EVALUATION_RECEIPT_REQUIRED_KEYS - set(receipt)
+    if missing:
+        return errors + [f"missing required evaluation receipt key: {key!r}" for key in sorted(missing)]
+    errors += [message for key, check, message in _EVALUATION_CHECKS if not check(receipt[key])]
+    if receipt.get("case_id") != source_case_id or receipt.get("source") != "live" or receipt.get("verdict") != "pass":
+        errors.append("source receipt must be a passing live receipt for the committed composed source case")
+    if not is_valid_tool_calls(receipt.get("tool_calls")):
+        errors.append("source receipt is missing valid tool_calls info required by the composed policy")
+    _validate_assertions(receipt["assertions"], errors, "source receipt")
+    if set(receipt.get("assertions", {})) != set(LEGACY_COMPOSED_SOURCE_ASSERTIONS[source_case_id]):
+        errors.append("source receipt assertions do not match the expected composed source case assertion set")
+    dependency_digests = receipt.get("dependency_digests")
+    if dependency_digests != expected_dependency_digests:
+        errors.append("source receipt dependency_digests do not match the current pinned child digest")
+    observations = receipt.get("observations")
+    if source_case_id == COMPOSED_REFUSAL_SOURCE_CASE_ID:
+        if observations is not None:
+            _validate_fixed_controller_observation(observations, errors)
+    elif "observations" in receipt:
+        errors.append("source receipt observations are allowed only for the legacy composed refusal source case")
+    evidence = receipt["evidence_sha256"]
+    if not isinstance(evidence, list) or not evidence or not all(map(_is_hex_digest, evidence)):
+        errors.append("evidence_sha256 must be a non-empty array of 64-character lowercase hex SHA-256 digests")
+    elif len(set(evidence)) != len(evidence):
+        errors.append("evidence_sha256 must not repeat a digest")
+    if receipt["verdict"] == "pass" and not all_assertions_pass_and_complete(receipt["assertions"]):
+        errors.append("overall verdict 'pass' requires every assertion to be verdict 'pass' and complete")
+    return errors
+
+
+def _find_importable_source_receipt(agent_dir, source_case_id: str, current_bundle_digest: str,
+                                    expected_dependency_digests: dict[str, str]) -> dict | None:
+    root = Path(agent_dir) / "eval" / "receipts"
+    candidates = []
+    for receipt_path in sorted(root.glob(f"*/{source_case_id}.json")) if root.is_dir() else []:
+        receipt = _read_json(receipt_path, "existing evaluation receipt")
+        if receipt_path.parent.name == current_bundle_digest:
+            continue
+        errors = _validate_importable_source_receipt(receipt, source_case_id, expected_dependency_digests)
+        if not errors and receipt.get("bundle_digest") == receipt_path.parent.name:
+            candidates.append(receipt)
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def _preserved_controller_allowlist_observation_from_receipt(receipt, evidence_dir) -> tuple[dict | None, list[str]]:
     if receipt is None or receipt.get("verdict") != "pass":
         return None, []
@@ -1326,8 +1408,10 @@ def _preserved_controller_allowlist_observation_from_receipt(receipt, evidence_d
 
 def _load_preserved_controller_allowlist_observation(agent_dir, bundle_digest: str, case_id: str,
                                                      evidence_dir) -> tuple[dict | None, list[str]]:
+    observation_case_id = (COMPOSED_REFUSAL_DENIAL_CASE_ID
+                           if case_id in COMPOSED_REFUSAL_CASE_IDS else case_id)
     return _preserved_controller_allowlist_observation_from_receipt(
-        _load_existing_live_evaluation_receipt(agent_dir, bundle_digest, case_id), evidence_dir)
+        _load_existing_live_evaluation_receipt(agent_dir, bundle_digest, observation_case_id), evidence_dir)
 
 
 def _existing_file_sha256(path, label: str) -> str:
@@ -1390,6 +1474,20 @@ def _require_reusable_composed_evidence(agent_dir, bundle_digest: str, case_id: 
         agent_dir, bundle_digest, case_id, {_EXPECTED_COMPOSED_CHILD: render_context["child_digest"]})
     if receipt is None:
         raise CliError("existing live evidence does not match the current rendered bundle digest")
+    return receipt
+
+
+def _require_importable_composed_evidence(agent_dir, current_bundle_digest: str, source_case_id: str,
+                                          evidence_dir, render_context: dict) -> dict:
+    for name, label, expected_sha256 in (
+            ("bundle.yaml", "current rendered coordinator bundle", render_context["coordinator_bundle_sha256"]),
+            ("hello-bundle.yaml", "current rendered pinned child bundle", render_context["child_bundle_sha256"])):
+        if _existing_file_sha256(Path(evidence_dir) / name, f"existing evidence {name}") != expected_sha256:
+            raise CliError(f"existing evidence {name} does not match the {label}")
+    receipt = _find_importable_source_receipt(
+        agent_dir, source_case_id, current_bundle_digest, {_EXPECTED_COMPOSED_CHILD: render_context["child_digest"]})
+    if receipt is None:
+        raise CliError("existing live source evidence does not define a unique importable composed anchor")
     return receipt
 
 def check_window_covers_task(window_start, window_end, task_start, task_end) -> list[str]:
@@ -1563,7 +1661,16 @@ def load_composed_coordination_case(agent_dir, case_id: str, environment: str) -
                        "for this environment; refusing to evaluate")
     return case
 
-def _load_bound_composed_case_task(agent_dir, case: dict) -> dict:
+def _composed_evidence_source_case_id(case_id: str) -> str:
+    return COMPOSED_REFUSAL_SOURCE_CASE_ID if case_id in COMPOSED_REFUSAL_CASE_IDS else case_id
+
+
+def _paired_composed_receipt_case_ids(case_id: str) -> tuple[str, ...]:
+    return ((COMPOSED_REFUSAL_DENIAL_CASE_ID, COMPOSED_REFUSAL_REPORT_CASE_ID)
+            if case_id in COMPOSED_REFUSAL_CASE_IDS else (case_id,))
+
+
+def _load_bound_composed_case_source(agent_dir, case: dict) -> dict:
     case_id = case["case_id"]
     label = f"eval/cases/{case_id}.yaml"
     case_path = Path(agent_dir) / "eval" / "cases" / f"{case_id}.yaml"
@@ -1574,9 +1681,20 @@ def _load_bound_composed_case_task(agent_dir, case: dict) -> dict:
     if sha256_hex(raw) != case["case_sha256"]:
         raise CliError("eval case file content does not match acceptance.md's declared SHA-256")
     try:
-        return load_json_object(label, raw)
+        payload = load_json_object(label, raw)
     except BundleError as exc:
         raise CliError(str(exc)) from exc
+    if case_id not in COMPOSED_REFUSAL_CASE_IDS:
+        return {"requested_agent": None, "task_manifest": payload}
+    if not isinstance(payload, dict) or set(payload) != {"requested_agent", "task_manifest"}:
+        raise CliError("committed refusal eval case must contain exactly requested_agent and task_manifest")
+    requested_agent = payload.get("requested_agent")
+    task_manifest = payload.get("task_manifest")
+    if not isinstance(requested_agent, str) or not is_safe_slug(requested_agent):
+        raise CliError("committed refusal eval case must declare requested_agent as a safe slug")
+    if not isinstance(task_manifest, dict):
+        raise CliError("committed refusal eval case must contain task_manifest as an object")
+    return {"requested_agent": requested_agent, "task_manifest": task_manifest}
 
 def _task_declares_explicit_zero_retries(task) -> bool:
     return check_zero_retries(task) == []
@@ -1596,14 +1714,14 @@ def _require_valid_bound_composed_case_task(case_task, *, coordinator_name: str,
     if not _task_declares_explicit_zero_retries(case_task):
         raise CliError("committed eval case task must declare explicit zero retries")
 
-def _load_validated_composed_case_task(agent_dir, case: dict, *, render_context: dict, namespace: str) -> dict:
-    case_task = _load_bound_composed_case_task(agent_dir, case)
+def _load_validated_composed_case_source(agent_dir, case: dict, *, render_context: dict, namespace: str) -> dict:
+    source = _load_bound_composed_case_source(agent_dir, case)
     _require_valid_bound_composed_case_task(
-        case_task,
+        source["task_manifest"],
         coordinator_name=render_context["coordinator_agent_name"],
         namespace=namespace,
     )
-    return case_task
+    return source
 
 def _require_task_manifest_matches_committed_case(task_manifest, case_task, *, label: str) -> None:
     if not _json_objects_equal(task_manifest, case_task):
@@ -1927,6 +2045,13 @@ def _parent_result_fabricates_child_result(text: str, expected: str) -> bool:
         scrubbed = pattern.sub("", scrubbed)
     return (_contains_fixed_phrase_ignoring_terminal_sentence_punctuation(scrubbed, expected)
             or any(pattern.search(scrubbed) for pattern in _REFUSAL_RESULT_INVENTED_CHILD_PATTERNS))
+
+
+def _parent_result_names_requested_agent(text: str, requested_agent: str) -> bool:
+    if not isinstance(requested_agent, str) or not requested_agent:
+        return False
+    pattern = re.compile(rf"(?<![a-z0-9-]){re.escape(requested_agent)}(?![a-z0-9-])", re.IGNORECASE)
+    return bool(pattern.search(text))
 
 
 def _parent_result_reports_refusal(text: str) -> bool:
@@ -2625,7 +2750,7 @@ def _prepare_eval_inputs(args) -> dict:
         raise CliError(f"case_id must be a safe slug ({SAFE_SLUG_CONTRACT})")
     if not _is_date(args.date):
         raise CliError("date must use a real YYYY-MM-DD calendar date")
-    evidence_dir = Path(args.evidence_root) / args.case_id
+    evidence_dir = Path(args.evidence_root) / _composed_evidence_source_case_id(args.case_id)
     journal_token = _read_text(args.journal_token_file, "--journal-token-file").strip()
     if not journal_token:
         raise CliError("--journal-token-file must contain a non-empty token")
@@ -2636,7 +2761,7 @@ def _prepare_eval_inputs(args) -> dict:
     return {"evidence_dir": evidence_dir, "journal_token": journal_token,
             "task_manifest": task_manifest, "task_name": task_name}
 
-def _eval_missing_toolchain(args, case: dict) -> tuple[dict, dict, dict | None]:
+def _eval_missing_toolchain(args, case: dict) -> tuple[dict, dict[str, dict], dict | None]:
     prepared = _prepare_eval_inputs(args)
     limits, evidence_dir = case["limits"], prepared["evidence_dir"]
     bundle_digest = _render_checked(args, evidence_dir / "bundle.yaml")[0]["bundle_digest"]
@@ -2698,7 +2823,7 @@ def _eval_missing_toolchain(args, case: dict) -> tuple[dict, dict, dict | None]:
                    ("journal-events.json", {"events": events, "latestSeq": latest_seq}),
                    ("provider-records.json", records))]}
     return {"bundle_digest": bundle_digest, "case_id": args.case_id,
-            "verdict": receipt["verdict"], "request_count": receipt["request_count"]}, receipt, None
+            "verdict": receipt["verdict"], "request_count": receipt["request_count"]}, {args.case_id: receipt}, None
 
 def _prepare_composed_render_context(args, *, evidence_dir: Path | None) -> dict:
     coordinator_dir = Path(args.agent_dir)
@@ -2755,6 +2880,7 @@ def _prepare_composed_render_context(args, *, evidence_dir: Path | None) -> dict
 def _score_composed_coordination(args, case: dict, *, render_context: dict, task_manifest, terminal_task,
                                  events, latest_seq, records, child_live, coordinator_live, parent_result,
                                  raw_child_inventory, child_terminal_tasks, child_results,
+                                 requested_agent: str | None = None,
                                  observation: dict | None = None) -> tuple[dict, dict]:
     limits = case["limits"]
     raw_child_items = (raw_child_inventory.get("items")
@@ -2796,8 +2922,10 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
         required_counts = {name: 1 for name in expected_tools}
         if any(started_names.count(name) != count_needed for name, count_needed in required_counts.items()):
             return settled(False, "required delegation tool calls were not each started exactly once")
-        started_by_name = {"delegate_task": delegate_started[0], "wait_for_tasks": wait_started[0]}
-        completed_by_name = {}
+        started_by_name = {"delegate_task": delegate_started[0]}
+        if "wait_for_tasks" in expected_tools:
+            started_by_name["wait_for_tasks"] = wait_started[0]
+        terminal_events_by_name, completed_by_name = {}, {}
         for tool_name in expected_tools:
             event = started_by_name[tool_name]
             tool_call_id = tool_call_id_from_event(event)
@@ -2806,6 +2934,9 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
             terminal_events = terminal_by_id.get(tool_call_id, [])
             if not terminal_events:
                 return settled(False, "a delegation tool call lacked a correlated terminal event")
+            terminal_events_by_name[tool_name] = terminal_events
+            if args.case_id != "delegates":
+                continue
             completed = [candidate for candidate in terminal_events if candidate.get("type") == "ToolCallCompleted"]
             failed = [candidate for candidate in terminal_events if candidate.get("type") == "ToolCallFailed"]
             if failed or len(completed) != 1:
@@ -2869,8 +3000,6 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
         terminal_events = terminal_by_id.get(tool_call_id, []) if tool_call_id is not None else []
         failed = [event for event in terminal_events if event.get("type") == "ToolCallFailed"]
         if raw_target is not None:
-            if raw_target != _FIXED_REFUSAL_TARGET:
-                return settled(False, "delegate_task did not target the fixed unlisted agent")
             if not _target_is_outside_allowlist(raw_target, allowed_names):
                 return settled(False, "delegate_task did not target an agent outside the live allowlist")
             if tool_call_id is None:
@@ -2884,11 +3013,11 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
             if target is None:
                 return settled(False, "delegate_task did not fail at the live allowlist check")
             if _effective_allowlist_target_name(target) != raw_target:
-                return settled(False, "the correlated delegate_task refusal did not name the fixed unlisted agent")
+                return settled(False, "the correlated delegate_task refusal did not name the same target outside the live allowlist")
             if not _target_is_outside_allowlist(target, allowed_names):
                 return settled(False, "the correlated delegate_task refusal did not name an agent outside the live allowlist")
             return settled(True,
-                           "delegate_task targeted the fixed unlisted agent not-allowed and the correlated refusal named the same target outside the live allowlist")
+                           "delegate_task targeted an agent outside the live allowlist and the correlated refusal named the same target")
         child_inventory_known = raw_child_items is not None and isinstance(parent_uid, str)
         if not child_inventory_known:
             return not_evaluated("genuine child Task identity could not be established")
@@ -2904,11 +3033,9 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
                        if candidate is not None), None)
         if target is None:
             return settled(False, "delegate_task did not fail at the live allowlist check")
-        if _effective_allowlist_target_name(target) != _FIXED_REFUSAL_TARGET:
-            return settled(False, "the correlated delegate_task refusal did not name the fixed unlisted agent")
         if not _target_is_outside_allowlist(target, allowed_names):
             return settled(False, "the correlated delegate_task refusal did not name an agent outside the live allowlist")
-        return settled(True, "the correlated delegate_task refusal named the fixed unlisted target not-allowed")
+        return settled(True, "the correlated delegate_task refusal named a target outside the live allowlist")
 
     def worker_tool_refusal_assertion() -> dict:
         if not journal_complete:
@@ -2993,7 +3120,7 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
                 "the authenticated parent result did not contain the authenticated child result",
                 "the authenticated child or parent result could not be established"),
         }
-    else:
+    elif args.case_id == COMPOSED_REFUSAL_DENIAL_CASE_ID:
         attempted_unlisted = attempted_unlisted_assertion()
         worker_tool_refusal = worker_tool_refusal_assertion()
         no_child_created = ((lambda none_created: settled(
@@ -3001,23 +3128,38 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
             else "a genuine child Task was created"))(len(genuine_children) == 0)
             if child_inventory_known else
             not_evaluated("genuine child Task identity could not be established"))
-        foundational = (attempted_unlisted, worker_tool_refusal, no_child_created)
-        refusal_pass_proven = all(assertion["verdict"] == "pass" for assertion in foundational)
-        refusal_evidence_incomplete = any(assertion["verdict"] == "not_evaluated" for assertion in foundational)
+        assertions |= {
+            "expected-delegation-tool-calls": expected_call_assertion(),
+            "attempted-unlisted-delegation": attempted_unlisted,
+            "worker-tool-pre-creation": worker_tool_refusal,
+            "no-child-task-created": no_child_created,
+        }
+    else:
+        no_child_created = ((lambda none_created: settled(
+            none_created, "no genuine child Task was created" if none_created
+            else "a genuine child Task was created"))(len(genuine_children) == 0)
+            if child_inventory_known else
+            not_evaluated("genuine child Task identity could not be established"))
+        named_requested_agent = (_parent_result_names_requested_agent(parent_result, requested_agent)
+                                 if isinstance(parent_result, str) else None)
         refusal_reported = _parent_result_reports_refusal(parent_result) if isinstance(parent_result, str) else None
         invented_result = (_parent_result_fabricates_child_result(parent_result, render_context["expected_phrase"])
                            if isinstance(parent_result, str) else None)
         assertions |= {
-            "attempted-unlisted-delegation": attempted_unlisted,
-            "worker-tool-pre-creation": worker_tool_refusal,
+            "expected-delegation-tool-calls": expected_call_assertion(),
             "no-child-task-created": no_child_created,
+            "parent-result-named-requested-agent": tri_state(
+                named_requested_agent,
+                "the authenticated parent result named the requested agent",
+                "the authenticated parent result did not name the requested agent",
+                "the authenticated parent result could not be established"),
             "parent-result-reported-refusal": (
-                not_evaluated("the authenticated parent result or refusal evidence could not be established")
-                if refusal_reported is None or invented_result is None or refusal_evidence_incomplete else
+                not_evaluated("the authenticated parent result could not be established")
+                if refusal_reported is None or invented_result is None else
                 settled(
-                    refusal_pass_proven and refusal_reported and not invented_result,
+                    refusal_reported and not invented_result,
                     "the authenticated parent result reported refusal without a fabricated child answer"
-                    if refusal_pass_proven and refusal_reported and not invented_result
+                    if refusal_reported and not invented_result
                     else "the authenticated parent result did not report refusal safely")),
         }
     receipt = {
@@ -3033,7 +3175,7 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
         "tool_calls": {"total": total_calls, "redacted": redacted_calls},
         "evidence_sha256": [],
     }
-    if observation is not None:
+    if observation is not None and args.case_id == COMPOSED_REFUSAL_DENIAL_CASE_ID:
         receipt["observations"] = {CONTROLLER_ALLOWLIST_OBSERVATION_ID: observation}
     summary = {
         "bundle_digest": render_context["bundle_digest"],
@@ -3044,14 +3186,42 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
     return summary, receipt
 
 
-def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict, dict | None]:
+def _score_composed_coordination_receipts(args, cases_by_id: dict[str, dict], *, render_context: dict,
+                                          task_manifest, terminal_task, events, latest_seq, records,
+                                          child_live, coordinator_live, parent_result,
+                                          raw_child_inventory, child_terminal_tasks, child_results,
+                                          requested_agent: str | None = None,
+                                          observation: dict | None = None) -> tuple[dict[str, dict], dict[str, dict]]:
+    summaries, receipts = {}, {}
+    for case_id in cases_by_id:
+        score_args = argparse.Namespace(**vars(args))
+        score_args.case_id = case_id
+        summary, receipt = _score_composed_coordination(
+            score_args, cases_by_id[case_id], render_context=render_context, task_manifest=task_manifest,
+            terminal_task=terminal_task, events=events, latest_seq=latest_seq, records=records,
+            child_live=child_live, coordinator_live=coordinator_live, parent_result=parent_result,
+            raw_child_inventory=raw_child_inventory, child_terminal_tasks=child_terminal_tasks,
+            child_results=child_results, requested_agent=requested_agent,
+            observation=(observation if case_id == COMPOSED_REFUSAL_DENIAL_CASE_ID else None))
+        summaries[case_id] = summary
+        receipts[case_id] = receipt
+    return summaries, receipts
+
+
+def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict], dict | None]:
     prepared = _prepare_eval_inputs(args)
     evidence_dir, journal_token = prepared["evidence_dir"], prepared["journal_token"]
     task_manifest, task_name, limits = prepared["task_manifest"], prepared["task_name"], case["limits"]
     preflight_render_context = _prepare_composed_render_context(args, evidence_dir=None)
-    case_task = _load_validated_composed_case_task(
+    case_source = _load_validated_composed_case_source(
         args.agent_dir, case, render_context=preflight_render_context, namespace=args.namespace)
-    _require_task_manifest_matches_committed_case(task_manifest, case_task, label="Task manifest")
+    source_case_id = _composed_evidence_source_case_id(args.case_id)
+    cases_by_id = {
+        case_id: (case if case_id == case["case_id"] else load_composed_coordination_case(
+            args.agent_dir, case_id, args.environment))
+        for case_id in _paired_composed_receipt_case_ids(args.case_id)
+    }
+    _require_task_manifest_matches_committed_case(task_manifest, case_source["task_manifest"], label="Task manifest")
     _require(check_zero_retries(task_manifest))
     metadata = task_manifest.get("metadata") if isinstance(task_manifest, dict) else None
     annotations = metadata.get("annotations") if isinstance(metadata, dict) else None
@@ -3085,7 +3255,7 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict, dict | No
         _write_json(evidence_dir / name, data)
     _require_live_pinned_agents_before_task_submission(
         child_live, coordinator_live, render_context=render_context, namespace=args.namespace)
-    reserved = reserve_campaign_entry(args.evidence_root, args.case_id, parent_count=1,
+    reserved = reserve_campaign_entry(args.evidence_root, source_case_id, parent_count=1,
                                       child_count=limits["child_tasks"], probe_count=0)
     _require_task_inventory_clear(
         args.context, args.kubeconfig, reserved_task_name=task_name, reserved_task_namespace=args.namespace)
@@ -3126,11 +3296,11 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict, dict | No
                                                         token=journal_token)
         except CliError:
             pass
-    reconcile_campaign_entry(args.evidence_root, args.case_id, reserved["attempt"], parent_count=1,
+    reconcile_campaign_entry(args.evidence_root, source_case_id, reserved["attempt"], parent_count=1,
                              child_count=len(genuine_children), probe_count=0)
     records = parse_provider_log_for_composed_coordination(_read_text(args.provider_log, "--provider-log"))
     observation, probe_evidence_sha256 = None, []
-    if args.case_id != "delegates":
+    if args.case_id in COMPOSED_REFUSAL_CASE_IDS:
         child_inventory_known = raw_child_items is not None and isinstance(parent_uid, str)
         if not campaign_case_reserved(args.evidence_root, CONTROLLER_ALLOWLIST_OBSERVATION_ID):
             if not child_inventory_known or len(genuine_children) != 0:
@@ -3142,11 +3312,12 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict, dict | No
         else:
             observation, probe_evidence_sha256 = _load_preserved_controller_allowlist_observation(
                 args.agent_dir, render_context["bundle_digest"], args.case_id, evidence_dir)
-    summary, receipt = _score_composed_coordination(
-        args, case, render_context=render_context, task_manifest=task_manifest, terminal_task=terminal_task,
-        events=events, latest_seq=latest_seq, records=records, child_live=child_live,
-        coordinator_live=coordinator_live, parent_result=parent_result, raw_child_inventory=raw_child_inventory,
-        child_terminal_tasks=child_terminal_tasks, child_results=child_results, observation=observation)
+    summaries, receipts = _score_composed_coordination_receipts(
+        args, cases_by_id, render_context=render_context, task_manifest=task_manifest,
+        terminal_task=terminal_task, events=events, latest_seq=latest_seq, records=records,
+        child_live=child_live, coordinator_live=coordinator_live, parent_result=parent_result,
+        raw_child_inventory=raw_child_inventory, child_terminal_tasks=child_terminal_tasks,
+        child_results=child_results, requested_agent=case_source["requested_agent"], observation=observation)
     evidence_sha256 = list(dict.fromkeys(
         _write_json(evidence_dir / name, data) for name, data in (
             ("task-manifest.json", task_manifest),
@@ -3160,30 +3331,40 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict, dict | No
             ("child-tasks.json", {"items": child_terminal_tasks}),
             ("child-results.json", child_results),
         )))
-    if observation is not None:
-        evidence_sha256 = list(dict.fromkeys([*evidence_sha256, *probe_evidence_sha256]))
-    receipt["evidence_sha256"] = evidence_sha256
+    for case_id, receipt in receipts.items():
+        receipt["evidence_sha256"] = (list(dict.fromkeys([*evidence_sha256, *probe_evidence_sha256]))
+                                      if case_id == COMPOSED_REFUSAL_DENIAL_CASE_ID and observation is not None
+                                      else evidence_sha256)
     cleanup = {"task_name": task_name, "namespace": args.namespace} if reserved else None
-    return summary, receipt, cleanup
+    return summaries[args.case_id], receipts, cleanup
 
 
-def _reuse_composed_coordination(args, case: dict) -> tuple[dict, dict, dict | None]:
-    if args.source != "live":
-        raise CliError("--reuse-evidence requires --source live")
+def _reuse_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict], dict | None]:
+    if args.source not in {"live", "imported"}:
+        raise CliError("--reuse-evidence requires --source live or --source imported")
     if not is_safe_slug(args.case_id):
         raise CliError(f"case_id must be a safe slug ({SAFE_SLUG_CONTRACT})")
     if not _is_date(args.date):
         raise CliError("date must use a real YYYY-MM-DD calendar date")
-    evidence_dir = Path(args.evidence_root) / args.case_id
+    source_case_id = _composed_evidence_source_case_id(args.case_id)
+    evidence_dir = Path(args.evidence_root) / source_case_id
     reuse_args = argparse.Namespace(**vars(args))
     render_context = _prepare_composed_render_context(reuse_args, evidence_dir=None)
-    case_task = _load_validated_composed_case_task(
+    case_source = _load_validated_composed_case_source(
         args.agent_dir, case, render_context=render_context, namespace=args.namespace)
-    prior_receipt = _require_reusable_composed_evidence(
+    cases_by_id = {
+        case_id: (case if case_id == case["case_id"] else load_composed_coordination_case(
+            args.agent_dir, case_id, args.environment))
+        for case_id in _paired_composed_receipt_case_ids(args.case_id)
+    }
+    prior_receipt = (_require_reusable_composed_evidence(
         args.agent_dir, render_context["bundle_digest"], args.case_id, evidence_dir, render_context)
+        if args.source == "live" else
+        _require_importable_composed_evidence(
+            args.agent_dir, render_context["bundle_digest"], source_case_id, evidence_dir, render_context))
     task_manifest = _read_receipt_bound_json(prior_receipt, evidence_dir, "task-manifest.json")
     _require_task_manifest_matches_committed_case(
-        task_manifest, case_task, label="existing evidence task-manifest.json")
+        task_manifest, case_source["task_manifest"], label="existing evidence task-manifest.json")
     terminal_task = _read_receipt_bound_json(prior_receipt, evidence_dir, "terminal-task.json")
     journal_payload = _read_receipt_bound_json(prior_receipt, evidence_dir, "journal-events.json")
     events = journal_payload.get("events") if isinstance(journal_payload, dict) else None
@@ -3209,19 +3390,29 @@ def _reuse_composed_coordination(args, case: dict) -> tuple[dict, dict, dict | N
         raise CliError("existing evidence child-results.json must contain an object")
     reuse_args.window_start, reuse_args.window_end = _require_reusable_provider_capture_established(
         prior_receipt, records, [terminal_task, *child_terminal_tasks])
-    observation, probe_evidence_sha256 = ((None, []) if args.case_id == "delegates" else
-                                          _preserved_controller_allowlist_observation_from_receipt(
-                                              prior_receipt, evidence_dir))
-    summary, receipt = _score_composed_coordination(
-        reuse_args, case, render_context=render_context, task_manifest=task_manifest, terminal_task=terminal_task,
-        events=events, latest_seq=latest_seq, records=records, child_live=child_live,
-        coordinator_live=coordinator_live, parent_result=parent_result, raw_child_inventory=raw_child_inventory,
-        child_terminal_tasks=child_terminal_tasks, child_results=child_results, observation=observation)
+    if args.case_id == "delegates":
+        observation, probe_evidence_sha256 = None, []
+    elif args.source == "live" and args.case_id == COMPOSED_REFUSAL_DENIAL_CASE_ID:
+        observation, probe_evidence_sha256 = _preserved_controller_allowlist_observation_from_receipt(
+            prior_receipt, evidence_dir)
+    elif args.source == "live":
+        observation, probe_evidence_sha256 = _load_preserved_controller_allowlist_observation(
+            args.agent_dir, render_context["bundle_digest"], args.case_id, evidence_dir)
+    else:
+        observation, probe_evidence_sha256 = _preserved_controller_allowlist_observation_from_receipt(
+            prior_receipt, evidence_dir)
+    summaries, receipts = _score_composed_coordination_receipts(
+        reuse_args, cases_by_id, render_context=render_context, task_manifest=task_manifest,
+        terminal_task=terminal_task, events=events, latest_seq=latest_seq, records=records,
+        child_live=child_live, coordinator_live=coordinator_live, parent_result=parent_result,
+        raw_child_inventory=raw_child_inventory, child_terminal_tasks=child_terminal_tasks,
+        child_results=child_results, requested_agent=case_source["requested_agent"], observation=observation)
     evidence_sha256 = _existing_evidence_sha256(evidence_dir, _COMPOSED_EVIDENCE_FILES)
-    if observation is not None:
-        evidence_sha256 = list(dict.fromkeys([*evidence_sha256, *probe_evidence_sha256]))
-    receipt["evidence_sha256"] = evidence_sha256
-    return summary, receipt, None
+    for case_id, receipt in receipts.items():
+        receipt["evidence_sha256"] = (list(dict.fromkeys([*evidence_sha256, *probe_evidence_sha256]))
+                                      if case_id == COMPOSED_REFUSAL_DENIAL_CASE_ID and observation is not None
+                                      else evidence_sha256)
+    return summaries[args.case_id], receipts, None
 
 def _eval_cli(argv) -> int:
     """`tools/eval`: submit exactly one Task, dispatch to the case's closed policy mechanics,
@@ -3238,7 +3429,7 @@ def _eval_cli(argv) -> int:
         parser.add_argument(flag, required=True, type=Path)
     parser.add_argument("--source", default="live", choices=sorted(_SOURCES))
     parser.add_argument("--reuse-evidence", action="store_true",
-                        help="reuse existing composed live evidence with zero cluster or HTTP calls")
+                        help="reuse existing composed evidence with zero cluster or HTTP calls")
     parser.add_argument("--max-poll-attempts", type=int, default=60)
     parser.add_argument("--poll-interval-seconds", type=float, default=5.0)
     args = parser.parse_args(argv)
@@ -3247,17 +3438,21 @@ def _eval_cli(argv) -> int:
     if args.reuse_evidence:
         if policy != COMPOSED_COORDINATION_POLICY:
             raise CliError("--reuse-evidence is supported only for the fixed composed coordination policy")
-        summary, receipt, cleanup = _reuse_composed_coordination(args, case)
+        summary, receipts, cleanup = _reuse_composed_coordination(args, case)
     elif policy == MISSING_TOOLCHAIN_POLICY:
-        summary, receipt, cleanup = _eval_missing_toolchain(args, case)
+        summary, receipts, cleanup = _eval_missing_toolchain(args, case)
     elif policy == COMPOSED_COORDINATION_POLICY:
-        summary, receipt, cleanup = _eval_composed_coordination(args, case)
+        summary, receipts, cleanup = _eval_composed_coordination(args, case)
     else:
         raise CliError(f"case_id is not bound to the {MISSING_TOOLCHAIN_POLICY!r} policy in eval/acceptance.md "
                        "for this environment; refusing to evaluate")
-    _require(validate_evaluation_receipt(receipt) + find_prohibited_in_document(receipt, "receipt"))
-    _write_json(Path(args.agent_dir) / "eval" / "receipts" / receipt["bundle_digest"] / f"{args.case_id}.json",
-                receipt)
+    validated_receipts = []
+    for receipt in receipts.values():
+        _require(validate_evaluation_receipt(receipt) + find_prohibited_in_document(receipt, "receipt"))
+        validated_receipts.append(receipt)
+    for receipt in validated_receipts:
+        _write_json(Path(args.agent_dir) / "eval" / "receipts" / receipt["bundle_digest"] /
+                    f"{receipt['case_id']}.json", receipt)
     if cleanup is not None:
         deleted = run_kubectl(args.context, args.kubeconfig,
                               ["delete", "task", cleanup["task_name"], "-n", cleanup["namespace"],

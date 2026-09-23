@@ -20,13 +20,16 @@ Tasks.
 
 ## Run it
 
-Render and verify the coordinator before applying it. The rendered bundle keeps
-its own namespace, so the apply step needs only your explicit cluster context
-and kubeconfig.
+Render the coordinator before applying it. The rendered bundle keeps its own
+namespace, so the apply step needs only your explicit cluster context and
+kubeconfig. `tools/verify agents/coordinator production` is the committed green
+offline check. `tools/verify agents/coordinator trial` is intentionally red at
+this digest because the required `coordinator-reports-denial` receipt fails on
+retained PR1 evidence.
 
 ```sh
 tools/render agents/coordinator trial --output /tmp/coordinator.json
-tools/verify agents/coordinator trial
+tools/verify agents/coordinator production
 kubectl --context "$CONTEXT" --kubeconfig "$KUBECONFIG" apply -f /tmp/coordinator.json
 ```
 
@@ -44,19 +47,21 @@ Orka journals do not always retain those exact wait arguments, so live
 verification instead proves one ordered successful non-empty wait after
 delegation plus authenticated child-result propagation.
 
-`refuses-unlisted` proves the coordinator targeted the fixed unallowlisted
-target `not-allowed`, that Orka refused that call before child creation, and
-that the final result reported refusal without inventing a child answer. When
-visible `delegate_task` arguments are retained, evaluation proves the exact
-started target plus a correlated allowlist denial naming the same effective
-target (allowing only namespace qualification). When current live Orka
-journals omit those raw arguments, evaluation instead proves the same exact
-target from the correlated allowlist-denial summary, plus zero genuine child
-Tasks and truthful refusal reporting.
+`orka-denies-unlisted` and `coordinator-reports-denial` share one committed
+refusal source manifest and one refusal raw-evidence capture per digest.
+`orka-denies-unlisted` proves the attempted delegation targeted an agent
+outside the live allowlist, that the worker denied it before child creation,
+and that no child Task was created. `coordinator-reports-denial` separately
+proves whether the final authenticated parent result named the requested agent
+`not-allowed`, stated refusal, and avoided inventing a child answer or fixed
+greeting.
 
 ## Where it has run
 
-Passing live trial receipts now exist for the current digest. The committed
-`delegates` and `refuses-unlisted` receipts capture one successful delegation
-to the pinned `hello` child and one pre-dispatch refusal for an unlisted
-target, so the catalogue status is `tested`.
+Retained live PR1 evidence now anchors three current-digest trial receipts.
+`delegates` passes. `orka-denies-unlisted` passes. The required
+`coordinator-reports-denial` receipt fails because the authenticated parent
+result names `not-allowed-agent` instead of the requested `not-allowed`, so
+`tools/verify agents/coordinator trial` is intentionally red only for that
+reporting case. `tools/verify agents/coordinator production` remains green and
+receipt-free.
