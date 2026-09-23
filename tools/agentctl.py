@@ -1529,6 +1529,17 @@ def _require_reusable_composed_provider_binding(prior_receipt: dict, evidence_di
     )
 
 
+def _require_reusable_established_token_usage(prior_receipt: dict, events, render_context: dict) -> dict | None:
+    if render_context["provider_route"] is None:
+        return None
+    token_usage, established = summarize_parent_token_usage(events)
+    if not established:
+        raise CliError("existing evidence journal-events.json does not prove authenticated parent token usage for the original live receipt")
+    if prior_receipt.get("token_usage") != token_usage:
+        raise CliError("existing evidence journal-events.json does not reproduce the original live receipt token_usage")
+    return token_usage
+
+
 def check_window_covers_task(window_start, window_end, task_start, task_end) -> list[str]:
     """Diagnostics; empty means the asserted window covers the Task exactly, with no tolerance."""
     if window_end < window_start:
@@ -1623,11 +1634,21 @@ def count_tool_calls(events) -> tuple[int, int]:
     redacted_seqs = set(find_redacted_sequences(events))
     return len(identity_seqs), sum(1 for seqs in identity_seqs.values() if seqs & redacted_seqs)
 
-def summarize_parent_token_usage(events) -> dict[str, int]:
-    """Sum non-negative token counts from complete parent journal events, deduped by event seq."""
+def _event_token_count(holders, key: str) -> tuple[int, bool, bool]:
+    values = [holder.get(key) for holder in holders if isinstance(holder, dict) and key in holder]
+    if not values:
+        return 0, False, False
+    if not all(_is_count(value) for value in values) or len(set(values)) != 1:
+        return 0, True, True
+    return values[0], True, False
+
+
+def summarize_parent_token_usage(events) -> tuple[dict[str, int] | None, bool]:
+    """Sum non-redacted parent token counts by unique seq; None means usage was not established."""
     totals = {"input": 0, "output": 0, "total": 0}
     seen = set()
     redacted = set(find_redacted_sequences(events))
+    established = False
     for event in events:
         seq = event_sequence_number(event)
         if seq is None or seq in seen or seq in redacted:
@@ -1636,14 +1657,19 @@ def summarize_parent_token_usage(events) -> dict[str, int]:
         if not isinstance(event, dict):
             continue
         holders = (event, event.get("content") if isinstance(event.get("content"), dict) else None)
-        input_tokens = next((holder.get("inputTokens") for holder in holders
-                             if isinstance(holder, dict) and _is_count(holder.get("inputTokens"))), None)
-        output_tokens = next((holder.get("outputTokens") for holder in holders
-                              if isinstance(holder, dict) and _is_count(holder.get("outputTokens"))), None)
-        totals["input"] += input_tokens or 0
-        totals["output"] += output_tokens or 0
+        input_tokens, has_input, input_invalid = _event_token_count(holders, "inputTokens")
+        output_tokens, has_output, output_invalid = _event_token_count(holders, "outputTokens")
+        if not has_input and not has_output:
+            continue
+        if input_invalid or output_invalid:
+            return None, False
+        established = True
+        totals["input"] += input_tokens
+        totals["output"] += output_tokens
+    if not established:
+        return None, False
     totals["total"] = totals["input"] + totals["output"]
-    return totals
+    return totals, True
 
 def check_workspace_unchanged(status) -> bool | None:
     """`None` with no `delivery` object; else pass only when state and outcome are read-validated."""
@@ -2569,7 +2595,7 @@ def _agent_ready_readback(agent_obj):
     return condition is not None and condition.get("status") == "True"
 
 
-def _provider_condition_with_usable_observed_generation(provider_obj):
+def _current_provider_ready_condition(provider_obj):
     if not isinstance(provider_obj, dict):
         return None
     metadata, status = provider_obj.get("metadata"), provider_obj.get("status")
@@ -2582,22 +2608,19 @@ def _provider_condition_with_usable_observed_generation(provider_obj):
                  if isinstance(condition, dict) and condition.get("type") == "Ready"
                  and isinstance(condition.get("observedGeneration"), int)
                  and not isinstance(condition["observedGeneration"], bool)
-                 and condition["observedGeneration"] > 0), None)
+                 and condition["observedGeneration"] > 0
+                 and condition["observedGeneration"] == generation), None)
 
 
 def _provider_ready_readback(provider_obj):
-    """Return tri-state readiness from Provider status.ready plus Ready/observedGeneration when usable."""
+    """Return tri-state readiness from Provider status.ready plus a current-generation Ready condition."""
     if provider_obj is None:
         return None
     status = provider_obj.get("status") if isinstance(provider_obj, dict) else None
-    ready = status.get("ready") if isinstance(status, dict) else None
-    if ready is not True:
+    if not isinstance(status, dict) or status.get("ready") is not True:
         return False
-    condition = _provider_condition_with_usable_observed_generation(provider_obj)
-    if condition is None:
-        return True
-    generation = provider_obj.get("metadata", {}).get("generation")
-    return condition.get("status") == "True" and condition.get("observedGeneration") == generation
+    condition = _current_provider_ready_condition(provider_obj)
+    return condition is not None and condition.get("status") == "True"
 
 
 def wait_for_current_agent_readback(read_fn, *, sleep_fn=None, max_attempts: int = 10,
@@ -3408,6 +3431,7 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
                          _live_agent_matches(child_live, render_context["child_agent_item"], args.namespace)
                          and _live_agent_matches(coordinator_live, render_context["coordinator_agent_item"],
                                                  args.namespace))
+    token_usage, token_usage_established = summarize_parent_token_usage(events)
     parent_phase = (terminal_task.get("status") or {}).get("phase") if isinstance(terminal_task, dict) else None
     assertions = {
         "live-pinned-agents-ready": tri_state(
@@ -3513,7 +3537,8 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
         "source": args.source,
         "model": render_context["coordinator_model_name"],
         "request_count": count if established else None,
-        "verdict": "pass" if all_assertions_pass_and_complete(assertions) else "fail",
+        "verdict": "pass" if (all_assertions_pass_and_complete(assertions)
+                                 and (provider_route is None or token_usage_established)) else "fail",
         "assertions": assertions,
         "dependency_digests": {_EXPECTED_COMPOSED_CHILD: render_context["child_digest"]},
         "tool_calls": {"total": total_calls, "redacted": redacted_calls},
@@ -3521,7 +3546,8 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
     }
     if provider_route is not None:
         receipt["provider_route"] = dict(provider_route)
-        receipt["token_usage"] = summarize_parent_token_usage(events)
+        if token_usage_established:
+            receipt["token_usage"] = token_usage
     if observation is not None and args.case_id == COMPOSED_REFUSAL_DENIAL_CASE_ID:
         receipt["observations"] = {CONTROLLER_ALLOWLIST_OBSERVATION_ID: observation}
     summary = {
@@ -3739,6 +3765,7 @@ def _reuse_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict
     coordinator_live = _read_receipt_bound_json(prior_receipt, evidence_dir, "coordinator-agent-readback.json")
     provider_route = _require_reusable_composed_provider_binding(
         prior_receipt, evidence_dir, render_context, coordinator_live)
+    _require_reusable_established_token_usage(prior_receipt, events, render_context)
     parent_result_holder = _read_receipt_bound_json(prior_receipt, evidence_dir, "parent-result.json")
     parent_result = (parent_result_holder.get("result")
                      if isinstance(parent_result_holder, dict) and isinstance(parent_result_holder.get("result"), str)

@@ -520,15 +520,28 @@ class PolicyMechanicsTestCase(unittest.TestCase):
         events = [
             {"seq": 1, "type": "ModelUsageUpdated", "inputTokens": 5, "outputTokens": 7},
             {"seq": 1, "type": "ModelUsageUpdated", "inputTokens": 99, "outputTokens": 99},
-            {"seq": 2, "type": "ModelUsageUpdated", "inputTokens": 3, "outputTokens": "not-an-int"},
-            {"seq": 3, "type": "ModelUsageUpdated", "inputTokens": 2, "outputTokens": 4,
+            {"seq": 2, "type": "ModelUsageUpdated", "inputTokens": 0, "outputTokens": 0,
              "contentOmitted": "policy"},
-            {"seq": 4, "type": "ModelRequestCompleted",
+            {"seq": 3, "type": "ModelRequestCompleted",
              "content": {"inputTokens": 11, "outputTokens": 13}},
-            {"seq": 5, "type": "ModelRequestCompleted", "inputTokens": -1, "outputTokens": 1},
         ]
         self.assertEqual(agentctl.summarize_parent_token_usage(events),
-                         {"input": 19, "output": 21, "total": 40})
+                         ({"input": 16, "output": 20, "total": 36}, True))
+
+    def test_parent_token_usage_distinguishes_valid_zero_from_missing_or_malformed_usage(self):
+        self.assertEqual(
+            agentctl.summarize_parent_token_usage(
+                [{"seq": 1, "type": "ModelRequestCompleted", "inputTokens": 0, "outputTokens": 0}]),
+            ({"input": 0, "output": 0, "total": 0}, True),
+        )
+        for events in (
+                [{"seq": 1, "type": "ModelMessage", "contentText": "no usage"}],
+                [{"seq": 1, "type": "ModelUsageUpdated", "inputTokens": 1, "contentOmitted": "policy"}],
+                [{"seq": 1, "type": "ModelRequestCompleted", "inputTokens": -1, "outputTokens": 1}],
+                [{"seq": 1, "type": "ModelUsageUpdated", "content": {"inputTokens": "bad"}}],
+        ):
+            with self.subTest(events=events):
+                self.assertEqual(agentctl.summarize_parent_token_usage(events), (None, False))
 
     def test_workspace_unchanged_is_none_only_with_no_delivery_object_at_all(self):
         for status in ({}, None, {"status": "anything"}):
@@ -1407,22 +1420,37 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.assertIn(agentctl.sha256_hex(provider_readback.read_bytes()), receipt["evidence_sha256"])
         self.assertEqual(agentctl.find_prohibited_in_document(receipt, "receipt"), [])
 
-    def test_azure_provider_without_a_usable_observed_generation_uses_status_ready(self):
+    def test_azure_delegate_usage_allows_a_valid_zero_event(self):
         self._switch_coordinator_to_azure()
-        self.kubectl.responses[("providers.core.orka.ai", AZURE_PROVIDER_NAME)] = live_provider(
-            AZURE_PROVIDER_NAME,
-            NAMESPACE,
-            self.kubectl.responses[("providers.core.orka.ai", AZURE_PROVIDER_NAME)]["spec"],
-            uid="coordinator-provider-uid",
-            generation=2,
-            ready=True,
-            conditions=[{"type": "Ready", "status": "True"}],
-        )
-        self._set_delegate_result_evidence(self._delegate_events())
+        self._set_delegate_result_evidence(self._delegate_events_with_usage(
+            {"type": "ModelUsageUpdated", "inputTokens": 0, "outputTokens": 0},
+            {"type": "ModelRequestCompleted", "inputTokens": 0, "outputTokens": 0}))
         summary = self.run_eval(
             "delegates", self.root / "delegates-task.json", **{"--model": AZURE_DEPLOYMENT})
+        receipt = self.receipt("delegates")
         self.assertEqual(summary["verdict"], "pass")
-        self.assertEqual(self.receipt("delegates")["provider_route"], azure_provider_route())
+        self.assertEqual(receipt["token_usage"], {"input": 0, "output": 0, "total": 0})
+
+    def test_azure_delegate_requires_established_non_redacted_token_usage_to_pass(self):
+        cases = (
+            ("missing", self._delegate_events(), "fail"),
+            ("all-redacted", self._delegate_events_with_usage(
+                {"type": "ModelUsageUpdated", "inputTokens": 1, "contentOmitted": "policy"}), "fail"),
+            ("malformed", self._delegate_events_with_usage(
+                {"type": "ModelRequestCompleted", "outputTokens": -1}), "fail"),
+        )
+        for label, events, verdict in cases:
+            with self.subTest(case=label):
+                self.setUp()
+                self._switch_coordinator_to_azure()
+                self._set_delegate_result_evidence(events)
+                summary = self.run_eval(
+                    "delegates", self.root / "delegates-task.json", **{"--model": AZURE_DEPLOYMENT})
+                receipt = self.receipt("delegates")
+                self.assertEqual(summary["verdict"], verdict)
+                self.assertEqual(receipt["verdict"], verdict)
+                self.assertEqual(receipt["provider_route"], azure_provider_route())
+                self.assertNotIn("token_usage", receipt)
 
     def test_composed_live_eval_requires_a_matching_ready_azure_provider_before_task_create(self):
         cases = (
@@ -1433,12 +1461,24 @@ class ComposedEvalCliTestCase(unittest.TestCase):
              lambda: self.kubectl.responses[("providers.core.orka.ai", AZURE_PROVIDER_NAME)].__setitem__(
                  "status", {"ready": False}),
              "eval failed: coordinator Provider was not Ready and spec-identical before Task submission"),
+            ("missing-ready-condition",
+             lambda: self.kubectl.responses[("providers.core.orka.ai", AZURE_PROVIDER_NAME)].__setitem__(
+                 "status", {"ready": True, "conditions": []}),
+             "eval failed: coordinator Provider was not Ready and spec-identical before Task submission"),
             ("stale-ready-condition",
              lambda: self.kubectl.responses[("providers.core.orka.ai", AZURE_PROVIDER_NAME)].update({
                  "metadata": {"name": AZURE_PROVIDER_NAME, "namespace": NAMESPACE,
                               "uid": "coordinator-provider-uid", "generation": 2},
                  "status": {"ready": True,
                            "conditions": [{"type": "Ready", "status": "True", "observedGeneration": 1}]},
+             }),
+             "eval failed: coordinator Provider was not Ready and spec-identical before Task submission"),
+            ("wrong-generation",
+             lambda: self.kubectl.responses[("providers.core.orka.ai", AZURE_PROVIDER_NAME)].update({
+                 "metadata": {"name": AZURE_PROVIDER_NAME, "namespace": NAMESPACE,
+                              "uid": "coordinator-provider-uid", "generation": 2},
+                 "status": {"ready": True,
+                           "conditions": [{"type": "Ready", "status": "True", "observedGeneration": 3}]},
              }),
              "eval failed: coordinator Provider was not Ready and spec-identical before Task submission"),
             ("spec-drift",
@@ -1598,7 +1638,8 @@ class ComposedEvalCliTestCase(unittest.TestCase):
 
     def seed_azure_delegate_evidence(self):
         self._switch_coordinator_to_azure()
-        self._set_delegate_result_evidence(self._delegate_events())
+        self._set_delegate_result_evidence(self._delegate_events_with_usage(
+            {"type": "ModelRequestCompleted", "inputTokens": 0, "outputTokens": 0}))
         return self.run_eval(
             "delegates", self.root / "delegates-task.json", **{"--model": AZURE_DEPLOYMENT})
 
@@ -1646,6 +1687,11 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             {"type": "ModelMessage", "contentText": FIXED_PHRASE},
         ]
         return [{**event, "seq": index} for index, event in enumerate(events, start=1)]
+
+    def _delegate_events_with_usage(self, *usage_events) -> list[dict]:
+        base_events = [{key: value for key, value in event.items() if key != "seq"} for event in self._delegate_events()]
+        combined = [*base_events[:-1], *usage_events, base_events[-1]]
+        return [{**event, "seq": index} for index, event in enumerate(combined, start=1)]
 
     def _set_delegate_result_evidence(self, events: list[dict], *, parent_result: str = FIXED_PHRASE,
                                       child_items=None, child_results: dict | None = None):
@@ -2697,21 +2743,66 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             "eval failed: existing evidence coordinator-provider-readback.json does not match a digest recorded by the existing live receipt",
         )
 
-        self.setUp()
-        self.seed_azure_delegate_evidence()
-        provider_path = self.evidence / "delegates" / "coordinator-provider-readback.json"
-        receipt = self.receipt("delegates")
-        old_digest = agentctl.sha256_hex(provider_path.read_bytes())
-        saved_provider = json.loads(provider_path.read_text(encoding="utf-8"))
-        saved_provider["spec"]["baseURL"] = "https://other.example.com/"
-        provider_path.write_text(json.dumps(saved_provider, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        new_digest = agentctl.sha256_hex(provider_path.read_bytes())
-        receipt["evidence_sha256"] = [new_digest if digest == old_digest else digest for digest in receipt["evidence_sha256"]]
-        agentctl._write_json(self.receipt_path("delegates"), receipt)
-        self._assert_reuse_failure_preserves_bytes(
-            self.reuse_eval_argv("delegates", **{"--model": AZURE_DEPLOYMENT}),
-            "eval failed: existing evidence coordinator-provider-readback.json does not match the current rendered coordinator Provider",
+        cases = (
+            ("spec-drift", lambda provider: provider["spec"].update({"baseURL": "https://other.example.com/"})),
+            ("missing-ready-condition", lambda provider: provider.__setitem__("status", {"ready": True, "conditions": []})),
+            ("stale-ready-condition", lambda provider: provider.update({
+                "metadata": {"name": AZURE_PROVIDER_NAME, "namespace": NAMESPACE,
+                             "uid": "coordinator-provider-uid", "generation": 2},
+                "status": {"ready": True,
+                          "conditions": [{"type": "Ready", "status": "True", "observedGeneration": 1}]},
+            })),
+            ("wrong-generation", lambda provider: provider.update({
+                "metadata": {"name": AZURE_PROVIDER_NAME, "namespace": NAMESPACE,
+                             "uid": "coordinator-provider-uid", "generation": 2},
+                "status": {"ready": True,
+                          "conditions": [{"type": "Ready", "status": "True", "observedGeneration": 3}]},
+            })),
         )
+        for label, mutate in cases:
+            with self.subTest(case=label):
+                self.setUp()
+                self.seed_azure_delegate_evidence()
+                provider_path = self.evidence / "delegates" / "coordinator-provider-readback.json"
+                receipt = self.receipt("delegates")
+                old_digest = agentctl.sha256_hex(provider_path.read_bytes())
+                saved_provider = json.loads(provider_path.read_text(encoding="utf-8"))
+                mutate(saved_provider)
+                provider_path.write_text(json.dumps(saved_provider, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                new_digest = agentctl.sha256_hex(provider_path.read_bytes())
+                receipt["evidence_sha256"] = [new_digest if digest == old_digest else digest for digest in receipt["evidence_sha256"]]
+                agentctl._write_json(self.receipt_path("delegates"), receipt)
+                self._assert_reuse_failure_preserves_bytes(
+                    self.reuse_eval_argv("delegates", **{"--model": AZURE_DEPLOYMENT}),
+                    "eval failed: existing evidence coordinator-provider-readback.json does not match the current rendered coordinator Provider",
+                )
+
+    def test_reuse_current_azure_anchor_requires_authenticated_parent_token_usage_evidence(self):
+        cases = (
+            ("missing", self._delegate_events(),
+             "eval failed: existing evidence journal-events.json does not prove authenticated parent token usage for the original live receipt"),
+            ("all-redacted", self._delegate_events_with_usage(
+                {"type": "ModelUsageUpdated", "inputTokens": 1, "contentOmitted": "policy"}),
+             "eval failed: existing evidence journal-events.json does not prove authenticated parent token usage for the original live receipt"),
+            ("malformed", self._delegate_events_with_usage(
+                {"type": "ModelRequestCompleted", "outputTokens": -1}),
+             "eval failed: existing evidence journal-events.json does not prove authenticated parent token usage for the original live receipt"),
+        )
+        for label, events, message in cases:
+            with self.subTest(case=label):
+                self.setUp()
+                self.seed_azure_delegate_evidence()
+                journal_path = self.evidence / "delegates" / "journal-events.json"
+                receipt = self.receipt("delegates")
+                old_digest = agentctl.sha256_hex(journal_path.read_bytes())
+                write_json(journal_path, {"events": events, "latestSeq": events[-1]["seq"] if events else 0})
+                new_digest = agentctl.sha256_hex(journal_path.read_bytes())
+                receipt["evidence_sha256"] = [new_digest if digest == old_digest else digest for digest in receipt["evidence_sha256"]]
+                agentctl._write_json(self.receipt_path("delegates"), receipt)
+                self._assert_reuse_failure_preserves_bytes(
+                    self.reuse_eval_argv("delegates", **{"--model": AZURE_DEPLOYMENT}),
+                    message,
+                )
 
     def test_reuse_only_migrates_the_exact_legacy_current_live_receipt_shape(self):
         cases = (
@@ -3871,12 +3962,24 @@ class LifecycleCliTestCase(unittest.TestCase):
              lambda: self.native_kubectl.responses[("providers.core.orka.ai", AZURE_PROVIDER_NAME)].__setitem__(
                  "status", {"ready": False}),
              "provider-ready", "fail"),
+            ("missing-ready-condition",
+             lambda: self.native_kubectl.responses[("providers.core.orka.ai", AZURE_PROVIDER_NAME)].__setitem__(
+                 "status", {"ready": True, "conditions": []}),
+             "provider-ready", "fail"),
             ("stale-ready-condition",
              lambda: self.native_kubectl.responses[("providers.core.orka.ai", AZURE_PROVIDER_NAME)].update({
                  "metadata": {"name": AZURE_PROVIDER_NAME, "namespace": NAMESPACE,
                               "uid": "coordinator-provider-uid", "generation": 2},
                  "status": {"ready": True,
                            "conditions": [{"type": "Ready", "status": "True", "observedGeneration": 1}]},
+             }),
+             "provider-ready", "fail"),
+            ("wrong-generation",
+             lambda: self.native_kubectl.responses[("providers.core.orka.ai", AZURE_PROVIDER_NAME)].update({
+                 "metadata": {"name": AZURE_PROVIDER_NAME, "namespace": NAMESPACE,
+                              "uid": "coordinator-provider-uid", "generation": 2},
+                 "status": {"ready": True,
+                           "conditions": [{"type": "Ready", "status": "True", "observedGeneration": 3}]},
              }),
              "provider-ready", "fail"),
             ("spec-drift",
@@ -3906,6 +4009,38 @@ class LifecycleCliTestCase(unittest.TestCase):
                           "coordinator-matches-restored", "coordinator-ready",
                           "provider-matches-restored", "provider-ready"})
         self.assertTrue((self.native_evidence / "coordinator-provider-readback.json").is_file())
+
+    def test_native_azure_rollback_requires_a_matching_current_ready_provider(self):
+        cases = (
+            ("missing", lambda: self.native_kubectl.failures.add(("providers.core.orka.ai", AZURE_PROVIDER_NAME)),
+             "provider-matches-restored", "not_evaluated"),
+            ("missing-ready-condition",
+             lambda: self.native_kubectl.responses[("providers.core.orka.ai", AZURE_PROVIDER_NAME)].__setitem__(
+                 "status", {"ready": True, "conditions": []}),
+             "provider-ready", "fail"),
+            ("wrong-generation",
+             lambda: self.native_kubectl.responses[("providers.core.orka.ai", AZURE_PROVIDER_NAME)].update({
+                 "metadata": {"name": AZURE_PROVIDER_NAME, "namespace": NAMESPACE,
+                              "uid": "coordinator-provider-uid", "generation": 2},
+                 "status": {"ready": True,
+                           "conditions": [{"type": "Ready", "status": "True", "observedGeneration": 3}]},
+             }),
+             "provider-ready", "fail"),
+            ("spec-drift",
+             lambda: self.native_kubectl.responses[("providers.core.orka.ai", AZURE_PROVIDER_NAME)]["spec"].update({"extra": True}),
+             "provider-matches-restored", "fail"),
+        )
+        for label, mutate, assertion, verdict in cases:
+            with self.subTest(case=label):
+                self.setup_native_composition()
+                self._switch_native_coordinator_to_azure()
+                mutate()
+                code, summary = self.run_native_lifecycle_with_code("rollback")
+                self.assertEqual(code, 1)
+                self.assertEqual(summary["verdict"], "fail")
+                receipt = self.native_receipt("rollback")
+                self.assertEqual(receipt["assertions"][assertion]["verdict"], verdict)
+                self.assertTrue((self.native_evidence / "coordinator-provider-readback.json").is_file())
 
     def test_native_mode_validates_catalogue_pins_before_cluster_calls(self):
         self.setup_native_composition()
