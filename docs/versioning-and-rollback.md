@@ -53,9 +53,10 @@ tools/rollback-verify \
 Rollback does not undo work already published outside the cluster. It does not
 restore the Agent object's UID or generation. In monitored-runtime mode, memory
 is checked against its baseline instead of being rewritten. In
-native-composition mode, rollback verifies the restored pinned child and
-coordinator definitions plus their Ready conditions. Work already running
-finishes on the version Orka pinned when it dispatched the Task.
+native-composition mode, rollback verifies the restored live pinned child and
+coordinator definitions plus their Ready conditions. It does not move work
+already running, and it does not guarantee that a later delegation will use a
+frozen child revision.
 
 ## Worked example
 

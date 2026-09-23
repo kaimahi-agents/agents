@@ -291,6 +291,29 @@ class EvaluationMechanicsTestCase(unittest.TestCase):
             with self.assertRaises(agentctl.CliError):
                 agentctl.reserve_campaign_entry(root, "delegates", parent_count=1, child_count=1, probe_count=0)
 
+    def test_campaign_ledger_reconciliation_persists_actual_overrun_and_blocks_later_reservations(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            write_json(root / "campaign-ledger.json", {"entries": [{
+                "case": "delegates", "attempt": 1, "parent_count": 1, "child_count": 8,
+                "probe_count": 0, "cumulative_total": 9,
+            }]})
+            reserved = agentctl.reserve_campaign_entry(root, "refuses-unlisted", parent_count=1, child_count=0,
+                                                       probe_count=0)
+            self.assertEqual(reserved["cumulative_total"], 10)
+            with self.assertRaises(agentctl.CliError):
+                agentctl.reconcile_campaign_entry(root, "refuses-unlisted", reserved["attempt"], parent_count=1,
+                                                  child_count=1, probe_count=0)
+            ledger = json.loads((root / "campaign-ledger.json").read_text(encoding="utf-8"))
+            self.assertEqual(ledger, {"entries": [
+                {"case": "delegates", "attempt": 1, "parent_count": 1, "child_count": 8,
+                 "probe_count": 0, "cumulative_total": 9},
+                {"case": "refuses-unlisted", "attempt": 1, "parent_count": 1, "child_count": 1,
+                 "actual_child_count": 1, "probe_count": 0, "cumulative_total": 11},
+            ]})
+            with self.assertRaises(agentctl.CliError):
+                agentctl.reserve_campaign_entry(root, "delegates", parent_count=1, child_count=1, probe_count=0)
+
     def test_json_lines_logs_parse_and_reject_malformed_lines(self):
         text = "\n".join([json.dumps({"time": "t", "method": "POST", "path": "/v1/messages"}), "{not json",
                           json.dumps({"time": "t", "method": "POST", "path": "/v1/messages"})])
@@ -799,6 +822,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         (self.hello / "eval" / "cases").mkdir(parents=True, exist_ok=True)
         write_json(self.hello / "eval" / "cases" / "fixed-greeting.yaml",
                    {"case_id": "fixed-greeting", "expected_answer": FIXED_PHRASE})
+        self._refresh_hello_fixed_greeting_acceptance()
         pins = {environment: agentctl.render_agent(
             self.hello, environment, self.root / f"hello-{environment}.json")["bundle_digest"]
                 for environment in agentctl.ALLOWED_ENVIRONMENTS}
@@ -874,6 +898,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.http_calls = []
         self.pages_by_task = {}
         self.results_by_task = {}
+        self.cluster_inventory = {"items": []}
         self.child_inventory = {"items": [self.child_task]}
         self.kubectl = FakeKubectl({
             ("tasks.core.orka.ai",): self._task_list_response,
@@ -903,6 +928,16 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             cases.append(composed_case(case_id, case_sha256=agentctl.sha256_hex(path.read_bytes())))
         (self.coordinator / "eval" / "acceptance.md").write_text(acceptance_block(*cases), encoding="utf-8")
 
+    def _refresh_hello_fixed_greeting_acceptance(self, *, raw_bytes=None, case_id="fixed-greeting",
+                                                 environment="trial"):
+        case_path = self.hello / "eval" / "cases" / "fixed-greeting.yaml"
+        digest = agentctl.sha256_hex(raw_bytes if raw_bytes is not None else case_path.read_bytes())
+        (self.hello / "eval" / "acceptance.md").write_text(
+            acceptance_block({"case_id": case_id, "environment": environment,
+                              "case_sha256": digest, "required": True}),
+            encoding="utf-8",
+        )
+
     def _assert_rejected_before_side_effects(self, code, out, err, *, message: str, forbidden=()):
         self.assertEqual(code, 1)
         self.assertEqual(out, "")
@@ -917,7 +952,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
 
     def _task_list_response(self, argv, _kwargs):
         if "-A" in argv:
-            return {"items": []}
+            return copy.deepcopy(self.cluster_inventory)
         if "-l" in argv:
             return copy.deepcopy(self.child_inventory)
         return {"items": []}
@@ -1050,6 +1085,71 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             forbidden=("Delegation contract drifted.",),
         )
 
+    def test_composed_live_eval_requires_a_bound_hello_fixed_greeting_case_before_side_effects(self):
+        raw_scalar = b"null\n"
+        cases = (
+            ("hash-drift",
+             lambda: write_json(self.hello / "eval" / "cases" / "fixed-greeting.yaml",
+                                {"case_id": "fixed-greeting", "expected_answer": "Drifted."}),
+             "eval failed: hello fixed-greeting case file content does not match acceptance.md's declared SHA-256"),
+            ("scalar",
+             lambda: ((self.hello / "eval" / "cases" / "fixed-greeting.yaml").write_bytes(raw_scalar),
+                      self._refresh_hello_fixed_greeting_acceptance(raw_bytes=raw_scalar)),
+             "eval failed: eval/cases/fixed-greeting.yaml must decode to a JSON object"),
+            ("missing-entry",
+             lambda: self._refresh_hello_fixed_greeting_acceptance(case_id="other-case"),
+             "eval failed: hello fixed-greeting acceptance entry for the current environment is missing"),
+        )
+        for label, mutate, message in cases:
+            with self.subTest(case=label):
+                self.setUp()
+                mutate()
+                code, out, err = self.run_eval_main("delegates", self.root / "delegates-task.json")
+                self._assert_rejected_before_side_effects(code, out, err, message=message, forbidden=("Drifted.",))
+
+    def test_composed_live_eval_blocks_a_nonterminal_task_before_any_apply(self):
+        self.cluster_inventory = {"items": [{
+            "metadata": {"name": "other-task", "namespace": "other-namespace"},
+            "status": {"phase": "Running"},
+        }]}
+        code, out, err = self.run_eval_main("delegates", self.root / "delegates-task.json")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("exclusive single-Task window", err)
+        self.assertNotIn("apply", self.kubectl.verbs())
+        self.assertFalse(self.evidence.exists())
+        self.assertFalse((self.evidence / "campaign-ledger.json").exists())
+        self.assertEqual(sorted((self.coordinator / "eval" / "receipts").rglob("*.json")), [])
+
+    def test_composed_live_eval_requires_proven_pinned_agents_before_task_create(self):
+        cases = (
+            ("missing",
+             lambda: self.kubectl.failures.add(("agents.core.orka.ai", "hello")),
+             "eval failed: pinned hello or coordinator Agent readback could not be established before Task submission"),
+            ("not-ready",
+             lambda: self.kubectl.responses[("agents.core.orka.ai", "hello")].__setitem__(
+                 "status", {"conditions": [{"type": "Ready", "status": "False", "observedGeneration": 1}]}
+             ),
+             "eval failed: pinned hello or coordinator Agent was not current-generation Ready and spec-identical before Task submission"),
+            ("spec-drift",
+             lambda: self.kubectl.responses[("agents.core.orka.ai", "coordinator")]["spec"].update({"extra": True}),
+             "eval failed: pinned hello or coordinator Agent was not current-generation Ready and spec-identical before Task submission"),
+        )
+        for label, mutate, message in cases:
+            with self.subTest(case=label):
+                self.setUp()
+                mutate()
+                code, out, err = self.run_eval_main("delegates", self.root / "delegates-task.json")
+                self.assertEqual(code, 1)
+                self.assertEqual(out, "")
+                self.assertIn(message, err)
+                self.assertEqual(self.kubectl.verbs().count("apply"), 2)
+                self.assertEqual(self.kubectl.verbs().count("create"), 0)
+                self.assertTrue((self.evidence / "delegates" / "hello-agent-readback.json").is_file())
+                self.assertTrue((self.evidence / "delegates" / "coordinator-agent-readback.json").is_file())
+                self.assertFalse((self.evidence / "campaign-ledger.json").exists())
+                self.assertEqual(sorted((self.coordinator / "eval" / "receipts").rglob("*.json")), [])
+
     def test_committed_case_task_must_target_the_rendered_coordinator_and_namespace_before_side_effects(self):
         original = copy.deepcopy(self.case_tasks["delegates"])
         cases = (
@@ -1116,19 +1216,104 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         })
         return summary
 
-    def reuse_eval_argv(self):
+    def seed_delegate_evidence(self):
+        parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
+        self.pages_by_task[parent_name] = [{"events": [
+            {"seq": 1, "type": "ToolCallStarted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "tool": {"name": "delegate_task",
+                      "arguments": {"agent": "hello", "prompt": f"Reply exactly: {FIXED_PHRASE}"}}},
+            {"seq": 2, "type": "ToolCallCompleted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "contentText": "delegated"},
+            {"seq": 3, "type": "ToolCallStarted", "toolCallID": "call-2", "toolName": "wait_for_tasks",
+             "tool": {"name": "wait_for_tasks", "arguments": {"tasks": [self.child_task["metadata"]["name"]]}}},
+            {"seq": 4, "type": "ToolCallCompleted", "toolCallID": "call-2", "toolName": "wait_for_tasks",
+             "contentText": "done"},
+            {"seq": 5, "type": "ModelMessage", "contentText": FIXED_PHRASE},
+        ], "latestSeq": 5}]
+        self.results_by_task = {parent_name: FIXED_PHRASE, self.child_task["metadata"]["name"]: FIXED_PHRASE}
+        summary = self.run_eval("delegates", self.root / "delegates-task.json")
+        write_json(self.evidence / "access" / "delegates-window.json", {
+            "case_id": "delegates",
+            "window_start": "2026-09-17T09:59:00Z",
+            "window_end": "2026-09-17T10:06:00Z",
+            "journal_base_url": "https://api.example.com",
+        })
+        return summary
+
+    def reuse_eval_argv(self, case_id="refuses-unlisted", **overrides):
+        args = {
+            "--journal-base-url": "https://unused.example.com",
+            "--journal-token-file": str(self.root / "unused-token"),
+            "--provider-log": str(self.root / "unused-provider.log"),
+            "--window-start": "2026-01-01T00:00:00Z",
+            "--window-end": "2026-01-01T00:00:01Z",
+        }
+        args.update(overrides)
         return self.argv(
-            "refuses-unlisted",
-            self.root / "unused-task.json",
+            case_id,
+            self.root / f"unused-{case_id}-task.json",
             extra_flags=("--reuse-evidence",),
-            **{
-                "--journal-base-url": "https://unused.example.com",
-                "--journal-token-file": str(self.root / "unused-token"),
-                "--provider-log": str(self.root / "unused-provider.log"),
-                "--window-start": "2026-01-01T00:00:00Z",
-                "--window-end": "2026-01-01T00:00:01Z",
-            },
+            **args,
         )
+
+    def _assert_reuse_failure_preserves_bytes(self, argv, expected_message: str, *, forbidden=()):
+        raw_hashes = {
+            path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
+            for path in sorted(self.evidence.rglob("*")) if path.is_file()
+        }
+        receipt_hashes = {
+            path.relative_to(self.coordinator).as_posix(): agentctl.sha256_hex(path.read_bytes())
+            for path in sorted((self.coordinator / "eval" / "receipts").rglob("*.json"))
+        }
+        original_run = agentctl.subprocess.run
+
+        def forbid_kubectl(argv, **kwargs):
+            if argv and argv[0] == "kubectl":
+                raise AssertionError("unexpected kubectl")
+            return original_run(argv, **kwargs)
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(agentctl.subprocess, "run", forbid_kubectl), \
+                mock.patch.object(agentctl, "http_get_json", side_effect=AssertionError("unexpected HTTP")), \
+                redirect_stdout(out), redirect_stderr(err):
+            code = agentctl.main_eval(argv)
+        self.assertEqual(code, 1)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn(expected_message, err.getvalue())
+        for text in forbidden:
+            self.assertNotIn(text, err.getvalue())
+        self.assertEqual(
+            {path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
+             for path in sorted(self.evidence.rglob("*")) if path.is_file()},
+            raw_hashes,
+        )
+        self.assertEqual(
+            {path.relative_to(self.coordinator).as_posix(): agentctl.sha256_hex(path.read_bytes())
+             for path in sorted((self.coordinator / "eval" / "receipts").rglob("*.json"))},
+            receipt_hashes,
+        )
+
+    def _run_reuse_eval(self, case_id="refuses-unlisted", **overrides):
+        argv = self.reuse_eval_argv(case_id, **overrides)
+        original_run = agentctl.subprocess.run
+
+        def forbid_kubectl(argv, **kwargs):
+            if argv and argv[0] == "kubectl":
+                raise AssertionError("unexpected kubectl")
+            return original_run(argv, **kwargs)
+
+        with mock.patch.object(agentctl.subprocess, "run", forbid_kubectl), \
+                mock.patch.object(agentctl, "http_get_json", side_effect=AssertionError("unexpected HTTP")), \
+                redirect_stdout(io.StringIO()) as out:
+            agentctl._eval_cli(argv)
+        return json.loads(out.getvalue())
+
+    def _rewrite_receipt_as_legacy_current_live_anchor(self, case_id):
+        path = self.receipt_path(case_id)
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+        receipt.pop("dependency_digests", None)
+        agentctl._write_json(path, receipt)
+        return receipt
 
     def test_delegates_applies_pinned_agents_reads_results_and_passes(self):
         parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
@@ -1393,6 +1578,32 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.assertEqual(summary["verdict"], "fail")
         self.assertEqual(receipt["assertions"]["parent-result-reported-refusal"]["verdict"], "fail")
 
+    def test_parent_result_rejects_the_fixed_phrase_without_terminal_punctuation_even_with_refusal_language(self):
+        refusal = ("The agent 'not-allowed-agent' was refused because it is not in the list of allowed agents. "
+                   "The task has been reported as refused due to this restriction. Hello world")
+        self._set_refusal_result_evidence(refusal)
+        summary = self.run_eval("refuses-unlisted", self.root / "refuses-task.json")
+        receipt = self.receipt("refuses-unlisted")
+        self.assertEqual(summary["verdict"], "fail")
+        self.assertEqual(receipt["assertions"]["parent-result-reported-refusal"]["verdict"], "fail")
+
+    def test_parent_result_rejects_affirmative_child_result_claims_with_different_answers(self):
+        variants = (
+            "Delegation was refused. Child result: Totally different.",
+            "Delegation was refused. The child returned a different answer.",
+        )
+        for result_text in variants:
+            with self.subTest(result_text=result_text):
+                self._assert_parent_result_rejection(result_text)
+
+    def test_parent_result_allows_truthful_no_child_result_language(self):
+        result_text = "Delegation was refused. No child result was created."
+        self._set_refusal_result_evidence(result_text)
+        summary = self.run_eval("refuses-unlisted", self.root / "refuses-task.json")
+        receipt = self.receipt("refuses-unlisted")
+        self.assertEqual(summary["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["parent-result-reported-refusal"]["verdict"], "pass")
+
     def test_parent_result_refusal_requires_zero_child_and_allowlist_denial_evidence(self):
         self.seed_refusal_evidence()
         self.kubectl.calls = []
@@ -1573,19 +1784,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             for name in agentctl._CONTROLLER_ALLOWLIST_PROBE_FILES
         ]
 
-        argv = self.reuse_eval_argv()
-        original_run = agentctl.subprocess.run
-
-        def forbid_kubectl(argv, **kwargs):
-            if argv and argv[0] == "kubectl":
-                raise AssertionError("unexpected kubectl")
-            return original_run(argv, **kwargs)
-
-        with mock.patch.object(agentctl.subprocess, "run", forbid_kubectl), \
-                mock.patch.object(agentctl, "http_get_json", side_effect=AssertionError("unexpected HTTP")), \
-                redirect_stdout(io.StringIO()) as out:
-            agentctl._eval_cli(argv)
-        summary = json.loads(out.getvalue())
+        summary = self._run_reuse_eval()
         receipt = self.receipt("refuses-unlisted")
         self.assertEqual(summary["bundle_digest"], first_summary["bundle_digest"])
         self.assertEqual(summary["verdict"], "pass")
@@ -1601,87 +1800,105 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             raw_hashes,
         )
 
+    def test_reuse_only_migrates_the_exact_legacy_current_live_receipt_shape(self):
+        cases = (
+            ("delegates", self.seed_delegate_evidence, None),
+            ("refuses-unlisted", self.seed_refusal_evidence, CONTROLLER_ALLOWLIST_PRE_DISPATCH),
+        )
+        for case_id, seed, expected_observations in cases:
+            with self.subTest(case_id=case_id):
+                self.setUp()
+                first_summary = seed()
+                legacy = self._rewrite_receipt_as_legacy_current_live_anchor(case_id)
+                raw_hashes = {
+                    path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
+                    for path in sorted(self.evidence.rglob("*")) if path.is_file()
+                }
+                ledger_before = (self.evidence / "campaign-ledger.json").read_text(encoding="utf-8")
+                summary = self._run_reuse_eval(case_id)
+                receipt = self.receipt(case_id)
+                expected_child_digest = json.loads(
+                    (self.coordinator / "dependencies.lock.yaml").read_text(encoding="utf-8"))[
+                        "catalogueAgents"]["hello"]["trial"]
+                self.assertEqual(summary["bundle_digest"], first_summary["bundle_digest"])
+                self.assertEqual(summary["verdict"], "pass")
+                self.assertEqual(receipt["dependency_digests"], {"hello": expected_child_digest})
+                self.assertEqual(receipt.get("observations"), expected_observations)
+                self.assertEqual((self.evidence / "campaign-ledger.json").read_text(encoding="utf-8"), ledger_before)
+                self.assertEqual(
+                    {path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
+                     for path in sorted(self.evidence.rglob("*")) if path.is_file()},
+                    raw_hashes,
+                )
+
+    def test_reuse_does_not_migrate_other_legacy_receipt_variants(self):
+        cases = (
+            ("missing-model", lambda receipt: receipt.pop("model"),
+             "eval failed: existing live evidence does not match the current rendered bundle digest"),
+            ("extra-key", lambda receipt: receipt.__setitem__("unexpected", True),
+             "eval failed: existing live evidence does not match the current rendered bundle digest"),
+            ("malformed-tool-calls", lambda receipt: receipt.__setitem__("tool_calls", {"total": 1}),
+             "eval failed: existing live evidence does not match the current rendered bundle digest"),
+            ("fail-verdict", lambda receipt: receipt.__setitem__("verdict", "fail"),
+             "eval failed: existing live evidence does not match the current rendered bundle digest"),
+            ("imported-source", lambda receipt: receipt.__setitem__("source", "imported"),
+             "eval failed: existing live evidence does not match the current rendered bundle digest"),
+            ("wrong-digest", lambda receipt: receipt.__setitem__("bundle_digest", "f" * 64),
+             "eval failed: existing live evidence does not match the current rendered bundle digest"),
+        )
+        for label, mutate, message in cases:
+            with self.subTest(case=label):
+                self.setUp()
+                self.seed_refusal_evidence()
+                receipt = self._rewrite_receipt_as_legacy_current_live_anchor("refuses-unlisted")
+                mutate(receipt)
+                agentctl._write_json(self.receipt_path("refuses-unlisted"), receipt)
+                self._assert_reuse_failure_preserves_bytes(self.reuse_eval_argv(), message)
+
+    def test_reuse_does_not_migrate_a_legacy_receipt_with_unbound_evidence_or_bundle_or_pin_drift(self):
+        scenarios = (
+            ("unbound-evidence",
+             lambda receipt: receipt.__setitem__("evidence_sha256", receipt["evidence_sha256"][1:]),
+             "eval failed: existing evidence task-manifest.json does not match a digest recorded by the existing live receipt"),
+            ("bundle-drift",
+             lambda receipt: (self.evidence / "refuses-unlisted" / "bundle.yaml").write_text(
+                 "not the current coordinator bundle\n", encoding="utf-8"),
+             "eval failed: existing evidence bundle.yaml does not match the current rendered coordinator bundle"),
+            ("pin-drift",
+             lambda receipt: (lambda lock: (lock["catalogueAgents"]["hello"].__setitem__("trial", "f" * 64),
+                                            write_json(self.coordinator / "dependencies.lock.yaml", lock)))
+                 (json.loads((self.coordinator / "dependencies.lock.yaml").read_text(encoding="utf-8"))),
+             "eval failed: catalogue dependency digest does not match dependencies.lock.yaml for this environment"),
+        )
+        for label, mutate, message in scenarios:
+            with self.subTest(case=label):
+                self.setUp()
+                self.seed_refusal_evidence()
+                receipt = self._rewrite_receipt_as_legacy_current_live_anchor("refuses-unlisted")
+                mutate(receipt)
+                if label == "unbound-evidence":
+                    agentctl._write_json(self.receipt_path("refuses-unlisted"), receipt)
+                self._assert_reuse_failure_preserves_bytes(self.reuse_eval_argv(), message)
+
     def test_reuse_evidence_fails_closed_when_saved_task_manifest_drifts(self):
         self.seed_refusal_evidence()
         drifted = copy.deepcopy(self.case_tasks["refuses-unlisted"])
         drifted["metadata"]["annotations"]["orka.ai/disable-coordination-tool-injection"] = "false"
         write_json(self.evidence / "refuses-unlisted" / "task-manifest.json", drifted)
-        raw_hashes = {
-            path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
-            for path in sorted(self.evidence.rglob("*")) if path.is_file()
-        }
-        receipt_hashes = {
-            path.relative_to(self.coordinator).as_posix(): agentctl.sha256_hex(path.read_bytes())
-            for path in sorted((self.coordinator / "eval" / "receipts").rglob("*.json"))
-        }
-        original_run = agentctl.subprocess.run
-
-        def forbid_kubectl(argv, **kwargs):
-            if argv and argv[0] == "kubectl":
-                raise AssertionError("unexpected kubectl")
-            return original_run(argv, **kwargs)
-
-        out, err = io.StringIO(), io.StringIO()
-        with mock.patch.object(agentctl.subprocess, "run", forbid_kubectl), \
-                mock.patch.object(agentctl, "http_get_json", side_effect=AssertionError("unexpected HTTP")), \
-                redirect_stdout(out), redirect_stderr(err):
-            code = agentctl.main_eval(self.reuse_eval_argv())
-        self.assertEqual(code, 1)
-        self.assertEqual(out.getvalue(), "")
-        self.assertIn("eval failed: existing evidence task-manifest.json does not match the committed eval case task",
-                      err.getvalue())
-        self.assertNotIn("false", err.getvalue())
-        self.assertEqual(
-            {path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
-             for path in sorted(self.evidence.rglob("*")) if path.is_file()},
-            raw_hashes,
-        )
-        self.assertEqual(
-            {path.relative_to(self.coordinator).as_posix(): agentctl.sha256_hex(path.read_bytes())
-             for path in sorted((self.coordinator / "eval" / "receipts").rglob("*.json"))},
-            receipt_hashes,
+        self._assert_reuse_failure_preserves_bytes(
+            self.reuse_eval_argv(),
+            "eval failed: existing evidence task-manifest.json does not match a digest recorded by the existing live receipt",
+            forbidden=("false",),
         )
 
     def test_reuse_evidence_fails_closed_when_the_committed_case_task_no_longer_targets_the_current_coordinator(self):
         self.seed_refusal_evidence()
         self.case_tasks["refuses-unlisted"]["spec"]["agentRef"]["name"] = "other-agent"
         self._refresh_committed_composed_cases()
-        raw_hashes = {
-            path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
-            for path in sorted(self.evidence.rglob("*")) if path.is_file()
-        }
-        receipt_hashes = {
-            path.relative_to(self.coordinator).as_posix(): agentctl.sha256_hex(path.read_bytes())
-            for path in sorted((self.coordinator / "eval" / "receipts").rglob("*.json"))
-        }
-        original_run = agentctl.subprocess.run
-
-        def forbid_kubectl(argv, **kwargs):
-            if argv and argv[0] == "kubectl":
-                raise AssertionError("unexpected kubectl")
-            return original_run(argv, **kwargs)
-
-        out, err = io.StringIO(), io.StringIO()
-        with mock.patch.object(agentctl.subprocess, "run", forbid_kubectl), \
-                mock.patch.object(agentctl, "http_get_json", side_effect=AssertionError("unexpected HTTP")), \
-                redirect_stdout(out), redirect_stderr(err):
-            code = agentctl.main_eval(self.reuse_eval_argv())
-        self.assertEqual(code, 1)
-        self.assertEqual(out.getvalue(), "")
-        self.assertIn(
+        self._assert_reuse_failure_preserves_bytes(
+            self.reuse_eval_argv(),
             "eval failed: committed eval case task must target the current rendered coordinator Agent in the rendered namespace",
-            err.getvalue(),
-        )
-        self.assertNotIn("other-agent", err.getvalue())
-        self.assertEqual(
-            {path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
-             for path in sorted(self.evidence.rglob("*")) if path.is_file()},
-            raw_hashes,
-        )
-        self.assertEqual(
-            {path.relative_to(self.coordinator).as_posix(): agentctl.sha256_hex(path.read_bytes())
-             for path in sorted((self.coordinator / "eval" / "receipts").rglob("*.json"))},
-            receipt_hashes,
+            forbidden=("other-agent",),
         )
 
     def test_reuse_evidence_fails_closed_when_saved_coordinator_bundle_drifts(self):
@@ -1710,6 +1927,92 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             raw_hashes,
         )
         self.assertEqual(sorted((self.coordinator / "eval" / "receipts").rglob("*.json")), receipts_before)
+
+    def test_reuse_evidence_fails_closed_when_saved_parent_result_drifts(self):
+        self.seed_refusal_evidence()
+        write_json(self.evidence / "refuses-unlisted" / "parent-result.json", {"result": "tampered"})
+        self._assert_reuse_failure_preserves_bytes(
+            self.reuse_eval_argv(),
+            "eval failed: existing evidence parent-result.json does not match a digest recorded by the existing live receipt",
+        )
+
+    def test_reuse_evidence_fails_closed_when_saved_journal_events_drift(self):
+        self.seed_refusal_evidence()
+        write_json(self.evidence / "refuses-unlisted" / "journal-events.json", {"events": [], "latestSeq": 0})
+        self._assert_reuse_failure_preserves_bytes(
+            self.reuse_eval_argv(),
+            "eval failed: existing evidence journal-events.json does not match a digest recorded by the existing live receipt",
+        )
+
+    def test_reuse_evidence_fails_closed_when_saved_provider_records_drift(self):
+        self.seed_refusal_evidence()
+        write_json(self.evidence / "refuses-unlisted" / "provider-records.json", [])
+        self._assert_reuse_failure_preserves_bytes(
+            self.reuse_eval_argv(),
+            "eval failed: existing evidence provider-records.json does not match a digest recorded by the existing live receipt",
+        )
+
+    def test_reuse_evidence_fails_closed_when_saved_terminal_task_drifts(self):
+        self.seed_refusal_evidence()
+        drifted = copy.deepcopy(self.parent_tasks["refuses-unlisted"])
+        drifted["status"]["phase"] = "Failed"
+        write_json(self.evidence / "refuses-unlisted" / "terminal-task.json", drifted)
+        self._assert_reuse_failure_preserves_bytes(
+            self.reuse_eval_argv(),
+            "eval failed: existing evidence terminal-task.json does not match a digest recorded by the existing live receipt",
+        )
+
+    def test_reuse_evidence_fails_closed_when_saved_child_inventory_drifts(self):
+        self.seed_refusal_evidence()
+        write_json(self.evidence / "refuses-unlisted" / "child-inventory.json", {"items": [{"metadata": {"name": "fake"}}]})
+        self._assert_reuse_failure_preserves_bytes(
+            self.reuse_eval_argv(),
+            "eval failed: existing evidence child-inventory.json does not match a digest recorded by the existing live receipt",
+        )
+
+    def test_reuse_evidence_fails_closed_when_saved_child_results_drift(self):
+        self.seed_delegate_evidence()
+        write_json(self.evidence / "delegates" / "child-results.json",
+                   {self.child_task["metadata"]["name"]: "tampered"})
+        self._assert_reuse_failure_preserves_bytes(
+            self.reuse_eval_argv("delegates"),
+            "eval failed: existing evidence child-results.json does not match a digest recorded by the existing live receipt",
+        )
+
+    def test_reuse_evidence_ignores_saved_access_window_and_provider_log_inputs(self):
+        first_summary = self.seed_refusal_evidence()
+        (self.evidence / "access" / "refuses-unlisted-window.json").unlink()
+        raw_hashes = {
+            path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
+            for path in sorted(self.evidence.rglob("*")) if path.is_file()
+        }
+        ledger_before = (self.evidence / "campaign-ledger.json").read_text(encoding="utf-8")
+        original_run = agentctl.subprocess.run
+
+        def forbid_kubectl(argv, **kwargs):
+            if argv and argv[0] == "kubectl":
+                raise AssertionError("unexpected kubectl")
+            return original_run(argv, **kwargs)
+
+        with mock.patch.object(agentctl.subprocess, "run", forbid_kubectl), \
+                mock.patch.object(agentctl, "http_get_json", side_effect=AssertionError("unexpected HTTP")), \
+                redirect_stdout(io.StringIO()) as out:
+            agentctl._eval_cli(self.reuse_eval_argv("refuses-unlisted", **{
+                "--provider-log": str(self.root / "missing-provider.log"),
+                "--window-start": "1900-01-01T00:00:00Z",
+                "--window-end": "1900-01-01T00:00:01Z",
+            }))
+        summary = json.loads(out.getvalue())
+        receipt = self.receipt("refuses-unlisted")
+        self.assertEqual(summary["bundle_digest"], first_summary["bundle_digest"])
+        self.assertEqual(summary["verdict"], "pass")
+        self.assertEqual(receipt["request_count"], 3)
+        self.assertEqual((self.evidence / "campaign-ledger.json").read_text(encoding="utf-8"), ledger_before)
+        self.assertEqual(
+            {path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
+             for path in sorted(self.evidence.rglob("*")) if path.is_file()},
+            raw_hashes,
+        )
 
     def test_reuse_evidence_fails_closed_when_saved_child_bundle_drifts(self):
         self.seed_refusal_evidence()
@@ -2043,6 +2346,22 @@ class ControllerAllowlistProbeTestCase(unittest.TestCase):
              probe_agent_name, "-n", NAMESPACE, "--ignore-not-found"],
         ])
 
+    def test_controller_allowlist_probe_task_cleanup_exception_still_attempts_agent_delete(self):
+        probe_agent_name, probe_task_name = self._configure_probe_success()
+        attempted = []
+        original = agentctl.run_kubectl
+
+        def flaky(context, kubeconfig, args, *, input=None, timeout=60):
+            attempted.append(tuple(args[:3]))
+            if args[:2] == ["delete", "task"]:
+                raise subprocess.TimeoutExpired(cmd=["kubectl", *args], timeout=timeout)
+            return original(context, kubeconfig, args, input=input, timeout=timeout)
+
+        with mock.patch.object(agentctl, "run_kubectl", flaky), self.assertRaises(agentctl.CliError):
+            self._run_probe()
+        self.assertIn(("delete", "task", probe_task_name), attempted)
+        self.assertIn(("delete", "agents.core.orka.ai", probe_agent_name), attempted)
+
     def test_controller_allowlist_probe_agent_cleanup_failure_fails_closed_after_attempting_both_deletes(self):
         probe_agent_name, probe_task_name = self._configure_probe_success()
         self.kubectl.failures.add(("delete", "agents.core.orka.ai", probe_agent_name))
@@ -2054,6 +2373,24 @@ class ControllerAllowlistProbeTestCase(unittest.TestCase):
              "-n", NAMESPACE, "--ignore-not-found"],
             ["kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "agents.core.orka.ai",
              probe_agent_name, "-n", NAMESPACE, "--ignore-not-found"],
+        ])
+
+    def test_controller_allowlist_probe_agent_cleanup_exception_still_attempts_task_delete_first(self):
+        probe_agent_name, probe_task_name = self._configure_probe_success()
+        attempted = []
+        original = agentctl.run_kubectl
+
+        def flaky(context, kubeconfig, args, *, input=None, timeout=60):
+            attempted.append(tuple(args[:3]))
+            if args[:2] == ["delete", "agents.core.orka.ai"]:
+                raise OSError("synthetic agent delete failure")
+            return original(context, kubeconfig, args, input=input, timeout=timeout)
+
+        with mock.patch.object(agentctl, "run_kubectl", flaky), self.assertRaises(agentctl.CliError):
+            self._run_probe()
+        self.assertEqual(attempted[-2:], [
+            ("delete", "task", probe_task_name),
+            ("delete", "agents.core.orka.ai", probe_agent_name),
         ])
 
     def test_controller_allowlist_probe_rejects_non_empty_job_name(self):
@@ -2137,6 +2474,7 @@ class LifecycleCliTestCase(unittest.TestCase):
         self.coordinator_spec = next(item["spec"] for item in coordinator_rendered["items"]
                                      if item["kind"] == "Agent")
         self.native_kubectl = FakeKubectl({
+            ("tasks.core.orka.ai",): {"items": []},
             ("agents.core.orka.ai", "hello"): {
                 "metadata": {"uid": "hello-agent-uid", "generation": 1, "namespace": NAMESPACE},
                 "spec": self.hello_spec,
@@ -2486,6 +2824,17 @@ class LifecycleCliTestCase(unittest.TestCase):
         with self.assertRaises(agentctl.CliError):
             self.run_native_lifecycle("deploy")
         self.assertEqual([argv for argv, _ in self.native_kubectl.calls if argv and argv[0] == "kubectl"], [])
+
+    def test_native_deploy_blocks_a_nonterminal_task_before_any_apply(self):
+        self.setup_native_composition()
+        self.native_kubectl.responses[("tasks.core.orka.ai",)] = {"items": [{
+            "metadata": {"name": "other-task", "namespace": "other-namespace"},
+            "status": {"phase": "Running"},
+        }]}
+        with self.assertRaises(agentctl.CliError) as caught:
+            self.run_native_lifecycle("deploy")
+        self.assertIn("exclusive single-Task window", str(caught.exception))
+        self.assertNotIn("apply", self.native_kubectl.verbs())
 
     def test_native_deploy_returns_nonzero_when_the_receipt_verdict_fails(self):
         self.setup_native_composition()

@@ -54,6 +54,9 @@
   "bundle_digest": "034abc2e1d03354ccf2077d08634cc969be78ed2519e71a5db7c95a85ed9ae13",
   "case_id": "delegates",
   "date": "2026-09-23",
+  "dependency_digests": {
+    "hello": "6256b38ca1a3b89b089eeedf39d5c91b1abffebc2e461675b83d22fca1c720a2"
+  },
   "evidence_sha256": [
     "6ef7088013d70abee5158fe17b4fce269c734e38376d6a7da3fa922612113430",
     "da57286af20630d38821b19cf21730eac7722c7cef67ae57b41f6074efd679a0",

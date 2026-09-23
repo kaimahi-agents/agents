@@ -160,6 +160,12 @@ class VerifyAgentTestCase(unittest.TestCase):
         self.receipt_path.unlink()
         self.assertTrue(any("no receipt found" in error for error in self.verify()))
 
+    def test_required_case_receipt_bundle_digest_must_match_its_directory_and_current_digest(self):
+        write_json(self.receipt_path, evaluation_receipt("demo-case", "c" * 64))
+        errors = self.verify()
+        self.assertTrue(any("receipt bundle_digest does not match the receipt directory and current rendered bundle digest"
+                            in error for error in errors))
+
     def test_case_file_must_match_the_declared_hash(self):
         (self.agent / "eval" / "cases" / "demo-case.yaml").write_text("id: tampered\n", encoding="utf-8")
         self.assertTrue(any("declared SHA-256" in error for error in self.verify()))
@@ -347,9 +353,31 @@ class VerifyAgentTestCase(unittest.TestCase):
             assertions={name: {"verdict": "pass", "evidence_completeness": True, "note": "n"}
                         for name in case["assertions"]},
             tool_calls={"total": case["limits"]["tool_calls"], "redacted": 0},
+            dependency_digests={"hello": "a" * 64},
         )
         write_json(self.agent / "eval" / "receipts" / digest / "refuses-unlisted.json", receipt)
         self.assertEqual(self.verify(), [])
+
+    def test_gate_rejects_a_current_digest_legacy_composed_live_receipt_missing_dependency_digests(self):
+        case = composed_case("refuses-unlisted", required=True, case_sha256=CASE_DIGEST)
+        (self.agent / "eval" / "acceptance.md").write_text(acceptance_block(case), encoding="utf-8")
+        (self.agent / "eval" / "policies").mkdir(parents=True, exist_ok=True)
+        (self.agent / "eval" / "policies" / "composed-coordination.md").write_text(
+            "policy text\n", encoding="utf-8")
+        case_path = self.agent / "eval" / "cases" / "refuses-unlisted.yaml"
+        case_path.write_text(CASE_TEXT, encoding="utf-8")
+        digest = agentctl.render_agent(self.agent, "trial", self.root / "probe-composed-legacy.yaml")["bundle_digest"]
+        receipt = evaluation_receipt(
+            "refuses-unlisted",
+            digest,
+            source="live",
+            assertions={name: {"verdict": "pass", "evidence_completeness": True, "note": "n"}
+                        for name in case["assertions"]},
+            tool_calls={"total": case["limits"]["tool_calls"], "redacted": 0},
+        )
+        write_json(self.agent / "eval" / "receipts" / digest / "refuses-unlisted.json", receipt)
+        errors = self.verify()
+        self.assertTrue(any("dependency_digests" in error for error in errors))
 
     def test_a_legacy_required_refusal_case_rejects_observations(self):
         case = required_case(case_id="refuses-unlisted", digest=CASE_DIGEST, required=True)
@@ -365,6 +393,7 @@ class VerifyAgentTestCase(unittest.TestCase):
                         for name in refusal["assertions"]},
             tool_calls={"total": refusal["limits"]["tool_calls"], "redacted": 0},
             observations=CONTROLLER_ALLOWLIST_PRE_DISPATCH,
+            dependency_digests={"hello": "a" * 64},
         )
         write_json(self.agent / "eval" / "receipts" / digest / "refuses-unlisted.json", receipt)
         errors = self.verify()
@@ -582,6 +611,7 @@ class EvaluationReceiptSchemaTestCase(unittest.TestCase):
             assertions={name: {"verdict": "pass", "evidence_completeness": True, "note": "n"}
                         for name in case["assertions"]},
             tool_calls={"total": case["limits"]["tool_calls"], "redacted": 0},
+            dependency_digests={"hello": "a" * 64},
         )
         receipt.update(overrides)
         return receipt
@@ -665,6 +695,24 @@ class EvaluationReceiptSchemaTestCase(unittest.TestCase):
         self.assertEqual(agentctl.validate_evaluation_receipt(self.receipt), [])
         self.assertTrue(agentctl.all_assertions_pass_and_complete(self.receipt["assertions"]))
 
+    def test_composed_receipts_require_the_fixed_dependency_digests_shape(self):
+        self.assertTrue(any("dependency_digests" in error
+                            for error in agentctl.validate_evaluation_receipt(
+                                self.composed_receipt("delegates", dependency_digests={"hello": "short"}))))
+        self.assertTrue(any("dependency_digests" in error
+                            for error in agentctl.validate_evaluation_receipt(
+                                self.composed_receipt("delegates", dependency_digests={"hello": "a" * 64,
+                                                                                        "extra": "b" * 64}))))
+        self.assertTrue(any("dependency_digests" in error
+                            for error in agentctl.validate_evaluation_receipt(
+                                self.composed_receipt("delegates", dependency_digests=None))))
+
+    def test_legacy_receipts_remain_valid_without_dependency_digests_but_reject_them_when_present(self):
+        self.assertEqual(agentctl.validate_evaluation_receipt(self.receipt), [])
+        errors = agentctl.validate_evaluation_receipt(
+            evaluation_receipt("demo-case", "d" * 64, dependency_digests={"hello": "a" * 64}))
+        self.assertTrue(any("dependency_digests" in error for error in errors))
+
     def test_observations_stay_optional_for_legacy_and_composed_receipts(self):
         self.assertNotIn("observations", self.receipt)
         self.assertEqual(agentctl.validate_evaluation_receipt(self.receipt), [])
@@ -687,6 +735,7 @@ class EvaluationReceiptSchemaTestCase(unittest.TestCase):
 
     def test_observations_reject_malformed_controller_probe_values(self):
         variants = (
+            None,
             {"wrong-id": CONTROLLER_ALLOWLIST_PRE_DISPATCH["controller-allowlist-pre-dispatch"]},
             {"controller-allowlist-pre-dispatch": {"verdict": "pass", "evidence_completeness": True,
                                                      "note": "controller rejected the unlisted target before dispatch"}},

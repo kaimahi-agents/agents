@@ -217,9 +217,9 @@ _VERDICTS = frozenset({"pass", "fail"})
 _SOURCES = frozenset({"live", "imported"})
 EVALUATION_RECEIPT_REQUIRED_KEYS = frozenset({"case_id", "bundle_digest", "date", "source", "model",
                                               "request_count", "verdict", "assertions", "evidence_sha256"})
-# `tool_calls` and `observations` are informational only -- present or absent, they never change a
-# verdict -- so a v1 receipt without them stays valid unchanged.
-EVALUATION_RECEIPT_OPTIONAL_KEYS = frozenset({"tool_calls", "observations"})
+# `tool_calls`, `observations`, and composed dependency digests are informational only -- present
+# or absent, they never change a verdict -- so a v1 receipt without them stays valid unchanged.
+EVALUATION_RECEIPT_OPTIONAL_KEYS = frozenset({"tool_calls", "observations", "dependency_digests"})
 EVALUATION_RECEIPT_KEYS = EVALUATION_RECEIPT_REQUIRED_KEYS | EVALUATION_RECEIPT_OPTIONAL_KEYS
 def is_valid_tool_calls(value) -> bool:
     return (isinstance(value, dict) and set(value) == {"total", "redacted"} and _is_count(value.get("total"))
@@ -257,14 +257,32 @@ def all_assertions_pass_and_complete(assertions) -> bool:
     return bool(isinstance(assertions, dict) and assertions and all(
         is_safe_slug(name) and isinstance(value, dict) and value.get("verdict") == "pass"
         and value.get("evidence_completeness") is True for name, value in assertions.items()))
-def _receipt_allows_observations(receipt) -> bool:
+def _receipt_requires_dependency_digests(receipt) -> bool:
     assertions = receipt.get("assertions") if isinstance(receipt, dict) else None
-    return (receipt.get("case_id") == "refuses-unlisted"
-            and isinstance(assertions, dict)
-            and set(assertions) == COMPOSED_ASSERTIONS["refuses-unlisted"])
+    case_id = receipt.get("case_id") if isinstance(receipt, dict) else None
+    return bool(case_id in COMPOSED_ASSERTIONS and isinstance(assertions, dict)
+                and set(assertions) == set(COMPOSED_ASSERTIONS[case_id]))
+
+def _receipt_allows_observations(receipt) -> bool:
+    return bool(receipt.get("case_id") == "refuses-unlisted" and _receipt_requires_dependency_digests(receipt)
+                and set(receipt.get("assertions", {})) == set(COMPOSED_ASSERTIONS["refuses-unlisted"]))
+
+def _validate_dependency_digests(receipt, errors: list[str]) -> None:
+    dependency_digests = receipt.get("dependency_digests")
+    if _receipt_requires_dependency_digests(receipt):
+        if not (isinstance(dependency_digests, dict) and set(dependency_digests) == {_EXPECTED_COMPOSED_CHILD}
+                and _is_hex_digest(dependency_digests.get(_EXPECTED_COMPOSED_CHILD))):
+            errors.append("dependency_digests must contain only hello mapped to a 64-character lowercase hex SHA-256 digest")
+        return
+    if "dependency_digests" in receipt:
+        errors.append("dependency_digests are allowed only for the fixed composed receipt shapes")
+
 def _validate_observations(receipt, errors: list[str]) -> None:
+    if "observations" not in receipt:
+        return
     observations = receipt.get("observations")
     if observations is None:
+        errors.append("observations must use the fixed closed object shape when present")
         return
     if not _receipt_allows_observations(receipt):
         errors.append("observations are allowed only for the fixed composed refusal receipt shape")
@@ -292,6 +310,7 @@ def validate_evaluation_receipt(receipt) -> list[str]:
         errors.append("tool_calls must be an object with exactly total/redacted non-negative integers, "
                       "redacted no greater than total")
     _validate_assertions(receipt["assertions"], errors, "evaluation receipt")
+    _validate_dependency_digests(receipt, errors)
     _validate_observations(receipt, errors)
     evidence = receipt["evidence_sha256"]
     if not isinstance(evidence, list) or not evidence or not all(map(_is_hex_digest, evidence)):
@@ -487,6 +506,9 @@ def _verify_required_case(agent_dir: Path, environment: str, bundle_digest: str,
         schema_errors = validate_evaluation_receipt(receipt)
         if "observations" in receipt and not _case_allows_observations(case, receipt):
             schema_errors.append("observations are allowed only when the acceptance case is bound to the fixed composed refusal policy shape")
+        if receipt.get("bundle_digest") != bundle_digest:
+            schema_errors.append(
+                "receipt bundle_digest does not match the receipt directory and current rendered bundle digest")
         errors += [f"{receipt_path.name}: {error}"
                    for error in schema_errors + find_prohibited_in_document(receipt, "receipt")]
         if not schema_errors and receipt["verdict"] != "pass":
@@ -1171,8 +1193,12 @@ def reconcile_campaign_entry(evidence_root, case_id: str, attempt: int, *, paren
         entry["cumulative_total"] = cumulative
     if not matched:
         raise CliError("campaign ledger entry was not found for reconciliation")
-    _require(_validate_campaign_ledger(ledger))
+    validation_errors = _validate_campaign_ledger(ledger)
+    cap_error = "campaign ledger exceeds the ten-Task campaign cap"
+    _require([error for error in validation_errors if error != cap_error])
     _write_json_atomic(_campaign_ledger_path(evidence_root), ledger)
+    if cap_error in validation_errors:
+        raise CliError(cap_error)
     return next(entry for entry in ledger["entries"] if entry["case"] == case_id and entry["attempt"] == attempt)
 
 def campaign_case_reserved(evidence_root, case_id: str) -> bool:
@@ -1202,9 +1228,37 @@ def _load_existing_live_evaluation_receipt(agent_dir, bundle_digest: str, case_i
     return receipt
 
 
-def _load_preserved_controller_allowlist_observation(agent_dir, bundle_digest: str, case_id: str,
-                                                     evidence_dir) -> tuple[dict | None, list[str]]:
-    receipt = _load_existing_live_evaluation_receipt(agent_dir, bundle_digest, case_id)
+def _legacy_composed_reuse_anchor_key_sets(case_id: str) -> set[frozenset[str]]:
+    base = frozenset(EVALUATION_RECEIPT_REQUIRED_KEYS | {"tool_calls"})
+    return ({base, frozenset(set(base) | {"observations"})}
+            if case_id == "refuses-unlisted" else {base})
+
+
+def _load_existing_live_reuse_anchor_receipt(agent_dir, bundle_digest: str, case_id: str,
+                                             expected_dependency_digests: dict[str, str]) -> dict | None:
+    receipt_path = Path(agent_dir) / "eval" / "receipts" / bundle_digest / f"{case_id}.json"
+    if not receipt_path.is_file():
+        return None
+    receipt = _read_json(receipt_path, "existing evaluation receipt")
+    if (not validate_evaluation_receipt(receipt)
+            and receipt.get("case_id") == case_id
+            and receipt.get("bundle_digest") == bundle_digest
+            and receipt.get("source") == "live"):
+        return receipt
+    if (not isinstance(receipt, dict)
+            or "dependency_digests" in receipt
+            or set(receipt) not in _legacy_composed_reuse_anchor_key_sets(case_id)
+            or receipt.get("case_id") != case_id
+            or receipt.get("bundle_digest") != bundle_digest
+            or receipt.get("source") != "live"
+            or receipt.get("verdict") != "pass"):
+        return None
+    candidate = copy.deepcopy(receipt)
+    candidate["dependency_digests"] = expected_dependency_digests
+    return receipt if not validate_evaluation_receipt(candidate) else None
+
+
+def _preserved_controller_allowlist_observation_from_receipt(receipt, evidence_dir) -> tuple[dict | None, list[str]]:
     if receipt is None or receipt.get("verdict") != "pass":
         return None, []
     observations = receipt.get("observations") if isinstance(receipt, dict) else None
@@ -1215,6 +1269,12 @@ def _load_preserved_controller_allowlist_observation(agent_dir, bundle_digest: s
             or not set(probe_digests).issubset(set(evidence_sha256))):
         return None, []
     return dict(observation), probe_digests
+
+
+def _load_preserved_controller_allowlist_observation(agent_dir, bundle_digest: str, case_id: str,
+                                                     evidence_dir) -> tuple[dict | None, list[str]]:
+    return _preserved_controller_allowlist_observation_from_receipt(
+        _load_existing_live_evaluation_receipt(agent_dir, bundle_digest, case_id), evidence_dir)
 
 
 def _existing_file_sha256(path, label: str) -> str:
@@ -1229,15 +1289,31 @@ def _existing_evidence_sha256(evidence_dir, names) -> list[str]:
         _existing_file_sha256(Path(evidence_dir) / name, f"existing evidence {name}") for name in names))
 
 
+def _require_receipt_bound_evidence_digest(receipt: dict, evidence_dir, name: str) -> str:
+    digest = _existing_file_sha256(Path(evidence_dir) / name, f"existing evidence {name}")
+    evidence_sha256 = receipt.get("evidence_sha256") if isinstance(receipt, dict) else None
+    if not isinstance(evidence_sha256, list) or digest not in evidence_sha256:
+        raise CliError(f"existing evidence {name} does not match a digest recorded by the existing live receipt")
+    return digest
+
+
+def _read_receipt_bound_json(receipt: dict, evidence_dir, name: str):
+    _require_receipt_bound_evidence_digest(receipt, evidence_dir, name)
+    return _read_json(Path(evidence_dir) / name, f"existing evidence {name}")
+
+
 def _require_reusable_composed_evidence(agent_dir, bundle_digest: str, case_id: str,
-                                        evidence_dir, render_context: dict) -> None:
-    if _load_existing_live_evaluation_receipt(agent_dir, bundle_digest, case_id) is None:
-        raise CliError("existing live evidence does not match the current rendered bundle digest")
+                                        evidence_dir, render_context: dict) -> dict:
     for name, label, expected_sha256 in (
             ("bundle.yaml", "current rendered coordinator bundle", render_context["coordinator_bundle_sha256"]),
             ("hello-bundle.yaml", "current rendered pinned child bundle", render_context["child_bundle_sha256"])):
         if _existing_file_sha256(Path(evidence_dir) / name, f"existing evidence {name}") != expected_sha256:
             raise CliError(f"existing evidence {name} does not match the {label}")
+    receipt = _load_existing_live_reuse_anchor_receipt(
+        agent_dir, bundle_digest, case_id, {_EXPECTED_COMPOSED_CHILD: render_context["child_digest"]})
+    if receipt is None:
+        raise CliError("existing live evidence does not match the current rendered bundle digest")
+    return receipt
 
 def check_window_covers_task(window_start, window_end, task_start, task_end) -> list[str]:
     """Diagnostics; empty means the asserted window covers the Task exactly, with no tolerance."""
@@ -1255,6 +1331,19 @@ def check_single_task_reservation(existing_tasks, reserved_task_name: str,
                  and task.get("phase") not in TASK_TERMINAL_PHASES)
     return [f"{others} other Task(s) in the cluster-wide inventory are non-terminal; the reserved Task cannot be "
             "evaluated as an exclusive single-Task window"] if others else []
+
+def _require_task_inventory_clear(context: str, kubeconfig: str, *, reserved_task_name: str = "",
+                                  reserved_task_namespace: str = "") -> None:
+    inventory = run_kubectl_json(context, kubeconfig, ["get", "tasks.core.orka.ai", "-A"])
+    _require(check_single_task_reservation(
+        [{"name": item.get("metadata", {}).get("name"),
+          "namespace": item.get("metadata", {}).get("namespace"),
+          "phase": item.get("status", {}).get("phase")}
+         for item in inventory.get("items", []) if isinstance(item, dict)],
+        reserved_task_name,
+        reserved_task_namespace,
+    ))
+
 def check_zero_retries(task_manifest) -> list[str]:
     """Zero retries via `maxRetries`/`retries`, else nested `retryPolicy.maxRetries` (PR 3's live
     form); absence in every form is never zero."""
@@ -1508,10 +1597,28 @@ def get_task_result(base_url, task_name, namespace, *, token=None) -> str:
         raise CliError("authenticated Task result was missing a result string")
     return result
 
-def load_fixed_greeting_expected_answer(agent_dir) -> str:
-    """Read the current child fixed-phrase contract from hello's case file."""
-    case = _read_json(Path(agent_dir) / "eval" / "cases" / f"{_FIXED_GREETING_CASE_ID}.yaml",
-                      "eval/cases/fixed-greeting.yaml")
+def load_fixed_greeting_expected_answer(agent_dir, *, environment: str) -> str:
+    """Read hello's fixed phrase only from the acceptance-bound case for this environment."""
+    try:
+        acceptance_cases = parse_acceptance_cases(
+            _read_text(Path(agent_dir) / "eval" / "acceptance.md", "eval/acceptance.md"))
+    except BundleError as exc:
+        raise CliError(str(exc)) from exc
+    matches = [case for case in acceptance_cases
+               if case.get("case_id") == _FIXED_GREETING_CASE_ID and case.get("environment") == environment]
+    if len(matches) != 1:
+        raise CliError("hello fixed-greeting acceptance entry for the current environment is missing")
+    case_path = Path(agent_dir) / "eval" / "cases" / f"{_FIXED_GREETING_CASE_ID}.yaml"
+    try:
+        raw = case_path.read_bytes()
+    except OSError as exc:
+        raise CliError("could not read eval/cases/fixed-greeting.yaml") from exc
+    if sha256_hex(raw) != matches[0]["case_sha256"]:
+        raise CliError("hello fixed-greeting case file content does not match acceptance.md's declared SHA-256")
+    try:
+        case = load_json_object("eval/cases/fixed-greeting.yaml", raw)
+    except BundleError as exc:
+        raise CliError(str(exc)) from exc
     answer = case.get("expected_answer") if isinstance(case, dict) else None
     if not isinstance(answer, str) or not answer:
         raise CliError("eval/cases/fixed-greeting.yaml must define a non-empty expected_answer")
@@ -1651,6 +1758,10 @@ _REFUSAL_RESULT_POSITIVE_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for
     r"\bwas refused\b",
     r"\breported as refused\b",
 ))
+_REFUSAL_RESULT_INVENTED_CHILD_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
+    r"\bchild result\s*:\s*\S",
+    r"\b(?:the\s+)?child returned\b",
+))
 
 def _allowlist_denial_target_from_event(event) -> str | None:
     text = visible_event_text(event)
@@ -1669,8 +1780,15 @@ def _live_agent_matches(live_obj, rendered_item, namespace: str):
                 and live_obj.get("spec") == rendered_item.get("spec") and _agent_ready_readback(live_obj) is True)
 
 
-def _contains_case_insensitive(text: str, expected: str) -> bool:
-    return expected.casefold() in text.casefold()
+def _contains_fixed_phrase_ignoring_terminal_sentence_punctuation(text: str, expected: str) -> bool:
+    normalized = _strip_terminal_sentence_punctuation(expected)
+    pattern = re.compile(rf"(?<!\w){re.escape(normalized)}(?:[.!?]+)?(?!\w)", re.IGNORECASE)
+    return bool(pattern.search(text))
+
+
+def _parent_result_fabricates_child_result(text: str, expected: str) -> bool:
+    return (_contains_fixed_phrase_ignoring_terminal_sentence_punctuation(text, expected)
+            or any(pattern.search(text) for pattern in _REFUSAL_RESULT_INVENTED_CHILD_PATTERNS))
 
 
 def _parent_result_reports_refusal(text: str) -> bool:
@@ -1762,18 +1880,22 @@ def run_controller_allowlist_probe(args, *, evidence_dir: Path, coordinator_live
         return dict(CONTROLLER_ALLOWLIST_OBSERVATION)
     finally:
         cleanup_errors = []
+
+        def attempt_cleanup(label: str, kubectl_args) -> None:
+            try:
+                deleted = run_kubectl(args.context, args.kubeconfig, kubectl_args)
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                cleanup_errors.append(f"controller allowlist probe {label} cleanup failed ({type(exc).__name__})")
+                return
+            if deleted.returncode != 0:
+                cleanup_errors.append(f"controller allowlist probe {label} cleanup failed (kubectl exited {deleted.returncode})")
+
         if created_task:
-            deleted = run_kubectl(args.context, args.kubeconfig,
-                                  ["delete", "task", probe_task_name, "-n", args.namespace,
-                                   "--ignore-not-found"])
-            if deleted.returncode != 0:
-                cleanup_errors.append(f"controller allowlist probe Task cleanup failed (kubectl exited {deleted.returncode})")
+            attempt_cleanup("Task", ["delete", "task", probe_task_name, "-n", args.namespace,
+                                      "--ignore-not-found"])
         if created_agent:
-            deleted = run_kubectl(args.context, args.kubeconfig,
-                                  ["delete", "agents.core.orka.ai", probe_agent_name, "-n", args.namespace,
-                                   "--ignore-not-found"])
-            if deleted.returncode != 0:
-                cleanup_errors.append(f"controller allowlist probe Agent cleanup failed (kubectl exited {deleted.returncode})")
+            attempt_cleanup("Agent", ["delete", "agents.core.orka.ai", probe_agent_name, "-n", args.namespace,
+                                       "--ignore-not-found"])
         if cleanup_errors:
             raise CliError("; ".join(cleanup_errors))
 
@@ -1887,8 +2009,8 @@ ROLLBACK_LIMITATIONS = (
     "No external system was involved or checked.",
 )
 NATIVE_COMPOSITION_ROLLBACK_LIMITATIONS = (
-    "Verification covers restored live catalogue definitions, not immutable native runtime revision binding.",
-    "Already-running work, had there been any, would continue on the previous version.",
+    "Verification covers restored live catalogue definitions and Ready conditions, not immutable native runtime revision binding.",
+    "Already-running work, had there been any, would continue on the previous version; rollback does not move it or guarantee a later delegation uses a frozen child revision.",
     "No external system was involved or checked.",
 )
 _LIFECYCLE = {
@@ -2147,6 +2269,15 @@ def _native_agent_matches_rendered(live_agent, rendered_item, expected_namespace
                 and live_agent.get("spec") == rendered_item.get("spec"))
 
 
+def _require_live_pinned_agents_before_task_submission(child_live, coordinator_live, *, render_context: dict,
+                                                       namespace: str) -> None:
+    if child_live is None or coordinator_live is None:
+        raise CliError("pinned hello or coordinator Agent readback could not be established before Task submission")
+    if not (_live_agent_matches(child_live, render_context["child_agent_item"], namespace)
+            and _live_agent_matches(coordinator_live, render_context["coordinator_agent_item"], namespace)):
+        raise CliError("pinned hello or coordinator Agent was not current-generation Ready and spec-identical before Task submission")
+
+
 def _shared_readback_namespace(*agent_objs):
     observed = []
     for agent_obj in agent_objs:
@@ -2169,6 +2300,7 @@ def _native_composition_lifecycle_cli(kind: str, argv) -> int:
     rendered = _load_native_composition_rendered(args)
 
     if kind == "deploy":
+        _require_task_inventory_clear(args.context, args.kubeconfig)
         for label, path in (("child", rendered["child_path"]), ("coordinator", rendered["coordinator_path"])):
             applied = run_kubectl(args.context, args.kubeconfig, ["apply", "-n", args.namespace, "-f", str(path)])
             if applied.returncode != 0:
@@ -2440,7 +2572,7 @@ def _prepare_composed_render_context(args, *, evidence_dir: Path | None) -> dict
     if child_slug is None:
         raise CliError("the pinned hello child could not be resolved in the catalogue")
     child_dir = coordinator_dir.parent.parent / "agents" / child_slug
-    expected_phrase = load_fixed_greeting_expected_answer(child_dir)
+    expected_phrase = load_fixed_greeting_expected_answer(child_dir, environment=args.environment)
     pinned_child_digest = lock[_EXPECTED_COMPOSED_CHILD][args.environment]
     if evidence_dir is None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2472,6 +2604,7 @@ def _prepare_composed_render_context(args, *, evidence_dir: Path | None) -> dict
     return {
         "bundle_digest": bundle_digest,
         "expected_phrase": expected_phrase,
+        "child_digest": pinned_child_digest,
         "child_agent_item": child_agent_item,
         "coordinator_agent_item": coordinator_agent_item,
         "child_agent_name": child_agent_name,
@@ -2687,7 +2820,7 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
         refusal_pass_proven = all(assertion["verdict"] == "pass" for assertion in foundational)
         refusal_evidence_incomplete = any(assertion["verdict"] == "not_evaluated" for assertion in foundational)
         refusal_reported = _parent_result_reports_refusal(parent_result) if isinstance(parent_result, str) else None
-        invented_result = (_contains_case_insensitive(parent_result, render_context["expected_phrase"])
+        invented_result = (_parent_result_fabricates_child_result(parent_result, render_context["expected_phrase"])
                            if isinstance(parent_result, str) else None)
         assertions |= {
             "attempted-unlisted-delegation": attempted_unlisted,
@@ -2711,6 +2844,7 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
         "request_count": count if established else None,
         "verdict": "pass" if all_assertions_pass_and_complete(assertions) else "fail",
         "assertions": assertions,
+        "dependency_digests": {_EXPECTED_COMPOSED_CHILD: render_context["child_digest"]},
         "tool_calls": {"total": total_calls, "redacted": redacted_calls},
         "evidence_sha256": [],
     }
@@ -2738,8 +2872,7 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict, dict | No
     annotations = metadata.get("annotations") if isinstance(metadata, dict) else None
     if not isinstance(annotations, dict) or annotations.get(_DISABLE_COORDINATION_TOOL_INJECTION) != "true":
         raise CliError("Task manifest must set orka.ai/disable-coordination-tool-injection to 'true'")
-    reserved = reserve_campaign_entry(args.evidence_root, args.case_id, parent_count=1,
-                                      child_count=limits["child_tasks"], probe_count=0)
+    _require_task_inventory_clear(args.context, args.kubeconfig)
     render_context = _prepare_composed_render_context(args, evidence_dir=evidence_dir)
 
     def apply_bundle(path: Path) -> None:
@@ -2762,12 +2895,15 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict, dict | No
     coordinator_live = wait_for_current_agent_readback(
         lambda: get_agent(render_context["coordinator_agent_name"]), max_attempts=args.max_poll_attempts,
         poll_interval_seconds=args.poll_interval_seconds)
-    inventory = run_kubectl_json(args.context, args.kubeconfig, ["get", "tasks.core.orka.ai", "-A"])
-    _require(check_single_task_reservation(
-        [{"name": item.get("metadata", {}).get("name"),
-          "namespace": item.get("metadata", {}).get("namespace"),
-          "phase": item.get("status", {}).get("phase")}
-         for item in inventory.get("items", []) if isinstance(item, dict)], task_name, args.namespace))
+    for name, data in (("hello-agent-readback.json", child_live),
+                       ("coordinator-agent-readback.json", coordinator_live)):
+        _write_json(evidence_dir / name, data)
+    _require_live_pinned_agents_before_task_submission(
+        child_live, coordinator_live, render_context=render_context, namespace=args.namespace)
+    reserved = reserve_campaign_entry(args.evidence_root, args.case_id, parent_count=1,
+                                      child_count=limits["child_tasks"], probe_count=0)
+    _require_task_inventory_clear(
+        args.context, args.kubeconfig, reserved_task_name=task_name, reserved_task_namespace=args.namespace)
     submit = run_kubectl(args.context, args.kubeconfig, ["create", "-n", args.namespace, "-f", "-"],
                          input=json.dumps(task_manifest))
     if submit.returncode != 0:
@@ -2854,50 +2990,51 @@ def _reuse_composed_coordination(args, case: dict) -> tuple[dict, dict, dict | N
     if not _is_date(args.date):
         raise CliError("date must use a real YYYY-MM-DD calendar date")
     evidence_dir = Path(args.evidence_root) / args.case_id
-    window_payload = _read_json(Path(args.evidence_root) / "access" / f"{args.case_id}-window.json",
-                                f"existing evidence access/{args.case_id}-window.json")
-    if (not isinstance(window_payload, dict) or window_payload.get("case_id") != args.case_id
-            or not isinstance(window_payload.get("window_start"), str)
-            or not isinstance(window_payload.get("window_end"), str)):
-        raise CliError("existing evidence access window must contain matching case_id, window_start, and window_end")
     reuse_args = argparse.Namespace(**vars(args))
-    reuse_args.window_start = window_payload["window_start"]
-    reuse_args.window_end = window_payload["window_end"]
     render_context = _prepare_composed_render_context(reuse_args, evidence_dir=None)
     case_task = _load_validated_composed_case_task(
         args.agent_dir, case, render_context=render_context, namespace=args.namespace)
-    _require_reusable_composed_evidence(args.agent_dir, render_context["bundle_digest"], args.case_id,
-                                        evidence_dir, render_context)
-    task_manifest = _read_json(evidence_dir / "task-manifest.json", "existing evidence task-manifest.json")
+    prior_receipt = _require_reusable_composed_evidence(
+        args.agent_dir, render_context["bundle_digest"], args.case_id, evidence_dir, render_context)
+    task_manifest = _read_receipt_bound_json(prior_receipt, evidence_dir, "task-manifest.json")
     _require_task_manifest_matches_committed_case(
         task_manifest, case_task, label="existing evidence task-manifest.json")
-    terminal_task = _read_json(evidence_dir / "terminal-task.json", "existing evidence terminal-task.json")
-    journal_payload = _read_json(evidence_dir / "journal-events.json", "existing evidence journal-events.json")
+    terminal_task = _read_receipt_bound_json(prior_receipt, evidence_dir, "terminal-task.json")
+    journal_payload = _read_receipt_bound_json(prior_receipt, evidence_dir, "journal-events.json")
     events = journal_payload.get("events") if isinstance(journal_payload, dict) else None
     latest_seq = journal_payload.get("latestSeq") if isinstance(journal_payload, dict) else None
     if not isinstance(events, list):
         raise CliError("existing evidence journal-events.json must contain an events array")
-    records = _read_json(evidence_dir / "provider-records.json", "existing evidence provider-records.json")
+    records = _read_receipt_bound_json(prior_receipt, evidence_dir, "provider-records.json")
     if not isinstance(records, list):
         raise CliError("existing evidence provider-records.json must contain an array")
-    child_live = _read_json(evidence_dir / "hello-agent-readback.json", "existing evidence hello-agent-readback.json")
-    coordinator_live = _read_json(
-        evidence_dir / "coordinator-agent-readback.json", "existing evidence coordinator-agent-readback.json")
-    parent_result_holder = _read_json(evidence_dir / "parent-result.json", "existing evidence parent-result.json")
+    child_live = _read_receipt_bound_json(prior_receipt, evidence_dir, "hello-agent-readback.json")
+    coordinator_live = _read_receipt_bound_json(prior_receipt, evidence_dir, "coordinator-agent-readback.json")
+    parent_result_holder = _read_receipt_bound_json(prior_receipt, evidence_dir, "parent-result.json")
     parent_result = (parent_result_holder.get("result")
                      if isinstance(parent_result_holder, dict) and isinstance(parent_result_holder.get("result"), str)
                      else None)
-    raw_child_inventory = _read_json(evidence_dir / "child-inventory.json", "existing evidence child-inventory.json")
-    child_tasks_holder = _read_json(evidence_dir / "child-tasks.json", "existing evidence child-tasks.json")
+    raw_child_inventory = _read_receipt_bound_json(prior_receipt, evidence_dir, "child-inventory.json")
+    child_tasks_holder = _read_receipt_bound_json(prior_receipt, evidence_dir, "child-tasks.json")
     child_terminal_tasks = child_tasks_holder.get("items") if isinstance(child_tasks_holder, dict) else None
     if not isinstance(child_terminal_tasks, list):
         raise CliError("existing evidence child-tasks.json must contain an items array")
-    child_results = _read_json(evidence_dir / "child-results.json", "existing evidence child-results.json")
+    child_results = _read_receipt_bound_json(prior_receipt, evidence_dir, "child-results.json")
     if not isinstance(child_results, dict):
         raise CliError("existing evidence child-results.json must contain an object")
-    observation, probe_evidence_sha256 = (None, []) if args.case_id == "delegates" else \
-        _load_preserved_controller_allowlist_observation(args.agent_dir, render_context["bundle_digest"],
-                                                         args.case_id, evidence_dir)
+    holders = [terminal_task, *child_terminal_tasks]
+    try:
+        starts = [(parse_timestamp(holder.get("status", {}).get("startTime")), holder.get("status", {}).get("startTime"))
+                  for holder in holders]
+        ends = [(parse_timestamp(holder.get("status", {}).get("completionTime")),
+                 holder.get("status", {}).get("completionTime")) for holder in holders]
+    except CliError as exc:
+        raise CliError("existing evidence Task status is missing valid start/completion timestamps") from exc
+    reuse_args.window_start = min(starts, key=lambda item: item[0])[1]
+    reuse_args.window_end = max(ends, key=lambda item: item[0])[1]
+    observation, probe_evidence_sha256 = ((None, []) if args.case_id == "delegates" else
+                                          _preserved_controller_allowlist_observation_from_receipt(
+                                              prior_receipt, evidence_dir))
     summary, receipt = _score_composed_coordination(
         reuse_args, case, render_context=render_context, task_manifest=task_manifest, terminal_task=terminal_task,
         events=events, latest_seq=latest_seq, records=records, child_live=child_live,
