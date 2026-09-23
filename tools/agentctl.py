@@ -146,6 +146,32 @@ def _transform(resource: dict, environment: str, overlay: dict) -> dict:
                           "kaimahi.dev/environment": environment}
     rendered["metadata"] = metadata
     return rendered
+
+
+def _embedded_provider_item_for_single_agent(items: list[dict]) -> dict | None:
+    agents = [item for item in items if isinstance(item, dict) and item.get("kind") == "Agent"]
+    if len(agents) != 1:
+        return None
+    provider_name, provider_namespace = _referenced_provider_identity(agents[0])
+    if provider_name is None or provider_namespace is None:
+        return None
+    providers = [item for item in items
+                 if isinstance(item, dict) and item.get("kind") == "Provider"
+                 and ((item.get("metadata") or {}).get("name") == provider_name)
+                 and ((item.get("metadata") or {}).get("namespace") == provider_namespace)]
+    return providers[0] if len(providers) == 1 else None
+
+
+def _reject_unsupported_azure_model_temperature(items: list[dict]) -> None:
+    provider_item = _embedded_provider_item_for_single_agent(items)
+    provider_spec = provider_item.get("spec") if isinstance(provider_item, dict) else None
+    if not isinstance(provider_spec, dict) or provider_spec.get("type") != _AZURE_PROVIDER_TYPE:
+        return
+    agent_item = next(item for item in items if isinstance(item, dict) and item.get("kind") == "Agent")
+    agent_spec = agent_item.get("spec") if isinstance(agent_item, dict) else None
+    model = agent_spec.get("model") if isinstance(agent_spec, dict) else None
+    if isinstance(model, dict) and "temperature" in model:
+        raise BundleError("Azure Agent spec.model.temperature is unsupported and must be absent")
 def _extra_digest_paths(acceptance_bytes: bytes) -> list[str]:
     """Policy documents become digest inputs exactly when a parsed acceptance case declares that
     closed policy; undeclared policies never move a legacy digest."""
@@ -201,6 +227,7 @@ def render_agent(agent_dir: Path, environment: str, output: Path) -> dict[str, s
         if not isinstance(prompt_text, str) or not prompt_text:
             raise BundleError("Agent must use a non-empty inline prompt when prompts/system.md is absent")
     items = [_transform(resource, environment, overlay) for resource in resources]
+    _reject_unsupported_azure_model_temperature(items)
     if "prompts/system.md" in raw:
         items.append({"apiVersion": "v1", "kind": "ConfigMap", "data": {"system.md": prompt_text},
                       "metadata": {"name": "system-prompt", "labels": {"kaimahi.dev/environment": environment}}})

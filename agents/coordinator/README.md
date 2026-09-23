@@ -8,8 +8,8 @@ catalogue `hello` Agent and must report refusals truthfully.
 - Runtime: native `type: ai` Task execution
 - Provider: the rendered `coordinator-azure-openai` Azure OpenAI Provider in
   the catalogue namespace
-- Model: Azure deployment `gpt-5.6-terra`, temperature 0, maximum 512 output
-  tokens
+- Model: Azure deployment `gpt-5.6-terra`, maximum 512 output tokens; the
+  Azure route must omit explicit `temperature`
 - Tools: explicit `delegate_task` and `wait_for_tasks`
 - Coordination: enabled, `allowedAgents` limited to `hello`, `maxDepth: 1`,
   `maxConcurrentChildren: 1`

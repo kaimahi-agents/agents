@@ -211,6 +211,10 @@ def write_azure_native_coordinator(agent_dir, *, namespace="trial-namespace", ca
         model_name=AZURE_DEPLOYMENT,
         prompt=prompt,
     )
+    agent_path = Path(agent_dir) / "resources" / "agent.yaml"
+    agent_resource = json.loads(agent_path.read_text(encoding="utf-8"))
+    agent_resource["spec"]["model"].pop("temperature", None)
+    write_json(agent_path, agent_resource)
     write_json(Path(agent_dir) / "resources" / "provider.yaml",
                {"apiVersion": "core.orka.ai/v1alpha1", "kind": "Provider",
                 "metadata": {"name": AZURE_PROVIDER_NAME, "namespace": namespace},

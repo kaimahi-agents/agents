@@ -10,7 +10,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tests.fixtures import PROMPT_TEXT, acceptance_block, write_agent, write_json, write_native_agent  # noqa: E402
+from tests.fixtures import (  # noqa: E402
+    PROMPT_TEXT,
+    acceptance_block,
+    write_agent,
+    write_azure_native_coordinator,
+    write_json,
+    write_native_agent,
+    write_native_coordinator,
+)
 from tools import agentctl  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -80,6 +88,23 @@ class RenderTestCase(unittest.TestCase):
                    {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "hello-settings"}})
         self.assertNotEqual(agentctl.render_agent(native, "trial", self.root / "added.yaml")["bundle_digest"],
                             baseline)
+
+    def test_azure_route_rejects_explicit_model_temperature(self):
+        coordinator = write_azure_native_coordinator(self.root / "azure-coordinator")
+        agent_path = coordinator / "resources" / "agent.yaml"
+        agent = json.loads(agent_path.read_text(encoding="utf-8"))
+        agent["spec"]["model"]["temperature"] = 0
+        write_json(agent_path, agent)
+        with self.assertRaises(agentctl.BundleError) as caught:
+            agentctl.render_agent(coordinator, "trial", self.root / "never.yaml")
+        self.assertIn("spec.model.temperature", str(caught.exception))
+
+    def test_non_azure_route_may_retain_explicit_model_temperature(self):
+        coordinator = write_native_coordinator(self.root / "local-coordinator")
+        agentctl.render_agent(coordinator, "trial", self.root / "local-coordinator.yaml")
+        rendered = json.loads((self.root / "local-coordinator.yaml").read_text(encoding="utf-8"))
+        agent = next(item for item in rendered["items"] if item["kind"] == "Agent")
+        self.assertEqual(agent["spec"]["model"]["temperature"], 0)
 
     def test_resource_directory_rejects_misplaced_files_and_subdirectories(self):
         for relative in ("resources/provider.yml", "resources/nested/provider.yaml"):

@@ -1162,7 +1162,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self._rewrite_coordinator_agent_resource(
             lambda resource: resource["spec"].update({
                 "providerRef": {"name": AZURE_PROVIDER_NAME, "namespace": NAMESPACE},
-                "model": {"name": AZURE_DEPLOYMENT, "temperature": 0, "maxTokens": 512},
+                "model": {"name": AZURE_DEPLOYMENT, "maxTokens": 512},
             }),
             refresh_live_readback=True,
         )
@@ -1368,9 +1368,9 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             ("missing-model", lambda resource: resource["spec"].pop("model", None)),
             ("non-object-model", lambda resource: resource["spec"].__setitem__("model", "qwen2.5:3b")),
             ("empty-name", lambda resource: resource["spec"].__setitem__(
-                "model", {"name": "", "temperature": 0, "maxTokens": 512})),
+                "model", {"name": "", "maxTokens": 512})),
             ("non-string-name", lambda resource: resource["spec"].__setitem__(
-                "model", {"name": 7, "temperature": 0, "maxTokens": 512})),
+                "model", {"name": 7, "maxTokens": 512})),
         )
         for label, mutate in cases:
             with self.subTest(case=label):
@@ -1385,7 +1385,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
     def test_composed_live_eval_supports_future_arbitrary_model_names(self):
         self._rewrite_coordinator_agent_resource(
             lambda resource: resource["spec"].__setitem__(
-                "model", {"name": "future-model-v9", "temperature": 0, "maxTokens": 512}),
+                "model", {"name": "future-model-v9", "maxTokens": 512}),
             refresh_live_readback=True,
         )
         parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
@@ -3947,7 +3947,7 @@ class LifecycleCliTestCase(unittest.TestCase):
         path = self.coordinator / "resources" / "agent.yaml"
         agent_resource = json.loads(path.read_text(encoding="utf-8"))
         agent_resource["spec"]["providerRef"] = {"name": AZURE_PROVIDER_NAME, "namespace": NAMESPACE}
-        agent_resource["spec"]["model"] = {"name": AZURE_DEPLOYMENT, "temperature": 0, "maxTokens": 512}
+        agent_resource["spec"]["model"] = {"name": AZURE_DEPLOYMENT, "maxTokens": 512}
         write_json(path, agent_resource)
         coordinator_render = agentctl.render_agent(self.coordinator, "trial", self.native_root / "coordinator-probe.json")
         self.coordinator_digest = coordinator_render["bundle_digest"]
