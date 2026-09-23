@@ -11,6 +11,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tests.fixtures import (  # noqa: E402
+    AZURE_ENDPOINT,
+    AZURE_HOST,
     PROMPT_TEXT,
     acceptance_block,
     write_agent,
@@ -98,6 +100,32 @@ class RenderTestCase(unittest.TestCase):
         with self.assertRaises(agentctl.BundleError) as caught:
             agentctl.render_agent(coordinator, "trial", self.root / "never.yaml")
         self.assertIn("spec.model.temperature", str(caught.exception))
+
+    def test_current_public_safe_azure_route_renders(self):
+        coordinator = write_azure_native_coordinator(self.root / "azure-coordinator")
+        agentctl.render_agent(coordinator, "trial", self.root / "azure-coordinator.yaml")
+
+    def test_azure_route_requires_a_public_openai_resource_subdomain_endpoint(self):
+        coordinator = write_azure_native_coordinator(self.root / "azure-coordinator")
+        provider_path = coordinator / "resources" / "provider.yaml"
+        provider = json.loads(provider_path.read_text(encoding="utf-8"))
+        variants = (
+            "https://openai.azure.com/",
+            "https://" + AZURE_HOST + ".example.com/",
+            "https://127.0.0.1/",
+            "https://localhost/",
+            "https://" + AZURE_HOST + ":443/",
+            AZURE_ENDPOINT + "deployments",
+        )
+        for base_url in variants:
+            with self.subTest(base_url=base_url):
+                provider["spec"]["baseURL"] = base_url
+                write_json(provider_path, provider)
+                with self.assertRaises(agentctl.BundleError) as caught:
+                    agentctl.render_agent(coordinator, "trial", self.root / "never.yaml")
+                self.assertIn("baseURL", str(caught.exception))
+                provider["spec"]["baseURL"] = AZURE_ENDPOINT
+                write_json(provider_path, provider)
 
     def test_non_azure_route_may_retain_explicit_model_temperature(self):
         coordinator = write_native_coordinator(self.root / "local-coordinator")

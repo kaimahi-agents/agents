@@ -1408,20 +1408,28 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.assertEqual(receipt["verdict"], "pass")
         self.assertEqual(receipt["model"], "future-model-v9")
 
-    def test_composed_live_eval_rejects_azure_provider_endpoints_with_credentials_or_query_before_side_effects(self):
+    def test_composed_live_eval_rejects_unsupported_azure_provider_endpoints_before_side_effects(self):
         cases = (
             ("credentials", "https://user:pass@" + AZURE_HOST + "/"),
             ("query", AZURE_ENDPOINT + "?api-version=other"),
+            ("bare", "https://openai.azure.com/"),
+            ("lookalike", "https://" + AZURE_HOST + ".example.com/"),
+            ("ip", "https://127.0.0.1/"),
+            ("localhost", "https://localhost/"),
+            ("port", "https://" + AZURE_HOST + ":443/"),
+            ("path", AZURE_ENDPOINT + "deployments"),
         )
         for label, base_url in cases:
             with self.subTest(case=label):
                 self.setUp()
-                self._switch_coordinator_to_azure(base_url=base_url)
+                self._switch_coordinator_to_azure()
+                self._rewrite_coordinator_provider_resource(
+                    lambda provider: provider["spec"].update({"baseURL": base_url}))
                 code, out, err = self.run_eval_main(
                     "delegates", self.root / "delegates-task.json", **{"--model": AZURE_DEPLOYMENT})
                 self._assert_rejected_before_side_effects(
                     code, out, err,
-                    message="eval failed: rendered Azure provider baseURL",
+                    message="eval failed: render: rendered Azure provider baseURL",
                 )
 
     def test_composed_live_eval_requires_exact_rendered_provider_resolution_for_non_legacy_routes_before_side_effects(self):
@@ -2981,6 +2989,26 @@ class ComposedEvalCliTestCase(unittest.TestCase):
                     "eval failed: rendered bundle does not resolve exactly one coordinator Provider",
                 )
 
+    def test_reuse_current_azure_anchor_rejects_unsupported_rendered_provider_endpoints(self):
+        cases = (
+            ("bare", "https://openai.azure.com/"),
+            ("lookalike", "https://" + AZURE_HOST + ".example.com/"),
+            ("ip", "https://127.0.0.1/"),
+            ("localhost", "https://localhost/"),
+            ("port", "https://" + AZURE_HOST + ":443/"),
+            ("path", AZURE_ENDPOINT + "deployments"),
+        )
+        for label, base_url in cases:
+            with self.subTest(case=label):
+                self.setUp()
+                self.seed_azure_delegate_evidence()
+                self._rewrite_coordinator_provider_resource(
+                    lambda provider: provider["spec"].update({"baseURL": base_url}))
+                self._assert_reuse_failure_preserves_bytes(
+                    self.reuse_eval_argv("delegates", **{"--model": AZURE_DEPLOYMENT}),
+                    "eval failed: render: rendered Azure provider baseURL",
+                )
+
     def test_reuse_current_azure_anchor_requires_receipt_bound_provider_readback_and_current_provider_equality(self):
         self.seed_azure_delegate_evidence()
         provider_path = self.evidence / "delegates" / "coordinator-provider-readback.json"
@@ -4341,6 +4369,30 @@ class LifecycleCliTestCase(unittest.TestCase):
                     with self.assertRaises(agentctl.CliError) as caught:
                         self.run_native_lifecycle(kind)
                     self.assertIn("rendered bundle does not resolve exactly one coordinator Provider", str(caught.exception))
+                    self.assertEqual(
+                        [argv for argv, _ in self.native_kubectl.calls if argv and argv[0] == "kubectl"],
+                        [],
+                    )
+
+    def test_native_lifecycle_rejects_unsupported_azure_provider_endpoints_before_cluster_calls(self):
+        cases = (
+            ("bare", "https://openai.azure.com/"),
+            ("lookalike", "https://" + AZURE_HOST + ".example.com/"),
+            ("ip", "https://127.0.0.1/"),
+            ("localhost", "https://localhost/"),
+            ("port", "https://" + AZURE_HOST + ":443/"),
+            ("path", AZURE_ENDPOINT + "deployments"),
+        )
+        for kind in ("deploy", "rollback"):
+            for label, base_url in cases:
+                with self.subTest(kind=kind, case=label):
+                    self.setup_native_composition()
+                    self._switch_native_coordinator_to_azure()
+                    self._rewrite_native_coordinator_provider_resource(
+                        lambda provider: provider["spec"].update({"baseURL": base_url}))
+                    with self.assertRaises(agentctl.CliError) as caught:
+                        self.run_native_lifecycle(kind)
+                    self.assertIn("render: rendered Azure provider baseURL", str(caught.exception))
                     self.assertEqual(
                         [argv for argv, _ in self.native_kubectl.calls if argv and argv[0] == "kubectl"],
                         [],

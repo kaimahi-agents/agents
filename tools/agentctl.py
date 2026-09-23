@@ -172,6 +172,18 @@ def _reject_unsupported_azure_model_temperature(items: list[dict]) -> None:
     model = agent_spec.get("model") if isinstance(agent_spec, dict) else None
     if isinstance(model, dict) and "temperature" in model:
         raise BundleError("Azure Agent spec.model.temperature is unsupported and must be absent")
+
+def _reject_unsupported_azure_provider_endpoint(items: list[dict]) -> None:
+    provider_item = _embedded_provider_item_for_single_agent(items)
+    provider_spec = provider_item.get("spec") if isinstance(provider_item, dict) else None
+    if not isinstance(provider_spec, dict) or provider_spec.get("type") != _AZURE_PROVIDER_TYPE:
+        return
+    base_url = provider_spec.get("baseURL")
+    try:
+        _require_azure_provider_endpoint_host(base_url)
+    except CliError as exc:
+        raise BundleError(str(exc)) from exc
+
 def _extra_digest_paths(acceptance_bytes: bytes) -> list[str]:
     """Policy documents become digest inputs exactly when a parsed acceptance case declares that
     closed policy; undeclared policies never move a legacy digest."""
@@ -227,6 +239,7 @@ def render_agent(agent_dir: Path, environment: str, output: Path) -> dict[str, s
         if not isinstance(prompt_text, str) or not prompt_text:
             raise BundleError("Agent must use a non-empty inline prompt when prompts/system.md is absent")
     items = [_transform(resource, environment, overlay) for resource in resources]
+    _reject_unsupported_azure_provider_endpoint(items)
     _reject_unsupported_azure_model_temperature(items)
     if "prompts/system.md" in raw:
         items.append({"apiVersion": "v1", "kind": "ConfigMap", "data": {"system.md": prompt_text},
@@ -245,6 +258,12 @@ _ASSERTION_VERDICTS = frozenset({"pass", "fail", "not_evaluated"})
 _VERDICTS = frozenset({"pass", "fail"})
 _SOURCES = frozenset({"live", "imported"})
 _AZURE_PROVIDER_TYPE = "azure-openai"
+_AZURE_OPENAI_PUBLIC_SUFFIX = ".openai.azure.com"
+_AZURE_PROVIDER_ROUTE_ERROR = (
+    "provider_route must be an object with exactly type/endpoint_host/deployment/model/api_version, "
+    "type 'azure-openai', a normalized host-only endpoint_host under .openai.azure.com with a non-empty "
+    "resource subdomain, and non-empty deployment/model/api_version strings"
+)
 _PROVIDER_ROUTE_KEYS = frozenset({"type", "endpoint_host", "deployment", "model", "api_version"})
 _TOKEN_USAGE_KEYS = frozenset({"input", "output", "total"})
 EVALUATION_RECEIPT_REQUIRED_KEYS = frozenset({"case_id", "bundle_digest", "date", "source", "model",
@@ -258,15 +277,42 @@ EVALUATION_RECEIPT_KEYS = EVALUATION_RECEIPT_REQUIRED_KEYS | EVALUATION_RECEIPT_
 def is_valid_tool_calls(value) -> bool:
     return (isinstance(value, dict) and set(value) == {"total", "redacted"} and _is_count(value.get("total"))
             and _is_count(value.get("redacted")) and value["redacted"] <= value["total"])
-def _is_provider_route_host(value) -> bool:
+def _normalize_public_azure_endpoint_host(hostname: str) -> str | None:
+    if not isinstance(hostname, str) or not hostname:
+        return None
+    try:
+        normalized = hostname.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        return None
+    if normalized == "localhost" or any(not label for label in normalized.split(".")):
+        return None
+    try:
+        ipaddress.ip_address(normalized)
+    except ValueError:
+        pass
+    else:
+        return None
+    if not normalized.endswith(_AZURE_OPENAI_PUBLIC_SUFFIX):
+        return None
+    resource = normalized[:-len(_AZURE_OPENAI_PUBLIC_SUFFIX)]
+    return normalized if resource and not resource.endswith(".") else None
+
+def _normalized_provider_route_host(value) -> str | None:
     if not isinstance(value, str) or not value or any(char in value for char in "/@?#"):
-        return False
+        return None
     try:
         parsed = urllib.parse.urlsplit(f"https://{value}")
+        port = parsed.port
     except ValueError:
-        return False
-    return bool(parsed.hostname == value and parsed.username is None and parsed.password is None
-                and parsed.port is None and parsed.path == "" and not parsed.query and not parsed.fragment)
+        return None
+    if (parsed.username is not None or parsed.password is not None or port is not None or parsed.path != ""
+            or parsed.query or parsed.fragment):
+        return None
+    return _normalize_public_azure_endpoint_host(parsed.hostname)
+
+def _is_provider_route_host(value) -> bool:
+    return isinstance(value, str) and _normalized_provider_route_host(value) == value
+
 def is_valid_token_usage(value) -> bool:
     return (isinstance(value, dict) and set(value) == _TOKEN_USAGE_KEYS and all(
         _is_count(value.get(key)) for key in _TOKEN_USAGE_KEYS) and value["total"] == value["input"] + value["output"])
@@ -333,7 +379,7 @@ def _validate_provider_route(receipt, errors: list[str]) -> None:
             and _is_provider_route_host(route.get("endpoint_host"))
             and all(isinstance(route.get(key), str) and bool(route.get(key))
                     for key in ("deployment", "model", "api_version"))):
-        errors.append("provider_route must be an object with exactly type/endpoint_host/deployment/model/api_version, type 'azure-openai', a host-only endpoint_host, and non-empty deployment/model/api_version strings")
+        errors.append(_AZURE_PROVIDER_ROUTE_ERROR)
 
 def _validate_token_usage(receipt, errors: list[str]) -> None:
     if "token_usage" in receipt and not is_valid_token_usage(receipt.get("token_usage")):
@@ -3291,15 +3337,23 @@ def _require_rendered_coordinator_model_name(coordinator_agent_item) -> str:
     return name
 
 def _require_azure_provider_endpoint_host(base_url: str) -> str:
+    message = ("rendered Azure provider baseURL must be an HTTPS origin for a non-empty resource "
+               "subdomain under .openai.azure.com without credentials, query, fragment, port, IP/localhost, "
+               "or a path beyond '/'")
+    if not isinstance(base_url, str) or not base_url:
+        raise CliError(message)
     try:
         parsed = urllib.parse.urlsplit(base_url)
-    except ValueError as exc:
-        raise CliError("rendered Azure provider baseURL must be a valid HTTPS origin") from exc
-    if (parsed.scheme != "https" or not isinstance(parsed.hostname, str) or not parsed.hostname
-            or parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment
-            or parsed.path not in ("", "/") or parsed.port is not None):
-        raise CliError("rendered Azure provider baseURL must be an HTTPS origin without credentials, query, fragment, or a path beyond '/'")
-    return parsed.hostname
+        port = parsed.port
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise CliError(message) from exc
+    if (parsed.scheme != "https" or parsed.username is not None or parsed.password is not None or parsed.query
+            or parsed.fragment or parsed.path not in ("", "/") or port is not None):
+        raise CliError(message)
+    hostname = _normalize_public_azure_endpoint_host(parsed.hostname)
+    if hostname is None:
+        raise CliError(message)
+    return hostname
 
 def _referenced_provider_identity(agent_obj) -> tuple[str | None, str | None]:
     spec = agent_obj.get("spec") if isinstance(agent_obj, dict) else None

@@ -670,15 +670,24 @@ class VerifyAzureComposedReceiptRouteTestCase(unittest.TestCase):
         self.assertEqual(agentctl.validate_lifecycle_receipt(receipt, "deploy"), [])
 
     def test_native_lifecycle_receipt_rejects_malformed_or_rollback_provider_route(self):
-        cases = (
+        bad_hosts = (
+            "https://" + AZURE_HOST + "/",
+            "openai.azure.com",
+            AZURE_HOST + ".example.com",
+            "127.0.0.1",
+            "localhost",
+            AZURE_HOST + ":443",
+            AZURE_HOST + "/deployments",
+        )
+        cases = [
             native_lifecycle_receipt(
                 "deploy", "c" * 64, "d" * 64,
-                provider_route={**azure_provider_route(), "endpoint_host": "https://" + AZURE_HOST + "/"},
-            ),
-            native_lifecycle_receipt("rollback", "c" * 64, "d" * 64, provider_route=azure_provider_route()),
-        )
+                provider_route={**azure_provider_route(), "endpoint_host": endpoint_host},
+            )
+            for endpoint_host in bad_hosts
+        ] + [native_lifecycle_receipt("rollback", "c" * 64, "d" * 64, provider_route=azure_provider_route())]
         for receipt in cases:
-            with self.subTest(kind=receipt["kind"]):
+            with self.subTest(kind=receipt["kind"], endpoint_host=(receipt.get("provider_route") or {}).get("endpoint_host")):
                 errors = agentctl.validate_lifecycle_receipt(receipt, receipt["kind"])
                 self.assertTrue(any("provider_route" in error or "fixed public-safe set" in error for error in errors))
 
@@ -944,6 +953,12 @@ class EvaluationReceiptSchemaTestCase(unittest.TestCase):
             {"provider_route": {**azure_provider_route(), "endpoint_host": "https://" + AZURE_HOST + "/"}},
             {"provider_route": {**azure_provider_route(), "endpoint_host": "user@" + AZURE_HOST}},
             {"provider_route": {**azure_provider_route(), "endpoint_host": AZURE_HOST + "?x=1"}},
+            {"provider_route": {**azure_provider_route(), "endpoint_host": "openai.azure.com"}},
+            {"provider_route": {**azure_provider_route(), "endpoint_host": AZURE_HOST + ".example.com"}},
+            {"provider_route": {**azure_provider_route(), "endpoint_host": "127.0.0.1"}},
+            {"provider_route": {**azure_provider_route(), "endpoint_host": "localhost"}},
+            {"provider_route": {**azure_provider_route(), "endpoint_host": AZURE_HOST + ":443"}},
+            {"provider_route": {**azure_provider_route(), "endpoint_host": AZURE_HOST + "/deployments"}},
             {"provider_route": {**azure_provider_route(), "extra": "beyond-closed-shape"}},
         )
         for overrides in variants:
