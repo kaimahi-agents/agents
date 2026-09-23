@@ -6,12 +6,18 @@ catalogue `hello` Agent and must report refusals truthfully.
 ## What it needs
 
 - Runtime: native `type: ai` Task execution
-- Provider: the existing `hello` Provider in the catalogue namespace
-- Model: local-only `qwen2.5:3b`, temperature 0, maximum 512 output tokens
+- Provider: the rendered `coordinator-azure-openai` Azure OpenAI Provider in
+  the catalogue namespace
+- Model: Azure deployment `gpt-5.6-terra`, temperature 0, maximum 512 output
+  tokens
 - Tools: explicit `delegate_task` and `wait_for_tasks`
 - Coordination: enabled, `allowedAgents` limited to `hello`, `maxDepth: 1`,
   `maxConcurrentChildren: 1`
-- Credentials, gateway, and monitor: none
+- Child route: the coordinator runs on Azure, but the delegated `hello` child
+  still uses the separate local `hello` Provider
+- Credentials, gateway, and monitor: the Provider references an external
+  Kubernetes Secret only; no credential value or Secret manifest is committed in
+  this repository
 
 `dependencies.lock.yaml` pins the rendered `hello` child bundle digest for both
 environments. That lock is a promotion pin for catalogue verification and
@@ -22,10 +28,10 @@ Tasks.
 
 Render the coordinator before applying it. The rendered bundle keeps its own
 namespace, so the apply step needs only your explicit cluster context and
-kubeconfig. `tools/verify agents/coordinator production` is the committed green
-offline check. `tools/verify agents/coordinator trial` is intentionally red at
-this digest because the required `coordinator-reports-denial` receipt fails on
-retained PR1 evidence.
+kubeconfig plus the externally provisioned `coordinator-azure-openai` Secret in
+`orka-system`. `tools/verify agents/coordinator production` is the committed
+green offline check. `tools/verify agents/coordinator trial` is intentionally
+red at this digest until new Azure-routed receipts are committed.
 
 ```sh
 tools/render agents/coordinator trial --output /tmp/coordinator.json
@@ -58,10 +64,8 @@ greeting.
 
 ## Where it has run
 
-Retained live PR1 evidence now anchors three current-digest trial receipts.
-`delegates` passes. `orka-denies-unlisted` passes. The required
-`coordinator-reports-denial` receipt fails because the authenticated parent
-result names `not-allowed-agent` instead of the requested `not-allowed`, so
-`tools/verify agents/coordinator trial` is intentionally red only for that
-reporting case. `tools/verify agents/coordinator production` remains green and
-receipt-free.
+The coordinator now renders an Azure route, so the earlier local-provider trial
+receipts no longer satisfy the current digest. Until fresh Azure-routed trial
+receipts are committed, `tools/verify agents/coordinator trial` is expected to
+stay red because the required current-digest receipts are missing. Production
+remains green and receipt-free.

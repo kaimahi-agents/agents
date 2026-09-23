@@ -1,0 +1,21 @@
+{
+  "apiVersion": "core.orka.ai/v1alpha1",
+  "kind": "Provider",
+  "metadata": {
+    "name": "coordinator-azure-openai",
+    "namespace": "orka-system"
+  },
+  "spec": {
+    "type": "azure-openai",
+    "baseURL": "https://orka-open-ai.openai.azure.com/",
+    "azure": {
+      "deploymentName": "gpt-5.6-terra",
+      "apiVersion": "2025-03-01-preview"
+    },
+    "secretRef": {
+      "name": "coordinator-azure-openai",
+      "key": "api-key"
+    },
+    "defaultModel": "gpt-5.6-terra"
+  }
+}

@@ -21,12 +21,21 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tests.fixtures import (  # noqa: E402
+    AZURE_API_VERSION,
+    AZURE_CREDENTIAL_ENTRY,
+    AZURE_CREDENTIAL_NAME,
+    AZURE_DEPLOYMENT,
+    AZURE_ENDPOINT,
+    AZURE_HOST,
+    AZURE_PROVIDER_NAME,
+    AZURE_PROVIDER_TYPE,
     CONTROLLER_ALLOWLIST_PRE_DISPATCH,
     REFUSAL_DENIAL_CASE_ID,
     REFUSAL_REPORT_CASE_ID,
     REFUSAL_REQUESTED_AGENT,
     RUNTIME_DIGEST,
     acceptance_block,
+    azure_provider_route,
     composed_case,
     missing_toolchain_case,
     refusal_case_payload,
@@ -492,6 +501,20 @@ class PolicyMechanicsTestCase(unittest.TestCase):
 
     def test_the_real_pr3_replay_reduces_to_two_distinct_tool_calls_both_redacted(self):
         self.assertEqual(agentctl.count_tool_calls(PR3_REPLAY_EVENTS), (2, 2))
+
+    def test_parent_token_usage_sums_nonnegative_counts_dedupes_by_seq_and_skips_redacted_events(self):
+        events = [
+            {"seq": 1, "type": "ModelUsageUpdated", "inputTokens": 5, "outputTokens": 7},
+            {"seq": 1, "type": "ModelUsageUpdated", "inputTokens": 99, "outputTokens": 99},
+            {"seq": 2, "type": "ModelUsageUpdated", "inputTokens": 3, "outputTokens": "not-an-int"},
+            {"seq": 3, "type": "ModelUsageUpdated", "inputTokens": 2, "outputTokens": 4,
+             "contentOmitted": "policy"},
+            {"seq": 4, "type": "ModelRequestCompleted",
+             "content": {"inputTokens": 11, "outputTokens": 13}},
+            {"seq": 5, "type": "ModelRequestCompleted", "inputTokens": -1, "outputTokens": 1},
+        ]
+        self.assertEqual(agentctl.summarize_parent_token_usage(events),
+                         {"input": 19, "output": 21, "total": 40})
 
     def test_workspace_unchanged_is_none_only_with_no_delivery_object_at_all(self):
         for status in ({}, None, {"status": "anything"}):
@@ -1065,6 +1088,23 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             self.coordinator_spec = next(item["spec"] for item in rendered["items"] if item["kind"] == "Agent")
             self.kubectl.responses[("agents.core.orka.ai", "coordinator")]["spec"] = self.coordinator_spec
 
+    def _switch_coordinator_to_azure(self, *, base_url=AZURE_ENDPOINT):
+        write_json(self.coordinator / "resources" / "provider.yaml",
+                   {"apiVersion": "core.orka.ai/v1alpha1", "kind": "Provider",
+                    "metadata": {"name": AZURE_PROVIDER_NAME, "namespace": NAMESPACE},
+                    "spec": {"type": AZURE_PROVIDER_TYPE,
+                             "baseURL": base_url,
+                             "azure": {"deploymentName": AZURE_DEPLOYMENT, "apiVersion": AZURE_API_VERSION},
+                             "secretRef": {"name": AZURE_CREDENTIAL_NAME, "key": AZURE_CREDENTIAL_ENTRY},
+                             "defaultModel": AZURE_DEPLOYMENT}})
+        self._rewrite_coordinator_agent_resource(
+            lambda resource: resource["spec"].update({
+                "providerRef": {"name": AZURE_PROVIDER_NAME, "namespace": NAMESPACE},
+                "model": {"name": AZURE_DEPLOYMENT, "temperature": 0, "maxTokens": 512},
+            }),
+            refresh_live_readback=True,
+        )
+
     def _assert_rejected_before_side_effects(self, code, out, err, *, message: str, forbidden=()):
         self.assertEqual(code, 1)
         self.assertEqual(out, "")
@@ -1300,6 +1340,47 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.assertEqual(summary["verdict"], "pass")
         self.assertEqual(receipt["verdict"], "pass")
         self.assertEqual(receipt["model"], "future-model-v9")
+
+    def test_composed_live_eval_rejects_azure_provider_endpoints_with_credentials_or_query_before_side_effects(self):
+        cases = (
+            ("credentials", "https://user:pass@" + AZURE_HOST + "/"),
+            ("query", AZURE_ENDPOINT + "?api-version=other"),
+        )
+        for label, base_url in cases:
+            with self.subTest(case=label):
+                self.setUp()
+                self._switch_coordinator_to_azure(base_url=base_url)
+                code, out, err = self.run_eval_main(
+                    "delegates", self.root / "delegates-task.json", **{"--model": AZURE_DEPLOYMENT})
+                self._assert_rejected_before_side_effects(
+                    code, out, err,
+                    message="eval failed: rendered Azure provider baseURL",
+                )
+
+    def test_azure_delegate_receipt_derives_provider_route_and_parent_token_usage(self):
+        self._switch_coordinator_to_azure()
+        events = [
+            {"seq": 1, "type": "ToolCallStarted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "tool": {"name": "delegate_task",
+                      "arguments": {"agent": "hello", "prompt": f"Reply exactly: {FIXED_PHRASE}"}}},
+            {"seq": 2, "type": "ToolCallCompleted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "contentText": "delegated"},
+            {"seq": 3, "type": "ToolCallStarted", "toolCallID": "call-2", "toolName": "wait_for_tasks",
+             "tool": {"name": "wait_for_tasks", "arguments": {"tasks": [self.child_task["metadata"]["name"]]}}},
+            {"seq": 4, "type": "ToolCallCompleted", "toolCallID": "call-2", "toolName": "wait_for_tasks",
+             "contentText": "done"},
+            {"seq": 5, "type": "ModelUsageUpdated", "inputTokens": 12},
+            {"seq": 6, "type": "ModelRequestCompleted", "outputTokens": 5},
+            {"seq": 7, "type": "ModelMessage", "contentText": FIXED_PHRASE},
+        ]
+        self._set_delegate_result_evidence(events)
+        summary = self.run_eval(
+            "delegates", self.root / "delegates-task.json", **{"--model": AZURE_DEPLOYMENT})
+        receipt = self.receipt("delegates")
+        self.assertEqual(summary["verdict"], "pass")
+        self.assertEqual(receipt["provider_route"], azure_provider_route())
+        self.assertEqual(receipt["token_usage"], {"input": 12, "output": 5, "total": 17})
+        self.assertEqual(agentctl.find_prohibited_in_document(receipt, "receipt"), [])
 
     def test_composed_live_eval_blocks_a_nonterminal_task_before_any_apply(self):
         self.cluster_inventory = {"items": [{
@@ -3268,6 +3349,26 @@ class LifecycleCliTestCase(unittest.TestCase):
             },
         })
 
+    def _switch_native_coordinator_to_azure(self, *, base_url=AZURE_ENDPOINT):
+        write_json(self.coordinator / "resources" / "provider.yaml",
+                   {"apiVersion": "core.orka.ai/v1alpha1", "kind": "Provider",
+                    "metadata": {"name": AZURE_PROVIDER_NAME, "namespace": NAMESPACE},
+                    "spec": {"type": AZURE_PROVIDER_TYPE,
+                             "baseURL": base_url,
+                             "azure": {"deploymentName": AZURE_DEPLOYMENT, "apiVersion": AZURE_API_VERSION},
+                             "secretRef": {"name": AZURE_CREDENTIAL_NAME, "key": AZURE_CREDENTIAL_ENTRY},
+                             "defaultModel": AZURE_DEPLOYMENT}})
+        path = self.coordinator / "resources" / "agent.yaml"
+        agent_resource = json.loads(path.read_text(encoding="utf-8"))
+        agent_resource["spec"]["providerRef"] = {"name": AZURE_PROVIDER_NAME, "namespace": NAMESPACE}
+        agent_resource["spec"]["model"] = {"name": AZURE_DEPLOYMENT, "temperature": 0, "maxTokens": 512}
+        write_json(path, agent_resource)
+        coordinator_render = agentctl.render_agent(self.coordinator, "trial", self.native_root / "coordinator-probe.json")
+        self.coordinator_digest = coordinator_render["bundle_digest"]
+        coordinator_rendered = json.loads(Path(coordinator_render["bundle_path"]).read_text(encoding="utf-8"))
+        self.coordinator_spec = next(item["spec"] for item in coordinator_rendered["items"] if item["kind"] == "Agent")
+        self.native_kubectl.responses[("agents.core.orka.ai", "coordinator")]["spec"] = self.coordinator_spec
+
     def native_argv(self, **overrides):
         args = {"--mode": "native-composition", "--context": "ctx", "--kubeconfig": "cred",
                 "--evidence-root": str(self.native_evidence), "--agent-dir": str(self.coordinator),
@@ -3596,6 +3697,17 @@ class LifecycleCliTestCase(unittest.TestCase):
         self.assertEqual(set(receipt["assertions"]),
                          {"child-matches-rendered", "child-ready",
                           "coordinator-matches-rendered", "coordinator-ready"})
+
+    def test_native_deploy_includes_the_public_safe_azure_provider_route(self):
+        self.setup_native_composition()
+        self._switch_native_coordinator_to_azure()
+        summary = self.run_native_lifecycle("deploy")
+        receipt = self.native_receipt("deploy")
+        self.assertEqual(summary["verdict"], "pass")
+        self.assertEqual(receipt["provider_route"], azure_provider_route())
+        self.assertNotIn("token_usage", receipt)
+        self.assertNotIn(AZURE_CREDENTIAL_NAME, json.dumps(receipt))
+        self.assertNotIn(AZURE_CREDENTIAL_ENTRY, json.dumps(receipt))
 
     def test_native_mode_validates_catalogue_pins_before_cluster_calls(self):
         self.setup_native_composition()

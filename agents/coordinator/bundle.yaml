@@ -26,11 +26,11 @@
         },
         "model": {
           "maxTokens": 512,
-          "name": "qwen2.5:3b",
+          "name": "gpt-5.6-terra",
           "temperature": 0
         },
         "providerRef": {
-          "name": "hello",
+          "name": "coordinator-azure-openai",
           "namespace": "orka-system"
         },
         "systemPrompt": {
@@ -46,6 +46,32 @@
             "name": "wait_for_tasks"
           }
         ]
+      }
+    },
+    {
+      "apiVersion": "core.orka.ai/v1alpha1",
+      "kind": "Provider",
+      "metadata": {
+        "labels": {
+          "environment": "production",
+          "kaimahi.dev/agent": "coordinator",
+          "kaimahi.dev/environment": "production"
+        },
+        "name": "coordinator-azure-openai",
+        "namespace": "orka-system"
+      },
+      "spec": {
+        "azure": {
+          "apiVersion": "2025-03-01-preview",
+          "deploymentName": "gpt-5.6-terra"
+        },
+        "baseURL": "https://orka-open-ai.openai.azure.com/",
+        "defaultModel": "gpt-5.6-terra",
+        "secretRef": {
+          "key": "api-key",
+          "name": "coordinator-azure-openai"
+        },
+        "type": "azure-openai"
       }
     }
   ],

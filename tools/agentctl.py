@@ -217,15 +217,32 @@ _ASSERTION_KEYS = frozenset({"verdict", "evidence_completeness", "note"})
 _ASSERTION_VERDICTS = frozenset({"pass", "fail", "not_evaluated"})
 _VERDICTS = frozenset({"pass", "fail"})
 _SOURCES = frozenset({"live", "imported"})
+_AZURE_PROVIDER_TYPE = "azure-openai"
+_PROVIDER_ROUTE_KEYS = frozenset({"type", "endpoint_host", "deployment", "model", "api_version"})
+_TOKEN_USAGE_KEYS = frozenset({"input", "output", "total"})
 EVALUATION_RECEIPT_REQUIRED_KEYS = frozenset({"case_id", "bundle_digest", "date", "source", "model",
                                               "request_count", "verdict", "assertions", "evidence_sha256"})
-# `tool_calls`, `observations`, and composed dependency digests are informational only -- present
-# or absent, they never change a verdict -- so a v1 receipt without them stays valid unchanged.
-EVALUATION_RECEIPT_OPTIONAL_KEYS = frozenset({"tool_calls", "observations", "dependency_digests"})
+# `tool_calls`, `observations`, composed dependency digests, derived provider-route metadata and
+# derived token-usage metadata are informational only -- present or absent, they never change a
+# verdict -- so a v1 receipt without them stays valid unchanged.
+EVALUATION_RECEIPT_OPTIONAL_KEYS = frozenset(
+    {"tool_calls", "observations", "dependency_digests", "provider_route", "token_usage"})
 EVALUATION_RECEIPT_KEYS = EVALUATION_RECEIPT_REQUIRED_KEYS | EVALUATION_RECEIPT_OPTIONAL_KEYS
 def is_valid_tool_calls(value) -> bool:
     return (isinstance(value, dict) and set(value) == {"total", "redacted"} and _is_count(value.get("total"))
             and _is_count(value.get("redacted")) and value["redacted"] <= value["total"])
+def _is_provider_route_host(value) -> bool:
+    if not isinstance(value, str) or not value or any(char in value for char in "/@?#"):
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(f"https://{value}")
+    except ValueError:
+        return False
+    return bool(parsed.hostname == value and parsed.username is None and parsed.password is None
+                and parsed.port is None and parsed.path == "" and not parsed.query and not parsed.fragment)
+def is_valid_token_usage(value) -> bool:
+    return (isinstance(value, dict) and set(value) == _TOKEN_USAGE_KEYS and all(
+        _is_count(value.get(key)) for key in _TOKEN_USAGE_KEYS) and value["total"] == value["input"] + value["output"])
 _EVALUATION_CHECKS = (
     ("case_id", is_safe_slug, f"case_id must be a safe slug ({SAFE_SLUG_CONTRACT})"),
     ("bundle_digest", _is_hex_digest, "bundle_digest must be a 64-character lowercase hex SHA-256 string"),
@@ -280,6 +297,21 @@ def _validate_dependency_digests(receipt, errors: list[str]) -> None:
     if "dependency_digests" in receipt:
         errors.append("dependency_digests are allowed only for the fixed composed receipt shapes")
 
+def _validate_provider_route(receipt, errors: list[str]) -> None:
+    if "provider_route" not in receipt:
+        return
+    route = receipt.get("provider_route")
+    if not (isinstance(route, dict) and set(route) == _PROVIDER_ROUTE_KEYS
+            and route.get("type") == _AZURE_PROVIDER_TYPE
+            and _is_provider_route_host(route.get("endpoint_host"))
+            and all(isinstance(route.get(key), str) and bool(route.get(key))
+                    for key in ("deployment", "model", "api_version"))):
+        errors.append("provider_route must be an object with exactly type/endpoint_host/deployment/model/api_version, type 'azure-openai', a host-only endpoint_host, and non-empty deployment/model/api_version strings")
+
+def _validate_token_usage(receipt, errors: list[str]) -> None:
+    if "token_usage" in receipt and not is_valid_token_usage(receipt.get("token_usage")):
+        errors.append("token_usage must be an object with exactly input/output/total non-negative integers and total equal to input plus output")
+
 def _validate_observations(receipt, errors: list[str]) -> None:
     if "observations" not in receipt:
         return
@@ -314,6 +346,8 @@ def validate_evaluation_receipt(receipt) -> list[str]:
                       "redacted no greater than total")
     _validate_assertions(receipt["assertions"], errors, "evaluation receipt")
     _validate_dependency_digests(receipt, errors)
+    _validate_provider_route(receipt, errors)
+    _validate_token_usage(receipt, errors)
     _validate_observations(receipt, errors)
     evidence = receipt["evidence_sha256"]
     if not isinstance(evidence, list) or not evidence or not all(map(_is_hex_digest, evidence)):
@@ -506,7 +540,31 @@ def _required_case_expected_dependency_digests(agent_dir: Path, environment: str
     return {_EXPECTED_COMPOSED_CHILD: pins[environment]}, []
 
 
-def _verify_required_case(agent_dir: Path, environment: str, bundle_digest: str, case: dict) -> list[str]:
+def _receipt_provider_route_errors(case: dict, receipt: dict, *, expected_provider_route: dict | None,
+                                  expected_provider_route_errors: list[str]) -> list[str]:
+    if case.get("policy") != COMPOSED_COORDINATION_POLICY:
+        return (["provider_route is allowed only for composed coordination receipts"] if "provider_route" in receipt else []) + (
+            ["token_usage is allowed only for composed coordination receipts"] if "token_usage" in receipt else [])
+    if expected_provider_route_errors:
+        return list(expected_provider_route_errors)
+    if expected_provider_route is None:
+        return (["provider_route is allowed only when the current rendered coordinator Provider route is Azure"]
+                if "provider_route" in receipt else []) + (
+            ["token_usage is allowed only when the current rendered coordinator Provider route is Azure"]
+            if "token_usage" in receipt else [])
+    errors = []
+    if "provider_route" not in receipt:
+        errors.append("provider_route is required for the current Azure coordinator route")
+    elif receipt.get("provider_route") != expected_provider_route:
+        errors.append("receipt provider_route does not match the current rendered coordinator Provider/Agent route")
+    if "token_usage" not in receipt:
+        errors.append("token_usage is required for the current Azure coordinator route")
+    return errors
+
+
+def _verify_required_case(agent_dir: Path, environment: str, bundle_digest: str, case: dict,
+                          *, expected_provider_route: dict | None,
+                          expected_provider_route_errors: list[str]) -> list[str]:
     """One required case needs a case file matching acceptance.md's declared hash and, in this
     environment, a schema-valid, pattern-free, passing receipt under the current digest."""
     case_id = case["case_id"]
@@ -540,14 +598,21 @@ def _verify_required_case(agent_dir: Path, environment: str, bundle_digest: str,
             schema_errors.append(
                 "receipt bundle_digest does not match the receipt directory and current rendered bundle digest")
         dependency_errors = []
+        route_errors = []
         if not schema_errors and _receipt_requires_dependency_digests(receipt):
             if expected_dependency_errors:
                 dependency_errors = list(expected_dependency_errors)
             elif receipt.get("dependency_digests") != expected_dependency_digests:
                 dependency_errors.append(
                     "receipt dependency_digests do not match dependencies.lock.yaml catalogueAgents for this environment")
+        if not schema_errors:
+            route_errors = _receipt_provider_route_errors(
+                case, receipt,
+                expected_provider_route=expected_provider_route,
+                expected_provider_route_errors=expected_provider_route_errors,
+            )
         errors += [f"{receipt_path.name}: {error}"
-                   for error in schema_errors + dependency_errors + find_prohibited_in_document(receipt, "receipt")]
+                   for error in schema_errors + dependency_errors + route_errors + find_prohibited_in_document(receipt, "receipt")]
         if not schema_errors and receipt["verdict"] != "pass":
             errors.append(f"{receipt_path.name}: required case does not have a passing receipt")
         if not schema_errors and "policy" in case:
@@ -807,6 +872,11 @@ def verify_agent(agent_dir: Path, environment: str) -> list[str]:
         return [f"verify failed: {exc}"]
     except UnicodeDecodeError:
         return ["verify failed: eval/acceptance.md is not valid UTF-8"]
+    try:
+        expected_provider_route = _rendered_azure_provider_route(rendered)
+        expected_provider_route_errors: list[str] = []
+    except CliError as exc:
+        expected_provider_route, expected_provider_route_errors = None, [str(exc)]
     errors = check_rendered_prompt_equality(rendered, prompt_bytes) if prompt_bytes is not None else []
     # Real secret material is referenced from outside Git, never inlined; an offender is
     # identified by index, never by its author-supplied name.
@@ -828,7 +898,11 @@ def verify_agent(agent_dir: Path, environment: str) -> list[str]:
     errors += verify_catalogue_dependencies(agent_dir, environment)
     errors += _verify_lifecycle_receipts(agent_dir)
     return errors + [error for case in cases if case["required"]  # lock presence is enforced by render_agent
-                     for error in _verify_required_case(agent_dir, environment, bundle_digest, case)]
+                     for error in _verify_required_case(
+                         agent_dir, environment, bundle_digest, case,
+                         expected_provider_route=expected_provider_route,
+                         expected_provider_route_errors=expected_provider_route_errors,
+                     )]
 
 # --- Bounded public-tree secret scanner -----------------------------------------------------
 # Operators run `tools/secret-scan .` themselves before pushing and the agent-gate workflow runs
@@ -860,9 +934,12 @@ def _unquote(value: str) -> str:
     return value[1:-1] if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'" else value
 def _is_credential_assignment(line: str) -> bool:
     match = _ASSIGNMENT_RE.match(line)
-    if not match or not any(part in _unquote(match.group(1)).lower() for part in _SENSITIVE_KEYS):
+    key = _unquote(match.group(1)).lower() if match else ""
+    if not match or not any(part in key for part in _SENSITIVE_KEYS):
         return False
     value = _unquote(match.group(2).strip())
+    if value.startswith(("{", "[")) and any(part in key for part in ("secretref", "secret_ref", "secret-ref")):
+        return False
     if value.lower() in _PLACEHOLDERS or value.lower().startswith(("$", "{{", "<")):
         return False
     return not _is_image_digest(value) and not _CALL_RE.match(value)
@@ -1518,6 +1595,29 @@ def count_tool_calls(events) -> tuple[int, int]:
         identity_seqs.setdefault(identity, set()).add(event.get("seq"))
     redacted_seqs = set(find_redacted_sequences(events))
     return len(identity_seqs), sum(1 for seqs in identity_seqs.values() if seqs & redacted_seqs)
+
+def summarize_parent_token_usage(events) -> dict[str, int]:
+    """Sum non-negative token counts from complete parent journal events, deduped by event seq."""
+    totals = {"input": 0, "output": 0, "total": 0}
+    seen = set()
+    redacted = set(find_redacted_sequences(events))
+    for event in events:
+        seq = event_sequence_number(event)
+        if seq is None or seq in seen or seq in redacted:
+            continue
+        seen.add(seq)
+        if not isinstance(event, dict):
+            continue
+        holders = (event, event.get("content") if isinstance(event.get("content"), dict) else None)
+        input_tokens = next((holder.get("inputTokens") for holder in holders
+                             if isinstance(holder, dict) and _is_count(holder.get("inputTokens"))), None)
+        output_tokens = next((holder.get("outputTokens") for holder in holders
+                              if isinstance(holder, dict) and _is_count(holder.get("outputTokens"))), None)
+        totals["input"] += input_tokens or 0
+        totals["output"] += output_tokens or 0
+    totals["total"] = totals["input"] + totals["output"]
+    return totals
+
 def check_workspace_unchanged(status) -> bool | None:
     """`None` with no `delivery` object; else pass only when state and outcome are read-validated."""
     delivery = status.get("delivery") if isinstance(status, dict) else None
@@ -2322,7 +2422,8 @@ def _validate_monitored_lifecycle_receipt(receipt, kind: str, *, legacy: bool) -
 def _validate_native_composition_lifecycle_receipt(receipt, kind: str) -> list[str]:
     assertions = receipt.get("assertions", {})
     assertion_names = set(assertions) if isinstance(assertions, dict) else set()
-    expected_keys = NATIVE_COMPOSITION_LIFECYCLE_RECEIPT_KEYS | ({"limitations"} if kind == "rollback" else set())
+    route_keys = {"provider_route"} if kind == "deploy" and "provider_route" in receipt else set()
+    expected_keys = NATIVE_COMPOSITION_LIFECYCLE_RECEIPT_KEYS | route_keys | ({"limitations"} if kind == "rollback" else set())
     errors = [message for ok, message in (
         (set(receipt) == expected_keys, "lifecycle receipt fields are not the fixed public-safe set"),
         (receipt.get("kind") == kind, "lifecycle receipt declared kind does not match its filename"),
@@ -2345,6 +2446,10 @@ def _validate_native_composition_lifecycle_receipt(receipt, kind: str) -> list[s
         (kind != "rollback" or receipt.get("limitations") == list(NATIVE_COMPOSITION_ROLLBACK_LIMITATIONS),
          "rollback limitations are not the fixed public-safe statements")) if not ok]
     _validate_assertions(receipt.get("assertions"), errors, "lifecycle receipt")
+    if kind == "deploy":
+        _validate_provider_route(receipt, errors)
+    elif "provider_route" in receipt:
+        errors.append("provider_route is allowed only for deploy lifecycle receipts")
     return errors
 
 def validate_lifecycle_receipt(receipt, kind: str) -> list[str]:
@@ -2493,6 +2598,7 @@ def _load_native_composition_rendered(args) -> dict:
         "coordinator_item": coordinator_item,
         "coordinator_name": (coordinator_item.get("metadata") or {}).get("name"),
         "coordinator_path": Path(args.evidence_root) / "coordinator-bundle.yaml",
+        "provider_route": _rendered_azure_provider_route(coordinator_rendered),
     }
 
 
@@ -2579,6 +2685,8 @@ def _native_composition_lifecycle_cli(kind: str, argv) -> int:
         "assertions": assertions,
         "verdict": "pass" if all_assertions_pass_and_complete(assertions) else "fail",
     }
+    if kind == "deploy" and rendered["provider_route"] is not None:
+        receipt["provider_route"] = dict(rendered["provider_route"])
     if kind == "rollback":
         receipt["limitations"] = list(NATIVE_COMPOSITION_ROLLBACK_LIMITATIONS)
     _require(validate_lifecycle_receipt(receipt, kind) + find_prohibited_in_document(receipt, "receipt"))
@@ -2806,6 +2914,66 @@ def _require_rendered_coordinator_model_name(coordinator_agent_item) -> str:
         raise CliError("rendered coordinator Agent spec.model.name must be a non-empty string")
     return name
 
+def _require_azure_provider_endpoint_host(base_url: str) -> str:
+    try:
+        parsed = urllib.parse.urlsplit(base_url)
+    except ValueError as exc:
+        raise CliError("rendered Azure provider baseURL must be a valid HTTPS origin") from exc
+    if (parsed.scheme != "https" or not isinstance(parsed.hostname, str) or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment
+            or parsed.path not in ("", "/") or parsed.port is not None):
+        raise CliError("rendered Azure provider baseURL must be an HTTPS origin without credentials, query, fragment, or a path beyond '/'")
+    return parsed.hostname
+
+def _rendered_azure_provider_route(rendered_bundle) -> dict | None:
+    items = rendered_bundle.get("items") if isinstance(rendered_bundle, dict) else None
+    if not isinstance(items, list):
+        raise CliError("rendered bundle is missing the expected Agent resource")
+    agents = [item for item in items if isinstance(item, dict) and item.get("kind") == "Agent"]
+    if len(agents) != 1:
+        raise CliError("rendered bundle is missing the expected Agent resource")
+    coordinator_agent = agents[0]
+    spec = coordinator_agent.get("spec") if isinstance(coordinator_agent, dict) else None
+    provider_ref = spec.get("providerRef") if isinstance(spec, dict) else None
+    provider_name = provider_ref.get("name") if isinstance(provider_ref, dict) else None
+    if not isinstance(provider_name, str) or not provider_name:
+        return None
+    metadata = coordinator_agent.get("metadata") if isinstance(coordinator_agent, dict) else None
+    agent_namespace = metadata.get("namespace") if isinstance(metadata, dict) else None
+    provider_namespace = (provider_ref.get("namespace")
+                          if isinstance(provider_ref, dict) and isinstance(provider_ref.get("namespace"), str)
+                          and provider_ref.get("namespace") else agent_namespace)
+    providers = [item for item in items
+                 if isinstance(item, dict) and item.get("kind") == "Provider"
+                 and ((item.get("metadata") or {}).get("name") == provider_name)
+                 and ((item.get("metadata") or {}).get("namespace") == provider_namespace)]
+    if not providers:
+        return None
+    if len(providers) != 1:
+        raise CliError("rendered bundle does not resolve exactly one coordinator Provider")
+    provider_spec = providers[0].get("spec") if isinstance(providers[0], dict) else None
+    if not isinstance(provider_spec, dict):
+        raise CliError("rendered coordinator Provider spec must be an object")
+    if provider_spec.get("type") != _AZURE_PROVIDER_TYPE:
+        return None
+    base_url = provider_spec.get("baseURL")
+    default_model = provider_spec.get("defaultModel")
+    azure = provider_spec.get("azure")
+    deployment = azure.get("deploymentName") if isinstance(azure, dict) else None
+    api_version = azure.get("apiVersion") if isinstance(azure, dict) else None
+    if not all(isinstance(value, str) and value for value in (base_url, default_model, deployment, api_version)):
+        raise CliError("rendered Azure provider route fields must be non-empty strings")
+    model_name = _require_rendered_coordinator_model_name(coordinator_agent)
+    if default_model != deployment or model_name != default_model:
+        raise CliError("rendered coordinator Agent and Azure Provider do not agree on the deployment/model")
+    return {
+        "type": _AZURE_PROVIDER_TYPE,
+        "endpoint_host": _require_azure_provider_endpoint_host(base_url),
+        "deployment": deployment,
+        "model": model_name,
+        "api_version": api_version,
+    }
+
 
 def _require_supplied_model_matches_rendered_coordinator(supplied_model: str, rendered_model_name: str) -> None:
     if supplied_model != rendered_model_name:
@@ -2864,6 +3032,7 @@ def _prepare_composed_render_context(args, *, evidence_dir: Path | None) -> dict
         "child_bundle_sha256": child_bundle_sha256,
         "coordinator_bundle_sha256": coordinator_bundle_sha256,
         "coordinator_model_name": coordinator_model_name,
+        "provider_route": _rendered_azure_provider_route(coordinator_rendered),
     }
 
 
@@ -3159,6 +3328,9 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
         "tool_calls": {"total": total_calls, "redacted": redacted_calls},
         "evidence_sha256": [],
     }
+    if render_context["provider_route"] is not None:
+        receipt["provider_route"] = dict(render_context["provider_route"])
+        receipt["token_usage"] = summarize_parent_token_usage(events)
     if observation is not None and args.case_id == COMPOSED_REFUSAL_DENIAL_CASE_ID:
         receipt["observations"] = {CONTROLLER_ALLOWLIST_OBSERVATION_ID: observation}
     summary = {

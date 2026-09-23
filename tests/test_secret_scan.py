@@ -90,6 +90,15 @@ class CredentialAssignmentTestCase(unittest.TestCase):
             with self.subTest(rest=rest):
                 self.assertEqual(agentctl.scan_line(prefix + rest), [])
 
+    def test_secret_reference_objects_are_not_literal_credential_assignments(self):
+        for line in ('"secretRef": {', 'secretRef: {name: provider-key}', 'secretRef = ["external"]'):
+            with self.subTest(line=line):
+                self.assertEqual(agentctl.scan_line(line), [])
+
+    def test_structural_secret_refs_are_exempt_without_exempting_real_api_key_objects(self):
+        self.assertEqual(agentctl.scan_line('secretRef: {name: provider-key}'), [])
+        self.assertIn("credential-assignment", agentctl.scan_line('api_key: {"value": "abc123"}'))
+
     def test_only_an_exact_call_expression_is_exempt(self):
         # Finding 6: a value that merely contains parentheses is still a credential, whereas a
         # value that is entirely a call expression is code, not a literal secret.

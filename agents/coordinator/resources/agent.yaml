@@ -7,11 +7,11 @@
   },
   "spec": {
     "providerRef": {
-      "name": "hello",
+      "name": "coordinator-azure-openai",
       "namespace": "orka-system"
     },
     "model": {
-      "name": "qwen2.5:3b",
+      "name": "gpt-5.6-terra",
       "temperature": 0,
       "maxTokens": 512
     },

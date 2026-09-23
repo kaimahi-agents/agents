@@ -1,5 +1,6 @@
 """Offline verification: policy checks, the receipt allowlist and the required-case mapping."""
 
+import copy
 import io
 import json
 import sys
@@ -11,14 +12,20 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tests.fixtures import (  # noqa: E402
+    AZURE_API_VERSION,
+    AZURE_DEPLOYMENT,
+    AZURE_HOST,
+    AZURE_PROVIDER_NAME,
     CONTROLLER_ALLOWLIST_PRE_DISPATCH,
     REFUSAL_DENIAL_CASE_ID,
     REFUSAL_REPORT_CASE_ID,
     acceptance_block,
+    azure_provider_route,
     composed_case,
     evaluation_receipt,
     refusal_case_payload,
     write_agent,
+    write_azure_native_coordinator,
     write_json,
     write_native_agent,
     write_native_coordinator,
@@ -558,6 +565,113 @@ class VerifyComposedReceiptDependencyDigestTestCase(unittest.TestCase):
                 self.assertFalse(any(unsafe in error for error in errors))
 
 
+class VerifyAzureComposedReceiptRouteTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        (self.root / "agents").mkdir()
+        self.hello = write_native_agent(self.root / "agents" / "hello", namespace="orka-system",
+                                        agent_name="hello", provider_name="hello")
+        self.pins = {environment: agentctl.render_agent(
+            self.hello, environment, self.root / f"hello-{environment}.json")["bundle_digest"]
+                     for environment in agentctl.ALLOWED_ENVIRONMENTS}
+        case = composed_case("delegates", required=True, case_sha256=CASE_DIGEST)
+        self.coordinator = write_azure_native_coordinator(
+            self.root / "agents" / "coordinator",
+            namespace="orka-system",
+            catalogue_agents={"hello": self.pins},
+            cases=(case,),
+        )
+        (self.coordinator / "eval" / "cases").mkdir(parents=True, exist_ok=True)
+        (self.coordinator / "eval" / "cases" / "delegates.yaml").write_text(CASE_TEXT, encoding="utf-8")
+        self.bundle_digest = agentctl.render_agent(
+            self.coordinator, "trial", self.root / "coordinator-trial.json")["bundle_digest"]
+        assertions = {name: {"verdict": "pass", "evidence_completeness": True, "note": "n"}
+                      for name in composed_case("delegates")["assertions"]}
+        self.receipt_path = self.coordinator / "eval" / "receipts" / self.bundle_digest / "delegates.json"
+        self.base_receipt = evaluation_receipt(
+            "delegates",
+            self.bundle_digest,
+            model=AZURE_DEPLOYMENT,
+            assertions=assertions,
+            tool_calls={"total": composed_case("delegates")["limits"]["tool_calls"], "redacted": 0},
+            dependency_digests={"hello": self.pins["trial"]},
+            provider_route=azure_provider_route(),
+            token_usage={"input": 0, "output": 0, "total": 0},
+        )
+
+    def write_receipt(self, mutate=None):
+        receipt = copy.deepcopy(self.base_receipt)
+        if mutate is not None:
+            mutate(receipt)
+        write_json(self.receipt_path, receipt)
+        return receipt
+
+    def test_matching_current_azure_route_and_token_usage_verify_clean(self):
+        self.write_receipt()
+        self.assertEqual(agentctl.verify_agent(self.coordinator, "trial"), [])
+
+    def test_current_azure_route_requires_provider_route_and_token_usage(self):
+        cases = (
+            ("missing-provider-route", lambda receipt: receipt.pop("provider_route"), "provider_route"),
+            ("mismatched-provider-route",
+             lambda receipt: receipt["provider_route"].update({"model": "other-model"}), "provider_route"),
+            ("missing-token-usage", lambda receipt: receipt.pop("token_usage"), "token_usage"),
+        )
+        for label, mutate, fragment in cases:
+            with self.subTest(case=label):
+                self.setUp()
+                self.write_receipt(mutate)
+                errors = agentctl.verify_agent(self.coordinator, "trial")
+                self.assertTrue(any(fragment in error for error in errors))
+
+    def test_non_azure_current_route_rejects_forged_provider_route_metadata(self):
+        coordinator = write_native_coordinator(
+            self.root / "agents" / "coordinator-local",
+            namespace="orka-system",
+            agent_name="coordinator-local",
+            catalogue_agents={"hello": self.pins},
+            cases=(composed_case("delegates", required=True, case_sha256=CASE_DIGEST),),
+        )
+        (coordinator / "eval" / "cases").mkdir(parents=True, exist_ok=True)
+        (coordinator / "eval" / "cases" / "delegates.yaml").write_text(CASE_TEXT, encoding="utf-8")
+        bundle_digest = agentctl.render_agent(coordinator, "trial", self.root / "coordinator-local-trial.json")["bundle_digest"]
+        assertions = {name: {"verdict": "pass", "evidence_completeness": True, "note": "n"}
+                      for name in composed_case("delegates")["assertions"]}
+        write_json(coordinator / "eval" / "receipts" / bundle_digest / "delegates.json",
+                   evaluation_receipt(
+                       "delegates",
+                       bundle_digest,
+                       assertions=assertions,
+                       tool_calls={"total": composed_case("delegates")["limits"]["tool_calls"], "redacted": 0},
+                       dependency_digests={"hello": self.pins["trial"]},
+                       provider_route=azure_provider_route(model="qwen2.5:3b"),
+                       token_usage={"input": 0, "output": 0, "total": 0},
+                   ))
+        errors = agentctl.verify_agent(coordinator, "trial")
+        self.assertTrue(any("provider_route" in error for error in errors))
+        self.assertTrue(any("token_usage" in error for error in errors))
+
+    def test_native_deploy_receipt_accepts_a_public_safe_azure_provider_route(self):
+        receipt = native_lifecycle_receipt(
+            "deploy", "c" * 64, "d" * 64, provider_route=azure_provider_route())
+        self.assertEqual(agentctl.validate_lifecycle_receipt(receipt, "deploy"), [])
+
+    def test_native_lifecycle_receipt_rejects_malformed_or_rollback_provider_route(self):
+        cases = (
+            native_lifecycle_receipt(
+                "deploy", "c" * 64, "d" * 64,
+                provider_route={**azure_provider_route(), "endpoint_host": "https://" + AZURE_HOST + "/"},
+            ),
+            native_lifecycle_receipt("rollback", "c" * 64, "d" * 64, provider_route=azure_provider_route()),
+        )
+        for receipt in cases:
+            with self.subTest(kind=receipt["kind"]):
+                errors = agentctl.validate_lifecycle_receipt(receipt, receipt["kind"])
+                self.assertTrue(any("provider_route" in error or "fixed public-safe set" in error for error in errors))
+
+
 class AcceptanceParsingTestCase(unittest.TestCase):
     """`parse_acceptance_cases`: v1 four-key backward compatibility plus the optional, always-
     together `policy`/`assertions`/`limits` keys and the exact closed contracts each supported
@@ -709,6 +823,16 @@ class EvaluationReceiptSchemaTestCase(unittest.TestCase):
         receipt.update(overrides)
         return receipt
 
+    def azure_composed_receipt(self, case_id="delegates", **overrides):
+        receipt = self.composed_receipt(
+            case_id,
+            model=AZURE_DEPLOYMENT,
+            provider_route=azure_provider_route(),
+            token_usage={"input": 0, "output": 0, "total": 0},
+        )
+        receipt.update(overrides)
+        return receipt
+
     def test_a_well_formed_receipt_validates(self):
         self.assertEqual(agentctl.validate_evaluation_receipt(self.receipt), [])
 
@@ -799,6 +923,35 @@ class EvaluationReceiptSchemaTestCase(unittest.TestCase):
         self.assertTrue(any("dependency_digests" in error
                             for error in agentctl.validate_evaluation_receipt(
                                 self.composed_receipt("delegates", dependency_digests=None))))
+
+    def test_azure_provider_route_and_token_usage_validate_when_present(self):
+        self.assertEqual(agentctl.validate_evaluation_receipt(self.azure_composed_receipt()), [])
+
+    def test_azure_provider_route_requires_the_fixed_public_safe_shape(self):
+        variants = (
+            {"provider_route": None},
+            {"provider_route": {**azure_provider_route(), "endpoint_host": "https://" + AZURE_HOST + "/"}},
+            {"provider_route": {**azure_provider_route(), "endpoint_host": "user@" + AZURE_HOST}},
+            {"provider_route": {**azure_provider_route(), "endpoint_host": AZURE_HOST + "?x=1"}},
+            {"provider_route": {**azure_provider_route(), "extra": "beyond-closed-shape"}},
+        )
+        for overrides in variants:
+            with self.subTest(overrides=overrides):
+                errors = agentctl.validate_evaluation_receipt(self.azure_composed_receipt(**overrides))
+                self.assertTrue(any("provider_route" in error for error in errors))
+
+    def test_token_usage_requires_non_negative_counts_and_an_exact_total(self):
+        variants = (
+            None,
+            {"input": -1, "output": 0, "total": -1},
+            {"input": 1, "output": 2, "total": 99},
+            {"input": 1, "output": "2", "total": 3},
+            {"input": 1, "output": 2},
+        )
+        for token_usage in variants:
+            with self.subTest(token_usage=token_usage):
+                errors = agentctl.validate_evaluation_receipt(self.azure_composed_receipt(token_usage=token_usage))
+                self.assertTrue(any("token_usage" in error for error in errors))
 
     def test_legacy_receipts_remain_valid_without_dependency_digests_but_reject_them_when_present(self):
         self.assertEqual(agentctl.validate_evaluation_receipt(self.receipt), [])

@@ -18,6 +18,14 @@ REFUSAL_DENIAL_CASE_ID = "orka-denies-unlisted"
 REFUSAL_REPORT_CASE_ID = "coordinator-reports-denial"
 REFUSAL_SOURCE_CASE_ID = "refuses-unlisted"
 REFUSAL_REQUESTED_AGENT = "not-allowed"
+AZURE_PROVIDER_TYPE = "azure-openai"
+AZURE_PROVIDER_NAME = "coordinator-azure-openai"
+AZURE_CREDENTIAL_NAME = "coordinator-azure-openai"
+AZURE_CREDENTIAL_ENTRY = "api-key"
+AZURE_ENDPOINT = "https://orka-open-ai.openai.azure.com/"
+AZURE_HOST = "orka-open-ai.openai.azure.com"
+AZURE_DEPLOYMENT = "gpt-5.6-terra"
+AZURE_API_VERSION = "2025-03-01-preview"
 COMPOSED_ASSERTIONS = {
     "delegates": ("live-pinned-agents-ready", "parent-task-succeeded", "expected-delegation-tool-calls",
                     "no-unexpected-tool-calls", "exactly-one-child-task", "child-targeted-hello",
@@ -177,6 +185,41 @@ def write_native_coordinator(agent_dir, *, namespace="trial-namespace", cases=()
         write_json(agent_dir / "environments" / environment / "kustomization.yaml",
                    {"namespace": namespace, "commonLabels": {"kaimahi.dev/agent": agent_name}})
     return agent_dir
+
+
+def azure_provider_route(*, model: str = AZURE_DEPLOYMENT) -> dict:
+    return {
+        "type": AZURE_PROVIDER_TYPE,
+        "endpoint_host": AZURE_HOST,
+        "deployment": AZURE_DEPLOYMENT,
+        "model": model,
+        "api_version": AZURE_API_VERSION,
+    }
+
+
+def write_azure_native_coordinator(agent_dir, *, namespace="trial-namespace", cases=(), agent_name="coordinator",
+                                   catalogue_agents=None, allowed_agents=("hello",),
+                                   prompt="Delegate to exactly one allowed catalogue agent when needed.") -> Path:
+    agent_dir = write_native_coordinator(
+        agent_dir,
+        namespace=namespace,
+        cases=cases,
+        agent_name=agent_name,
+        provider_name=AZURE_PROVIDER_NAME,
+        allowed_agents=allowed_agents,
+        catalogue_agents=catalogue_agents,
+        model_name=AZURE_DEPLOYMENT,
+        prompt=prompt,
+    )
+    write_json(Path(agent_dir) / "resources" / "provider.yaml",
+               {"apiVersion": "core.orka.ai/v1alpha1", "kind": "Provider",
+                "metadata": {"name": AZURE_PROVIDER_NAME, "namespace": namespace},
+                "spec": {"type": AZURE_PROVIDER_TYPE,
+                         "baseURL": AZURE_ENDPOINT,
+                         "azure": {"deploymentName": AZURE_DEPLOYMENT, "apiVersion": AZURE_API_VERSION},
+                         "secretRef": {"name": AZURE_CREDENTIAL_NAME, "key": AZURE_CREDENTIAL_ENTRY},
+                         "defaultModel": AZURE_DEPLOYMENT}})
+    return Path(agent_dir)
 
 
 def evaluation_receipt(case_id: str, bundle_digest: str, **overrides) -> dict:
