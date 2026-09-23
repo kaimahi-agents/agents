@@ -250,7 +250,7 @@ _EVALUATION_CHECKS = (
     ("source", _SOURCES.__contains__, f"source must be one of {sorted(_SOURCES)}"),
     ("model", lambda value: isinstance(value, str) and bool(value), "model must be a non-empty string"),
     ("request_count", lambda value: value is None or _is_count(value),
-     "request_count must be null or a non-negative integer (never an event count)"),
+     "request_count must be null or a non-negative integer from the route's authoritative request source"),
     ("verdict", _VERDICTS.__contains__, f"verdict must be one of {sorted(_VERDICTS)}"),
 )
 def _validate_assertions(assertions, errors: list, prefix: str) -> None:
@@ -1144,9 +1144,11 @@ def check_rendered_namespace(rendered_bundle, expected_namespace: str) -> list[s
 
 # --- Evaluation mechanics -------------------------------------------------------------------
 # `eval` submits exactly one Task and permits zero retries. The full journal must be paged and
-# proven contiguous. Provider-request counting is authoritative only from the operator-supplied
+# proven contiguous. Legacy/local request counting is authoritative only from the operator-supplied
 # bounded log restricted to an operator-asserted window proven to cover the Task exactly -- never
-# inferred from journal events -- and a zero count is a provider-log schema mismatch.
+# inferred from journal events. Composed Azure routes instead count authenticated parent-journal
+# ModelRequestCompleted/ModelRequestFailed terminal events by unique seq and ignore provider logs
+# and windows.
 REDACTION_MARKER = "[REDACTED]"
 # The journal marks an incomplete event by omitting metadata/content and recording why under one
 # of these two exact field names, not by substituting the marker text above.
@@ -1528,6 +1530,25 @@ def _require_reusable_provider_capture_established(receipt: dict, records, holde
     return window_start, window_end
 
 
+def _require_reusable_azure_request_count_established(receipt: dict, events, latest_seq) -> int:
+    request_count = receipt.get("request_count") if isinstance(receipt, dict) else None
+    assertions = receipt.get("assertions") if isinstance(receipt, dict) else None
+    bounded = assertions.get("stayed-within-limits") if isinstance(assertions, dict) else None
+    if (not _is_count(request_count)
+            or not isinstance(bounded, dict)
+            or bounded.get("evidence_completeness") is not True
+            or bounded.get("verdict") not in _VERDICTS):
+        raise CliError("existing live receipt does not prove authenticated model-request count was established for reuse")
+    if check_journal_completeness(events, latest_seq):
+        raise CliError("existing evidence journal-events.json does not prove authenticated parent model-request count for the original live receipt")
+    current_count, established = summarize_parent_request_count(events)
+    if not established:
+        raise CliError("existing evidence journal-events.json does not prove authenticated parent model-request count for the original live receipt")
+    if current_count != request_count:
+        raise CliError("existing evidence journal-events.json does not reproduce the original live receipt request_count")
+    return current_count
+
+
 def _require_reusable_composed_evidence(agent_dir, bundle_digest: str, case_id: str,
                                         evidence_dir, render_context: dict) -> dict:
     for name, label, expected_sha256 in (
@@ -1642,6 +1663,7 @@ def tri_state(matched, match_note: str, mismatch_note: str, incomplete_note: str
 TOOL_CALL_EVENT_TYPES = frozenset({"ToolCallStarted", "ToolCallCompleted", "ToolCallFailed"})
 _TOOL_CALL_STARTED_TYPE = "ToolCallStarted"
 _MODEL_MESSAGE_EVENT_TYPE = "ModelMessage"
+_MODEL_REQUEST_TERMINAL_EVENT_TYPES = frozenset({"ModelRequestCompleted", "ModelRequestFailed"})
 DELIVERY_VALIDATED_STATE = "ReadValidated"
 ALLOWED_TASK_TOOLS = frozenset({"Read", "Write", "Edit", "Bash", "Glob", "Grep"})
 # Any of these keys anywhere in a Task spec is a request this policy must refuse to certify as
@@ -1667,6 +1689,21 @@ def count_tool_calls(events) -> tuple[int, int]:
         identity_seqs.setdefault(identity, set()).add(event.get("seq"))
     redacted_seqs = set(find_redacted_sequences(events))
     return len(identity_seqs), sum(1 for seqs in identity_seqs.values() if seqs & redacted_seqs)
+
+def summarize_parent_request_count(events) -> tuple[int | None, bool]:
+    """Count authenticated parent ModelRequestCompleted/ModelRequestFailed events by unique seq."""
+    count, seen = 0, set()
+    for event in events:
+        seq = event_sequence_number(event)
+        if seq is None:
+            return None, False
+        if seq in seen:
+            continue
+        seen.add(seq)
+        if isinstance(event, dict) and event.get("type") in _MODEL_REQUEST_TERMINAL_EVENT_TYPES:
+            count += 1
+    return count, True
+
 
 def _complete_model_request_token_pair(event) -> tuple[tuple[int, int] | None, bool]:
     if not isinstance(event, dict) or event.get("type") != "ModelRequestCompleted":
@@ -1907,11 +1944,11 @@ _CONTROLLER_ALLOWLIST_PROBE_FILES = (
     "controller-allowlist-probe-jobs.json",
 )
 _COORDINATOR_PROVIDER_READBACK_FILE = "coordinator-provider-readback.json"
+_COMPOSED_PROVIDER_RECORDS_FILE = "provider-records.json"
 _COMPOSED_EVIDENCE_FILES = (
     "task-manifest.json",
     "terminal-task.json",
     "journal-events.json",
-    "provider-records.json",
     "hello-agent-readback.json",
     "coordinator-agent-readback.json",
     "parent-result.json",
@@ -1921,8 +1958,13 @@ _COMPOSED_EVIDENCE_FILES = (
 )
 
 
-def _composed_evidence_files(*, include_provider_readback: bool) -> tuple[str, ...]:
-    return _COMPOSED_EVIDENCE_FILES + ((_COORDINATOR_PROVIDER_READBACK_FILE,) if include_provider_readback else ())
+def _composed_evidence_files(*, include_provider_records: bool,
+                             include_provider_readback: bool) -> tuple[str, ...]:
+    files = _COMPOSED_EVIDENCE_FILES[:3]
+    if include_provider_records:
+        files += (_COMPOSED_PROVIDER_RECORDS_FILE,)
+    files += _COMPOSED_EVIDENCE_FILES[3:]
+    return files + ((_COORDINATOR_PROVIDER_READBACK_FILE,) if include_provider_readback else ())
 
 def _controller_allowlist_probe_name_suffix() -> str:
     return secrets.token_hex(_CONTROLLER_ALLOWLIST_PROBE_SUFFIX_BYTES)
@@ -3321,16 +3363,21 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
     completeness_errors = check_journal_completeness(events, latest_seq)
     journal_complete = not completeness_errors
     incomplete_journal_note = f"journal is incomplete: {'; '.join(completeness_errors)}"
-    window = (parse_timestamp(args.window_start), parse_timestamp(args.window_end))
-    try:
-        holders = [terminal_task, *child_terminal_tasks]
-        starts = [parse_timestamp(holder.get("status", {}).get("startTime")) for holder in holders]
-        ends = [parse_timestamp(holder.get("status", {}).get("completionTime")) for holder in holders]
-        window_errors = check_window_covers_task(window[0], window[1], min(starts), max(ends))
-    except CliError:
-        window_errors = ["Task status is missing valid start/completion timestamps"]
-    count = count_provider_requests_in_window(records, *window)
-    established = not window_errors and count > 0
+    azure_authoritative_requests = provider_route is not None
+    if azure_authoritative_requests:
+        count, established = summarize_parent_request_count(events)
+        established = journal_complete and established
+    else:
+        window = (parse_timestamp(args.window_start), parse_timestamp(args.window_end))
+        try:
+            holders = [terminal_task, *child_terminal_tasks]
+            starts = [parse_timestamp(holder.get("status", {}).get("startTime")) for holder in holders]
+            ends = [parse_timestamp(holder.get("status", {}).get("completionTime")) for holder in holders]
+            window_errors = check_window_covers_task(window[0], window[1], min(starts), max(ends))
+        except CliError:
+            window_errors = ["Task status is missing valid start/completion timestamps"]
+        count = count_provider_requests_in_window(records, *window)
+        established = not window_errors and count > 0
     total_calls, redacted_calls = count_tool_calls(events)
     started_events = [event for event in events
                       if isinstance(event, dict) and event.get("type") == _TOOL_CALL_STARTED_TYPE]
@@ -3484,6 +3531,16 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
                                                  args.namespace))
     token_usage, token_usage_established = summarize_parent_token_usage(events)
     parent_phase = (terminal_task.get("status") or {}).get("phase") if isinstance(terminal_task, dict) else None
+    limit_pass_note = ("counts for authenticated model-request events, child Tasks, tool calls, and retries stayed within limits"
+                       if azure_authoritative_requests
+                       else "provider, child, tool, and retry counts stayed within limits")
+    limit_fail_note = ("counts for authenticated model-request events, child Tasks, tool calls, or retries exceeded limits"
+                       if azure_authoritative_requests
+                       else "provider, child, tool, or retry count exceeded limits")
+    limit_incomplete_note = ("counts for authenticated model-request events, child Tasks, tool calls, or retries were not fully established"
+                             if azure_authoritative_requests
+                             else "provider, child, tool, or retry bounds were not fully established")
+    limit_counts_established = established and child_inventory_known and (azure_authoritative_requests or journal_complete)
     assertions = {
         "live-pinned-agents-ready": tri_state(
             live_pinned_ready,
@@ -3494,14 +3551,11 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
                                           "the parent Task succeeded" if parent_phase == "Succeeded"
                                           else "the parent Task did not succeed"),
         "no-unexpected-tool-calls": no_unexpected_assertion(),
-        "stayed-within-limits": ((lambda within: settled(
-            within,
-            "provider, child, tool, and retry counts stayed within limits" if within
-            else "provider, child, tool, or retry count exceeded limits"))(
+        "stayed-within-limits": ((lambda within: settled(within, limit_pass_note if within else limit_fail_note))(
                 count <= limits["provider_requests"] and total_calls <= limits["tool_calls"]
                 and len(linked_children) <= limits["child_tasks"] and retry_ok)
-            if established and journal_complete and child_inventory_known else
-            not_evaluated("provider, child, tool, or retry bounds were not fully established")),
+            if limit_counts_established else
+            not_evaluated(limit_incomplete_note)),
     }
     if args.case_id == "delegates":
         child = child_terminal_tasks[0] if len(child_terminal_tasks) == 1 else None
@@ -3743,7 +3797,8 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict]
             pass
     reconcile_campaign_entry(args.evidence_root, source_case_id, reserved["attempt"], parent_count=1,
                              child_count=len(genuine_children), probe_count=0)
-    records = parse_provider_log_for_composed_coordination(_read_text(args.provider_log, "--provider-log"))
+    records = ([] if provider_route is not None
+               else parse_provider_log_for_composed_coordination(_read_text(args.provider_log, "--provider-log")))
     observation, probe_evidence_sha256 = None, []
     if args.case_id in COMPOSED_REFUSAL_CASE_IDS:
         if not campaign_case_reserved(args.evidence_root, CONTROLLER_ALLOWLIST_OBSERVATION_ID):
@@ -3764,7 +3819,6 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict]
         ("task-manifest.json", task_manifest),
         ("terminal-task.json", terminal_task),
         ("journal-events.json", {"events": events, "latestSeq": latest_seq}),
-        ("provider-records.json", records),
         ("hello-agent-readback.json", child_live),
         ("coordinator-agent-readback.json", coordinator_live),
         ("parent-result.json", {"result": parent_result}),
@@ -3772,6 +3826,8 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict]
         ("child-tasks.json", {"items": child_terminal_tasks}),
         ("child-results.json", child_results),
     ]
+    if provider_route is None:
+        evidence_pairs.insert(3, (_COMPOSED_PROVIDER_RECORDS_FILE, records))
     if render_context["coordinator_provider_item"] is not None:
         evidence_pairs.append((_COORDINATOR_PROVIDER_READBACK_FILE, provider_live))
     evidence_sha256 = list(dict.fromkeys(
@@ -3809,9 +3865,6 @@ def _reuse_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict
     latest_seq = journal_payload.get("latestSeq") if isinstance(journal_payload, dict) else None
     if not isinstance(events, list):
         raise CliError("existing evidence journal-events.json must contain an events array")
-    records = _read_receipt_bound_json(prior_receipt, evidence_dir, "provider-records.json")
-    if not isinstance(records, list):
-        raise CliError("existing evidence provider-records.json must contain an array")
     child_live = _read_receipt_bound_json(prior_receipt, evidence_dir, "hello-agent-readback.json")
     coordinator_live = _read_receipt_bound_json(prior_receipt, evidence_dir, "coordinator-agent-readback.json")
     provider_route = _require_reusable_composed_provider_binding(
@@ -3829,8 +3882,15 @@ def _reuse_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict
     child_results = _read_receipt_bound_json(prior_receipt, evidence_dir, "child-results.json")
     if not isinstance(child_results, dict):
         raise CliError("existing evidence child-results.json must contain an object")
-    reuse_args.window_start, reuse_args.window_end = _require_reusable_provider_capture_established(
-        prior_receipt, records, [terminal_task, *child_terminal_tasks])
+    if provider_route is None:
+        records = _read_receipt_bound_json(prior_receipt, evidence_dir, _COMPOSED_PROVIDER_RECORDS_FILE)
+        if not isinstance(records, list):
+            raise CliError("existing evidence provider-records.json must contain an array")
+        reuse_args.window_start, reuse_args.window_end = _require_reusable_provider_capture_established(
+            prior_receipt, records, [terminal_task, *child_terminal_tasks])
+    else:
+        records = []
+        _require_reusable_azure_request_count_established(prior_receipt, events, latest_seq)
     if args.case_id == "delegates":
         observation, probe_evidence_sha256 = None, []
     elif args.source == "live" and args.case_id == COMPOSED_REFUSAL_DENIAL_CASE_ID:
@@ -3847,7 +3907,9 @@ def _reuse_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict
         child_results=child_results, provider_route=provider_route, observation=observation)
     evidence_sha256 = _existing_evidence_sha256(
         evidence_dir,
-        _composed_evidence_files(include_provider_readback=render_context["coordinator_provider_item"] is not None))
+        _composed_evidence_files(
+            include_provider_records=render_context["provider_route"] is None,
+            include_provider_readback=render_context["coordinator_provider_item"] is not None))
     for case_id, receipt in receipts.items():
         receipt["evidence_sha256"] = (list(dict.fromkeys([*evidence_sha256, *probe_evidence_sha256]))
                                       if case_id == COMPOSED_REFUSAL_DENIAL_CASE_ID and observation is not None

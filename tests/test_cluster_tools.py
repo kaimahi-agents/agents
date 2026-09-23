@@ -516,6 +516,24 @@ class PolicyMechanicsTestCase(unittest.TestCase):
     def test_the_real_pr3_replay_reduces_to_two_distinct_tool_calls_both_redacted(self):
         self.assertEqual(agentctl.count_tool_calls(PR3_REPLAY_EVENTS), (2, 2))
 
+    def test_parent_request_count_counts_unique_completed_and_failed_terminal_events(self):
+        events = [
+            {"seq": 1, "type": "ModelRequestCompleted", "inputTokens": 5, "outputTokens": 7},
+            {"seq": 1, "type": "ModelRequestCompleted", "inputTokens": 99, "outputTokens": 99},
+            {"seq": 2, "type": "ModelRequestFailed", "contentText": "backend unavailable"},
+            {"seq": 3, "type": "ModelUsageUpdated", "inputTokens": 100, "outputTokens": 100},
+            {"seq": 4, "type": "ModelMessage", "contentText": "done"},
+        ]
+        self.assertEqual(agentctl.summarize_parent_request_count(events), (2, True))
+
+    def test_parent_request_count_requires_integer_sequence_numbers(self):
+        for events in (
+                [{"type": "ModelRequestCompleted", "inputTokens": 1, "outputTokens": 1}],
+                [{"seq": "1", "type": "ModelRequestFailed"}],
+        ):
+            with self.subTest(events=events):
+                self.assertEqual(agentctl.summarize_parent_request_count(events), (None, False))
+
     def test_parent_token_usage_sums_only_complete_model_request_completed_pairs(self):
         events = [
             {"seq": 1, "type": "ModelRequestCompleted", "inputTokens": 5, "outputTokens": 7},
@@ -1395,7 +1413,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
                     message="eval failed: rendered Azure provider baseURL",
                 )
 
-    def test_azure_delegate_receipt_derives_provider_route_and_parent_token_usage(self):
+    def test_azure_delegate_receipt_derives_provider_route_token_usage_and_request_count_from_the_journal(self):
         self._switch_coordinator_to_azure()
         events = [
             {"seq": 1, "type": "ToolCallStarted", "toolCallID": "call-1", "toolName": "delegate_task",
@@ -1409,7 +1427,8 @@ class ComposedEvalCliTestCase(unittest.TestCase):
              "contentText": "done"},
             {"seq": 5, "type": "ModelUsageUpdated", "inputTokens": 12, "outputTokens": 99},
             {"seq": 6, "type": "ModelRequestCompleted", "inputTokens": 12, "outputTokens": 5},
-            {"seq": 7, "type": "ModelMessage", "contentText": FIXED_PHRASE},
+            {"seq": 7, "type": "ModelRequestFailed", "contentText": "upstream reset"},
+            {"seq": 8, "type": "ModelMessage", "contentText": FIXED_PHRASE},
         ]
         self._set_delegate_result_evidence(events)
         summary = self.run_eval(
@@ -1418,9 +1437,73 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         provider_readback = self.evidence / "delegates" / "coordinator-provider-readback.json"
         self.assertEqual(summary["verdict"], "pass")
         self.assertEqual(receipt["provider_route"], azure_provider_route())
+        self.assertEqual(receipt["request_count"], 2)
         self.assertEqual(receipt["token_usage"], {"input": 12, "output": 5, "total": 17})
+        self.assertEqual(
+            receipt["assertions"]["stayed-within-limits"]["note"],
+            "counts for authenticated model-request events, child Tasks, tool calls, and retries stayed within limits",
+        )
+        self.assertFalse((self.evidence / "delegates" / "provider-records.json").exists())
         self.assertIn(agentctl.sha256_hex(provider_readback.read_bytes()), receipt["evidence_sha256"])
         self.assertEqual(agentctl.find_prohibited_in_document(receipt, "receipt"), [])
+
+    def test_azure_delegate_passes_without_provider_log_or_window_dependence(self):
+        cases = (
+            ("missing-log", self.root / "missing-provider.log"),
+            ("malformed-log", self.root / "malformed-provider.log"),
+        )
+        for label, provider_log_path in cases:
+            with self.subTest(case=label):
+                self.setUp()
+                self._switch_coordinator_to_azure()
+                self._set_delegate_result_evidence(self._delegate_events_with_usage(
+                    {"type": "ModelRequestCompleted", "inputTokens": 3, "outputTokens": 4}))
+                if label == "malformed-log":
+                    provider_log_path.write_text("{not json", encoding="utf-8")
+                summary = self.run_eval(
+                    "delegates",
+                    self.root / "delegates-task.json",
+                    **{
+                        "--model": AZURE_DEPLOYMENT,
+                        "--provider-log": str(provider_log_path),
+                        "--window-start": "not-a-time",
+                        "--window-end": "still-not-a-time",
+                    },
+                )
+                receipt = self.receipt("delegates")
+                self.assertEqual(summary["verdict"], "pass")
+                self.assertEqual(receipt["request_count"], 1)
+                self.assertFalse((self.evidence / "delegates" / "provider-records.json").exists())
+
+    def test_azure_delegate_request_count_requires_a_complete_parent_journal(self):
+        base_events = self._delegate_events_with_usage(
+            {"type": "ModelRequestCompleted", "inputTokens": 1, "outputTokens": 1},
+        )
+        duplicate_events = copy.deepcopy(base_events)
+        duplicate_events[-1]["seq"] = duplicate_events[-2]["seq"]
+        cases = (
+            (
+                "missing-seq",
+                [*base_events[:-1], {"type": "ModelRequestFailed", "contentText": "retry later"}, base_events[-1]],
+                base_events[-1]["seq"],
+            ),
+            ("duplicate-seq", duplicate_events, duplicate_events[-1]["seq"]),
+        )
+        for label, events, latest_seq in cases:
+            with self.subTest(case=label):
+                self.setUp()
+                self._switch_coordinator_to_azure()
+                self._set_delegate_result_payload(events, latest_seq)
+                summary = self.run_eval(
+                    "delegates", self.root / "delegates-task.json", **{"--model": AZURE_DEPLOYMENT})
+                receipt = self.receipt("delegates")
+                self.assertEqual(summary["verdict"], "fail")
+                self.assertIsNone(receipt["request_count"])
+                self.assertEqual(receipt["assertions"]["stayed-within-limits"]["verdict"], "not_evaluated")
+                self.assertEqual(
+                    receipt["assertions"]["stayed-within-limits"]["note"],
+                    "counts for authenticated model-request events, child Tasks, tool calls, or retries were not fully established",
+                )
 
     def test_azure_delegate_usage_allows_a_valid_zero_event(self):
         self._switch_coordinator_to_azure()
@@ -1700,10 +1783,11 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         combined = [*base_events[:-1], *usage_events, base_events[-1]]
         return [{**event, "seq": index} for index, event in enumerate(combined, start=1)]
 
-    def _set_delegate_result_evidence(self, events: list[dict], *, parent_result: str = FIXED_PHRASE,
-                                      child_items=None, child_results: dict | None = None):
+    def _set_delegate_result_payload(self, events: list[dict], latest_seq: int, *,
+                                     parent_result: str = FIXED_PHRASE, child_items=None,
+                                     child_results: dict | None = None):
         parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
-        self.pages_by_task[parent_name] = [{"events": events, "latestSeq": max(event["seq"] for event in events)}]
+        self.pages_by_task[parent_name] = [{"events": events, "latestSeq": latest_seq}]
         items = [self.child_task] if child_items is None else child_items
         self.child_inventory = {"items": items}
         self.results_by_task = {parent_name: parent_result}
@@ -1711,6 +1795,16 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             self.results_by_task.update({item["metadata"]["name"]: FIXED_PHRASE for item in items})
         else:
             self.results_by_task.update(child_results)
+
+    def _set_delegate_result_evidence(self, events: list[dict], *, parent_result: str = FIXED_PHRASE,
+                                      child_items=None, child_results: dict | None = None):
+        self._set_delegate_result_payload(
+            events,
+            max(event["seq"] for event in events),
+            parent_result=parent_result,
+            child_items=child_items,
+            child_results=child_results,
+        )
 
     def reuse_eval_argv(self, case_id=REFUSAL_DENIAL_CASE_ID, **overrides):
         args = {
@@ -2782,6 +2876,71 @@ class ComposedEvalCliTestCase(unittest.TestCase):
                 self._assert_reuse_failure_preserves_bytes(
                     self.reuse_eval_argv("delegates", **{"--model": AZURE_DEPLOYMENT}),
                     "eval failed: existing evidence coordinator-provider-readback.json does not match the current rendered coordinator Provider",
+                )
+
+    def test_reuse_current_azure_anchor_ignores_provider_log_and_window_inputs(self):
+        first_summary = self.seed_azure_delegate_evidence()
+        self.assertFalse((self.evidence / "delegates" / "provider-records.json").exists())
+        raw_hashes = {
+            path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
+            for path in sorted(self.evidence.rglob("*")) if path.is_file()
+        }
+        ledger_before = (self.evidence / "campaign-ledger.json").read_text(encoding="utf-8")
+
+        summary = self._run_reuse_eval(
+            "delegates",
+            **{
+                "--model": AZURE_DEPLOYMENT,
+                "--provider-log": str(self.root / "missing-provider.log"),
+                "--window-start": "not-a-time",
+                "--window-end": "still-not-a-time",
+            },
+        )
+        receipt = self.receipt("delegates")
+        self.assertEqual(summary["bundle_digest"], first_summary["bundle_digest"])
+        self.assertEqual(summary["verdict"], "pass")
+        self.assertEqual(receipt["request_count"], 1)
+        self.assertEqual((self.evidence / "campaign-ledger.json").read_text(encoding="utf-8"), ledger_before)
+        self.assertEqual(
+            {path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
+             for path in sorted(self.evidence.rglob("*")) if path.is_file()},
+            raw_hashes,
+        )
+
+    def test_reuse_current_azure_anchor_requires_authenticated_parent_request_count_evidence(self):
+        cases = (
+            (
+                "count-drift",
+                self._delegate_events_with_usage(
+                    {"type": "ModelRequestCompleted", "inputTokens": 0, "outputTokens": 0},
+                    {"type": "ModelRequestFailed", "contentText": "throttled"},
+                ),
+                7,
+                "eval failed: existing evidence journal-events.json does not reproduce the original live receipt request_count",
+            ),
+            (
+                "incomplete-journal",
+                self._delegate_events_with_usage(
+                    {"type": "ModelRequestCompleted", "inputTokens": 0, "outputTokens": 0},
+                ),
+                8,
+                "eval failed: existing evidence journal-events.json does not prove authenticated parent model-request count for the original live receipt",
+            ),
+        )
+        for label, events, latest_seq, message in cases:
+            with self.subTest(case=label):
+                self.setUp()
+                self.seed_azure_delegate_evidence()
+                journal_path = self.evidence / "delegates" / "journal-events.json"
+                receipt = self.receipt("delegates")
+                old_digest = agentctl.sha256_hex(journal_path.read_bytes())
+                write_json(journal_path, {"events": events, "latestSeq": latest_seq})
+                new_digest = agentctl.sha256_hex(journal_path.read_bytes())
+                receipt["evidence_sha256"] = [new_digest if digest == old_digest else digest for digest in receipt["evidence_sha256"]]
+                agentctl._write_json(self.receipt_path("delegates"), receipt)
+                self._assert_reuse_failure_preserves_bytes(
+                    self.reuse_eval_argv("delegates", **{"--model": AZURE_DEPLOYMENT}),
+                    message,
                 )
 
     def test_reuse_current_azure_anchor_requires_authenticated_parent_token_usage_evidence(self):
