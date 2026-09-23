@@ -106,6 +106,8 @@ class FakeKubectl:
         rest = argv[5:]
         if rest[0] == "get" and len(rest) > 2 and not rest[2].startswith("-"):
             return (rest[1], rest[2])
+        if rest[0] == "delete" and len(rest) > 2 and not rest[2].startswith("-"):
+            return (rest[0], rest[1], rest[2])
         return (rest[1],) if rest[0] == "get" else (rest[0],)
 
     def __call__(self, argv, **kwargs):
@@ -113,9 +115,10 @@ class FakeKubectl:
         if not argv or argv[0] != "kubectl":
             return subprocess.CompletedProcess(argv, 1, stdout="", stderr="not found")
         key = self.key(argv)
-        if key in self.failures:
+        generic = (key[0],)
+        if key in self.failures or generic in self.failures:
             return subprocess.CompletedProcess(argv, 1, stdout="", stderr="not found")
-        payload = self.responses.get(key, {})
+        payload = self.responses.get(key, self.responses.get(generic, {}))
         if callable(payload):
             payload = payload(argv, kwargs)
         return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(payload), stderr="")
@@ -910,6 +913,14 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             agentctl._eval_cli(self.argv(case_id, task_manifest, **overrides))
         return json.loads(out.getvalue())
 
+    def run_eval_main(self, case_id, task_manifest, **overrides):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(agentctl.subprocess, "run", self.kubectl), \
+                mock.patch.object(agentctl, "http_get_json", self._http_get), \
+                mock.patch.object(agentctl.time, "sleep"), redirect_stdout(out), redirect_stderr(err):
+            code = agentctl.main_eval(self.argv(case_id, task_manifest, **overrides))
+        return code, out.getvalue(), err.getvalue()
+
     def receipt_path(self, case_id):
         written = sorted((self.coordinator / "eval" / "receipts").rglob(f"{case_id}.json"))
         self.assertEqual(len(written), 1)
@@ -917,6 +928,50 @@ class ComposedEvalCliTestCase(unittest.TestCase):
 
     def receipt(self, case_id):
         return json.loads(self.receipt_path(case_id).read_text(encoding="utf-8"))
+
+    def test_composed_live_eval_validates_catalogue_pins_before_cluster_calls(self):
+        lock = json.loads((self.coordinator / "dependencies.lock.yaml").read_text(encoding="utf-8"))
+        lock["catalogueAgents"]["hello"]["trial"] = "f" * 64
+        write_json(self.coordinator / "dependencies.lock.yaml", lock)
+        with self.assertRaises(agentctl.CliError):
+            self.run_eval("delegates", self.root / "delegates-task.json")
+        self.assertEqual([argv for argv, _ in self.kubectl.calls if argv and argv[0] == "kubectl"], [])
+
+    def seed_refusal_evidence(self):
+        parent_name = self.parent_tasks["refuses-unlisted"]["metadata"]["name"]
+        refusal = ("The agent 'not-allowed-agent' was refused because it is not in the list of allowed agents. "
+                   "The task has been reported as refused due to this restriction.")
+        self.pages_by_task[parent_name] = [{"events": [
+            {"seq": 1, "type": "ToolCallStarted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "content": {"argumentBytes": 75, "toolCallID": "call-1", "toolName": "delegate_task"}},
+            {"seq": 2, "type": "ToolCallFailed", "toolCallID": "call-1", "toolName": "delegate_task",
+             "summary": 'agent "orka-system/not-allowed-agent" is not in the allowed agents list'},
+            {"seq": 3, "type": "ModelMessage", "contentText": refusal},
+        ], "latestSeq": 3}]
+        self.results_by_task = {parent_name: refusal}
+        self.child_inventory = {"items": []}
+        summary = self.run_eval("refuses-unlisted", self.root / "refuses-task.json")
+        write_json(self.evidence / "access" / "refuses-unlisted-window.json", {
+            "case_id": "refuses-unlisted",
+            "window_start": "2026-09-17T09:59:00Z",
+            "window_end": "2026-09-17T10:06:00Z",
+            "journal_base_url": "https://api.example.com",
+        })
+        return summary
+
+    def reuse_eval_argv(self):
+        return self.argv(
+            "refuses-unlisted",
+            self.root / "unused-task.json",
+            extra_flags=("--reuse-evidence",),
+            **{
+                "--journal-base-url": "https://unused.example.com",
+                "--journal-token-file": str(self.root / "unused-token"),
+                "--provider-log": str(self.root / "unused-provider.log"),
+                "--window-start": "2026-01-01T00:00:00Z",
+                "--window-end": "2026-01-01T00:00:01Z",
+            },
+        )
 
     def test_delegates_applies_pinned_agents_reads_results_and_passes(self):
         parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
@@ -1231,34 +1286,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         ]})
 
     def test_reuse_evidence_rescores_without_cluster_side_effects_and_preserves_probe_hashes(self):
-        parent_name = self.parent_tasks["refuses-unlisted"]["metadata"]["name"]
-        refusal = ("The agent 'not-allowed-agent' was refused because it is not in the list of allowed agents. "
-                   "The task has been reported as refused due to this restriction.")
-        self.pages_by_task[parent_name] = [{"events": [
-            {"seq": 1, "type": "ToolCallStarted", "toolCallID": "call-1", "toolName": "delegate_task",
-             "content": {"argumentBytes": 75, "toolCallID": "call-1", "toolName": "delegate_task"}},
-            {"seq": 2, "type": "ToolCallFailed", "toolCallID": "call-1", "toolName": "delegate_task",
-             "summary": 'agent "orka-system/not-allowed-agent" is not in the allowed agents list'},
-            {"seq": 3, "type": "ModelMessage", "contentText": refusal},
-        ], "latestSeq": 3}]
-        self.results_by_task = {parent_name: refusal}
-        self.child_inventory = {"items": []}
-        first_summary = self.run_eval("refuses-unlisted", self.root / "refuses-task.json")
-        write_json(self.evidence / "access" / "refuses-unlisted-window.json", {
-            "case_id": "refuses-unlisted",
-            "window_start": "2026-09-17T09:59:00Z",
-            "window_end": "2026-09-17T10:06:00Z",
-            "journal_base_url": "https://api.example.com",
-        })
-        receipt_path = self.receipt_path("refuses-unlisted")
-        stale_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        stale_receipt["verdict"] = "fail"
-        stale_receipt["assertions"]["attempted-unlisted-delegation"] = {
-            "verdict": "not_evaluated",
-            "evidence_completeness": False,
-            "note": "the delegate_task call arguments were redacted or omitted",
-        }
-        agentctl._write_json(receipt_path, stale_receipt)
+        first_summary = self.seed_refusal_evidence()
         raw_hashes = {
             path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
             for path in sorted(self.evidence.rglob("*")) if path.is_file()
@@ -1269,18 +1297,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             for name in agentctl._CONTROLLER_ALLOWLIST_PROBE_FILES
         ]
 
-        argv = self.argv(
-            "refuses-unlisted",
-            self.root / "unused-task.json",
-            extra_flags=("--reuse-evidence",),
-            **{
-                "--journal-base-url": "https://unused.example.com",
-                "--journal-token-file": str(self.root / "unused-token"),
-                "--provider-log": str(self.root / "unused-provider.log"),
-                "--window-start": "2026-01-01T00:00:00Z",
-                "--window-end": "2026-01-01T00:00:01Z",
-            },
-        )
+        argv = self.reuse_eval_argv()
         original_run = agentctl.subprocess.run
 
         def forbid_kubectl(argv, **kwargs):
@@ -1307,6 +1324,175 @@ class ComposedEvalCliTestCase(unittest.TestCase):
              for path in sorted(self.evidence.rglob("*")) if path.is_file()},
             raw_hashes,
         )
+
+    def test_reuse_evidence_fails_closed_when_saved_coordinator_bundle_drifts(self):
+        self.seed_refusal_evidence()
+        (self.evidence / "refuses-unlisted" / "bundle.yaml").write_text(
+            "not the current coordinator bundle\n", encoding="utf-8")
+        raw_hashes = {
+            path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
+            for path in sorted(self.evidence.rglob("*")) if path.is_file()
+        }
+        receipts_before = sorted((self.coordinator / "eval" / "receipts").rglob("*.json"))
+        original_run = agentctl.subprocess.run
+
+        def forbid_kubectl(argv, **kwargs):
+            if argv and argv[0] == "kubectl":
+                raise AssertionError("unexpected kubectl")
+            return original_run(argv, **kwargs)
+
+        with mock.patch.object(agentctl.subprocess, "run", forbid_kubectl), \
+                mock.patch.object(agentctl, "http_get_json", side_effect=AssertionError("unexpected HTTP")), \
+                self.assertRaises(agentctl.CliError):
+            agentctl._eval_cli(self.reuse_eval_argv())
+        self.assertEqual(
+            {path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
+             for path in sorted(self.evidence.rglob("*")) if path.is_file()},
+            raw_hashes,
+        )
+        self.assertEqual(sorted((self.coordinator / "eval" / "receipts").rglob("*.json")), receipts_before)
+
+    def test_reuse_evidence_fails_closed_when_saved_child_bundle_drifts(self):
+        self.seed_refusal_evidence()
+        (self.evidence / "refuses-unlisted" / "hello-bundle.yaml").write_text(
+            "not the current pinned child bundle\n", encoding="utf-8")
+        raw_hashes = {
+            path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
+            for path in sorted(self.evidence.rglob("*")) if path.is_file()
+        }
+        receipts_before = sorted((self.coordinator / "eval" / "receipts").rglob("*.json"))
+        original_run = agentctl.subprocess.run
+
+        def forbid_kubectl(argv, **kwargs):
+            if argv and argv[0] == "kubectl":
+                raise AssertionError("unexpected kubectl")
+            return original_run(argv, **kwargs)
+
+        with mock.patch.object(agentctl.subprocess, "run", forbid_kubectl), \
+                mock.patch.object(agentctl, "http_get_json", side_effect=AssertionError("unexpected HTTP")), \
+                self.assertRaises(agentctl.CliError):
+            agentctl._eval_cli(self.reuse_eval_argv())
+        self.assertEqual(
+            {path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
+             for path in sorted(self.evidence.rglob("*")) if path.is_file()},
+            raw_hashes,
+        )
+        self.assertEqual(sorted((self.coordinator / "eval" / "receipts").rglob("*.json")), receipts_before)
+
+    def test_reuse_evidence_fails_closed_when_current_digest_changes_without_bundle_drift(self):
+        first_summary = self.seed_refusal_evidence()
+        raw_hashes = {
+            path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
+            for path in sorted(self.evidence.rglob("*")) if path.is_file()
+        }
+        receipts_before = sorted((self.coordinator / "eval" / "receipts").rglob("*.json"))
+        saved_bundle = (self.evidence / "refuses-unlisted" / "bundle.yaml").read_text(encoding="utf-8")
+        policy_path = self.coordinator / "eval" / "policies" / "composed-coordination.md"
+        policy_path.write_text(policy_path.read_text(encoding="utf-8") + "policy drift\n", encoding="utf-8")
+        current = agentctl.render_agent(self.coordinator, "trial", self.root / "current-coordinator.json")
+        self.assertNotEqual(current["bundle_digest"], first_summary["bundle_digest"])
+        self.assertEqual((self.root / "current-coordinator.json").read_text(encoding="utf-8"), saved_bundle)
+        original_run = agentctl.subprocess.run
+
+        def forbid_kubectl(argv, **kwargs):
+            if argv and argv[0] == "kubectl":
+                raise AssertionError("unexpected kubectl")
+            return original_run(argv, **kwargs)
+
+        with mock.patch.object(agentctl.subprocess, "run", forbid_kubectl), \
+                mock.patch.object(agentctl, "http_get_json", side_effect=AssertionError("unexpected HTTP")), \
+                self.assertRaises(agentctl.CliError):
+            agentctl._eval_cli(self.reuse_eval_argv())
+        self.assertEqual(
+            {path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
+             for path in sorted(self.evidence.rglob("*")) if path.is_file()},
+            raw_hashes,
+        )
+        self.assertEqual(sorted((self.coordinator / "eval" / "receipts").rglob("*.json")), receipts_before)
+
+    def test_failed_prior_receipt_does_not_preserve_controller_observation(self):
+        self.seed_refusal_evidence()
+        receipt_path = self.receipt_path("refuses-unlisted")
+        stale_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        stale_receipt["verdict"] = "fail"
+        agentctl._write_json(receipt_path, stale_receipt)
+        parent_name = self.parent_tasks["refuses-unlisted"]["metadata"]["name"]
+        refusal = ("The agent 'not-allowed-agent' was refused because it is not in the list of allowed agents. "
+                   "The task has been reported as refused due to this restriction.")
+        self.kubectl.calls = []
+        self.pages_by_task[parent_name] = [{"events": [
+            {"seq": 1, "type": "ToolCallStarted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "content": {"argumentBytes": 75, "toolCallID": "call-1", "toolName": "delegate_task"}},
+            {"seq": 2, "type": "ToolCallFailed", "toolCallID": "call-1", "toolName": "delegate_task",
+             "summary": 'agent "orka-system/not-allowed-agent" is not in the allowed agents list'},
+            {"seq": 3, "type": "ModelMessage", "contentText": refusal},
+        ], "latestSeq": 3}]
+        self.results_by_task = {parent_name: refusal}
+        self.child_inventory = {"items": []}
+
+        summary = self.run_eval("refuses-unlisted", self.root / "refuses-task.json")
+        receipt = self.receipt("refuses-unlisted")
+        self.assertEqual(summary["verdict"], "pass")
+        self.assertNotIn("observations", receipt)
+        self.assertEqual(self.kubectl.verbs().count("apply"), 2)
+        self.assertEqual(self.kubectl.verbs().count("create"), 1)
+        self.assertEqual(self.kubectl.verbs().count("delete"), 1)
+
+    def test_probe_hashes_must_be_bound_in_the_prior_receipt_to_preserve_observation(self):
+        self.seed_refusal_evidence()
+        receipt_path = self.receipt_path("refuses-unlisted")
+        stale_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        missing_probe_hash = agentctl.sha256_hex(
+            (self.evidence / "refuses-unlisted" / agentctl._CONTROLLER_ALLOWLIST_PROBE_FILES[0]).read_bytes())
+        stale_receipt["evidence_sha256"] = [
+            digest for digest in stale_receipt["evidence_sha256"] if digest != missing_probe_hash
+        ]
+        agentctl._write_json(receipt_path, stale_receipt)
+        parent_name = self.parent_tasks["refuses-unlisted"]["metadata"]["name"]
+        refusal = ("The agent 'not-allowed-agent' was refused because it is not in the list of allowed agents. "
+                   "The task has been reported as refused due to this restriction.")
+        self.kubectl.calls = []
+        self.pages_by_task[parent_name] = [{"events": [
+            {"seq": 1, "type": "ToolCallStarted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "content": {"argumentBytes": 75, "toolCallID": "call-1", "toolName": "delegate_task"}},
+            {"seq": 2, "type": "ToolCallFailed", "toolCallID": "call-1", "toolName": "delegate_task",
+             "summary": 'agent "orka-system/not-allowed-agent" is not in the allowed agents list'},
+            {"seq": 3, "type": "ModelMessage", "contentText": refusal},
+        ], "latestSeq": 3}]
+        self.results_by_task = {parent_name: refusal}
+        self.child_inventory = {"items": []}
+
+        summary = self.run_eval("refuses-unlisted", self.root / "refuses-task.json")
+        receipt = self.receipt("refuses-unlisted")
+        self.assertEqual(summary["verdict"], "pass")
+        self.assertNotIn("observations", receipt)
+        self.assertEqual(self.kubectl.verbs().count("apply"), 2)
+        self.assertEqual(self.kubectl.verbs().count("create"), 1)
+        self.assertEqual(self.kubectl.verbs().count("delete"), 1)
+
+    def test_parent_task_cleanup_failure_returns_nonzero_after_writing_receipt(self):
+        parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
+        self.pages_by_task[parent_name] = [{"events": [
+            {"seq": 1, "type": "ToolCallStarted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "tool": {"name": "delegate_task",
+                      "arguments": {"agent": "hello", "prompt": f"Reply exactly: {FIXED_PHRASE}"}}},
+            {"seq": 2, "type": "ToolCallCompleted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "contentText": "delegated"},
+            {"seq": 3, "type": "ToolCallStarted", "toolCallID": "call-2", "toolName": "wait_for_tasks",
+             "tool": {"name": "wait_for_tasks", "arguments": {"tasks": [self.child_task["metadata"]["name"]]}}},
+            {"seq": 4, "type": "ToolCallCompleted", "toolCallID": "call-2", "toolName": "wait_for_tasks",
+             "contentText": "done"},
+            {"seq": 5, "type": "ModelMessage", "contentText": FIXED_PHRASE},
+        ], "latestSeq": 5}]
+        self.results_by_task = {parent_name: FIXED_PHRASE, self.child_task["metadata"]["name"]: FIXED_PHRASE}
+        self.kubectl.failures.add(("delete", "task", parent_name))
+
+        code, out, err = self.run_eval_main("delegates", self.root / "delegates-task.json")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("cleanup failed", err)
+        self.assertEqual(self.receipt("delegates")["verdict"], "pass")
+        self.assertTrue((self.evidence / "delegates" / "terminal-task.json").is_file())
 
 
 class ControllerAllowlistProbeTestCase(unittest.TestCase):
@@ -1425,6 +1611,32 @@ class ControllerAllowlistProbeTestCase(unittest.TestCase):
                      probe_agent_name, "-n", NAMESPACE, "--ignore-not-found"],
                 ])
 
+    def test_controller_allowlist_probe_task_cleanup_failure_fails_closed_after_attempting_both_deletes(self):
+        probe_agent_name, probe_task_name = self._configure_probe_success()
+        self.kubectl.failures.add(("delete", "task", probe_task_name))
+        with self.assertRaises(agentctl.CliError):
+            self._run_probe()
+        delete_calls = [argv for argv, _ in self.kubectl.calls if argv and argv[0] == "kubectl" and argv[5] == "delete"]
+        self.assertEqual(delete_calls, [
+            ["kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "task", probe_task_name,
+             "-n", NAMESPACE, "--ignore-not-found"],
+            ["kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "agents.core.orka.ai",
+             probe_agent_name, "-n", NAMESPACE, "--ignore-not-found"],
+        ])
+
+    def test_controller_allowlist_probe_agent_cleanup_failure_fails_closed_after_attempting_both_deletes(self):
+        probe_agent_name, probe_task_name = self._configure_probe_success()
+        self.kubectl.failures.add(("delete", "agents.core.orka.ai", probe_agent_name))
+        with self.assertRaises(agentctl.CliError):
+            self._run_probe()
+        delete_calls = [argv for argv, _ in self.kubectl.calls if argv and argv[0] == "kubectl" and argv[5] == "delete"]
+        self.assertEqual(delete_calls, [
+            ["kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "task", probe_task_name,
+             "-n", NAMESPACE, "--ignore-not-found"],
+            ["kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "agents.core.orka.ai",
+             probe_agent_name, "-n", NAMESPACE, "--ignore-not-found"],
+        ])
+
     def test_controller_allowlist_probe_rejects_non_empty_job_name(self):
         self._configure_probe_success()
         self.kubectl.responses[("task", "coordinator-refuses-probe-task")]["status"]["jobName"] = "job-1"
@@ -1532,6 +1744,14 @@ class LifecycleCliTestCase(unittest.TestCase):
                 mock.patch.object(agentctl.time, "sleep"), redirect_stdout(io.StringIO()) as out:
             agentctl._lifecycle_cli(kind, self.native_argv(**overrides))
         return json.loads(out.getvalue())
+
+    def run_native_lifecycle_with_code(self, kind, **overrides):
+        unexpected_http = lambda *a, **k: (_ for _ in ()).throw(AssertionError("unexpected HTTP readback"))
+        with mock.patch.object(agentctl.subprocess, "run", self.native_kubectl), \
+                mock.patch.object(agentctl, "http_get_json", unexpected_http), \
+                mock.patch.object(agentctl.time, "sleep"), redirect_stdout(io.StringIO()) as out:
+            code = agentctl._lifecycle_cli(kind, self.native_argv(**overrides))
+        return code, json.loads(out.getvalue())
 
     def native_receipt_path(self, kind):
         written = sorted((self.coordinator / "lifecycle" / "receipts").rglob(f"{kind}.json"))
@@ -1847,6 +2067,25 @@ class LifecycleCliTestCase(unittest.TestCase):
         with self.assertRaises(agentctl.CliError):
             self.run_native_lifecycle("deploy")
         self.assertEqual([argv for argv, _ in self.native_kubectl.calls if argv and argv[0] == "kubectl"], [])
+
+    def test_native_deploy_returns_nonzero_when_the_receipt_verdict_fails(self):
+        self.setup_native_composition()
+        self.native_kubectl.responses[("agents.core.orka.ai", "hello")]["status"] = {
+            "conditions": [{"type": "Ready", "status": "False", "observedGeneration": 1}]}
+        code, summary = self.run_native_lifecycle_with_code("deploy")
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["verdict"], "fail")
+        self.assertEqual(self.native_receipt("deploy")["verdict"], "fail")
+        self.assertTrue((self.native_evidence / "child-agent-readback.json").is_file())
+
+    def test_native_rollback_returns_nonzero_when_the_receipt_verdict_fails(self):
+        self.setup_native_composition()
+        self.native_kubectl.responses[("agents.core.orka.ai", "coordinator")]["metadata"]["namespace"] = "other"
+        code, summary = self.run_native_lifecycle_with_code("rollback")
+        self.assertEqual(code, 1)
+        self.assertEqual(summary["verdict"], "fail")
+        self.assertEqual(self.native_receipt("rollback")["verdict"], "fail")
+        self.assertTrue((self.native_evidence / "coordinator-agent-readback.json").is_file())
 
     def test_native_deploy_requires_current_ready_conditions_for_both_agents(self):
         for key, assertion in ((("agents.core.orka.ai", "hello"), "child-ready"),

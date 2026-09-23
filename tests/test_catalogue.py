@@ -58,7 +58,7 @@ class CatalogueTestCase(unittest.TestCase):
         rows = [line for line in README.read_text(encoding="utf-8").splitlines()
                 if line.startswith("| [coordinator](agents/coordinator/)")]
         self.assertEqual(len(rows), 1)
-        self.assertEqual(catalogue_rows().get("coordinator"), "ran, no tests yet")
+        self.assertEqual(catalogue_rows().get("coordinator"), "tested")
         self.assertTrue((ROOT / "agents" / "coordinator" / "README.md").is_file())
 
     def test_versioning_docs_have_one_pinned_composition_paragraph(self):

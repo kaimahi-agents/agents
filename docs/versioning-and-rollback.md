@@ -28,9 +28,11 @@ Task is frozen to one child revision.
 
 ## Deploy and roll back
 
-`tools/deploy` applies the rendered bundle. It reads the Agent, prompt, runtime
-selection, memory count, and proposal count back from the cluster, then writes
-a deploy receipt.
+`tools/deploy` applies the rendered bundle. In monitored-runtime mode it reads
+the Agent, prompt, runtime selection, memory count, and proposal count back
+from the cluster, then writes a deploy receipt. In native-composition mode it
+applies the pinned child and coordinator bundles, then verifies both live Agent
+definitions and Ready conditions before writing the receipt.
 
 Rollback is `git revert`. Reverting restores the earlier behavior inputs, so the
 digest returns to its earlier value. Its test receipts already exist and the
@@ -49,9 +51,11 @@ tools/rollback-verify \
 ```
 
 Rollback does not undo work already published outside the cluster. It does not
-restore the Agent object's UID or generation. Memory is checked against its
-baseline instead of being rewritten. Work already running finishes on the
-version Orka pinned when it dispatched the Task.
+restore the Agent object's UID or generation. In monitored-runtime mode, memory
+is checked against its baseline instead of being rewritten. In
+native-composition mode, rollback verifies the restored pinned child and
+coordinator definitions plus their Ready conditions. Work already running
+finishes on the version Orka pinned when it dispatched the Task.
 
 ## Worked example
 

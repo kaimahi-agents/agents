@@ -253,8 +253,10 @@ def all_assertions_pass_and_complete(assertions) -> bool:
         is_safe_slug(name) and isinstance(value, dict) and value.get("verdict") == "pass"
         and value.get("evidence_completeness") is True for name, value in assertions.items()))
 def _receipt_allows_observations(receipt) -> bool:
+    assertions = receipt.get("assertions") if isinstance(receipt, dict) else None
     return (receipt.get("case_id") == "refuses-unlisted"
-            and set(receipt.get("assertions", {})) == COMPOSED_ASSERTIONS["refuses-unlisted"])
+            and isinstance(assertions, dict)
+            and set(assertions) == COMPOSED_ASSERTIONS["refuses-unlisted"])
 def _validate_observations(receipt, errors: list[str]) -> None:
     observations = receipt.get("observations")
     if observations is None:
@@ -431,8 +433,12 @@ def parse_acceptance_cases(acceptance_text: str) -> list[dict]:
             case = json.loads(line.strip())
         except json.JSONDecodeError as exc:
             raise BundleError(f"acceptance.md line {number} is not valid JSON: {exc}") from exc
-        keys, with_policy = set(case), _ACCEPTANCE_REQUIRED_KEYS | _ACCEPTANCE_OPTIONAL_KEYS
-        if not isinstance(case, dict) or keys not in (_ACCEPTANCE_REQUIRED_KEYS, with_policy):
+        with_policy = _ACCEPTANCE_REQUIRED_KEYS | _ACCEPTANCE_OPTIONAL_KEYS
+        if not isinstance(case, dict):
+            raise BundleError(f"acceptance.md line {number} must have exactly keys {sorted(_ACCEPTANCE_REQUIRED_KEYS)}, "
+                              f"optionally with all of {sorted(_ACCEPTANCE_OPTIONAL_KEYS)} together")
+        keys = set(case)
+        if keys not in (_ACCEPTANCE_REQUIRED_KEYS, with_policy):
             raise BundleError(f"acceptance.md line {number} must have exactly keys {sorted(_ACCEPTANCE_REQUIRED_KEYS)}, "
                               f"optionally with all of {sorted(_ACCEPTANCE_OPTIONAL_KEYS)} together")
         checks = _ACCEPTANCE_CHECKS + (_ACCEPTANCE_OPTIONAL_CHECKS if "policy" in case else ())
@@ -1178,29 +1184,55 @@ def _controller_allowlist_probe_evidence_digests(evidence_dir) -> list[str] | No
         digests.append(sha256_hex(path.read_bytes()))
     return digests
 
-def _load_preserved_controller_allowlist_observation(agent_dir, bundle_digest: str, case_id: str,
-                                                     evidence_dir) -> tuple[dict | None, list[str]]:
+def _load_existing_live_evaluation_receipt(agent_dir, bundle_digest: str, case_id: str) -> dict | None:
     receipt_path = Path(agent_dir) / "eval" / "receipts" / bundle_digest / f"{case_id}.json"
     if not receipt_path.is_file():
-        return None, []
+        return None
     receipt = _read_json(receipt_path, "existing evaluation receipt")
-    if validate_evaluation_receipt(receipt):
+    if (validate_evaluation_receipt(receipt)
+            or receipt.get("case_id") != case_id
+            or receipt.get("bundle_digest") != bundle_digest
+            or receipt.get("source") != "live"):
+        return None
+    return receipt
+
+
+def _load_preserved_controller_allowlist_observation(agent_dir, bundle_digest: str, case_id: str,
+                                                     evidence_dir) -> tuple[dict | None, list[str]]:
+    receipt = _load_existing_live_evaluation_receipt(agent_dir, bundle_digest, case_id)
+    if receipt is None or receipt.get("verdict") != "pass":
         return None, []
     observations = receipt.get("observations") if isinstance(receipt, dict) else None
     observation = observations.get(CONTROLLER_ALLOWLIST_OBSERVATION_ID) if isinstance(observations, dict) else None
     probe_digests = _controller_allowlist_probe_evidence_digests(evidence_dir)
-    if observation != CONTROLLER_ALLOWLIST_OBSERVATION or probe_digests is None:
+    evidence_sha256 = receipt.get("evidence_sha256") if isinstance(receipt, dict) else None
+    if (observation != CONTROLLER_ALLOWLIST_OBSERVATION or probe_digests is None or not isinstance(evidence_sha256, list)
+            or not set(probe_digests).issubset(set(evidence_sha256))):
         return None, []
     return dict(observation), probe_digests
 
+
+def _existing_file_sha256(path, label: str) -> str:
+    try:
+        return sha256_hex(Path(path).read_bytes())
+    except OSError as exc:
+        raise CliError(f"could not read {label}") from exc
+
+
 def _existing_evidence_sha256(evidence_dir, names) -> list[str]:
-    digests = []
-    for name in names:
-        try:
-            digests.append(sha256_hex((Path(evidence_dir) / name).read_bytes()))
-        except OSError as exc:
-            raise CliError(f"could not read existing evidence {name}") from exc
-    return list(dict.fromkeys(digests))
+    return list(dict.fromkeys(
+        _existing_file_sha256(Path(evidence_dir) / name, f"existing evidence {name}") for name in names))
+
+
+def _require_reusable_composed_evidence(agent_dir, bundle_digest: str, case_id: str,
+                                        evidence_dir, render_context: dict) -> None:
+    if _load_existing_live_evaluation_receipt(agent_dir, bundle_digest, case_id) is None:
+        raise CliError("existing live evidence does not match the current rendered bundle digest")
+    for name, label, expected_sha256 in (
+            ("bundle.yaml", "current rendered coordinator bundle", render_context["coordinator_bundle_sha256"]),
+            ("hello-bundle.yaml", "current rendered pinned child bundle", render_context["child_bundle_sha256"])):
+        if _existing_file_sha256(Path(evidence_dir) / name, f"existing evidence {name}") != expected_sha256:
+            raise CliError(f"existing evidence {name} does not match the {label}")
 
 def check_window_covers_task(window_start, window_end, task_start, task_end) -> list[str]:
     """Diagnostics; empty means the asserted window covers the Task exactly, with no tolerance."""
@@ -1633,12 +1665,19 @@ def run_controller_allowlist_probe(args, *, evidence_dir: Path, coordinator_live
             raise CliError("controller allowlist probe observed worker Jobs despite pre-dispatch refusal")
         return dict(CONTROLLER_ALLOWLIST_OBSERVATION)
     finally:
-        run_kubectl(args.context, args.kubeconfig,
-                    ["delete", "task", _CONTROLLER_ALLOWLIST_PROBE_TASK, "-n", args.namespace,
-                     "--ignore-not-found"])
-        run_kubectl(args.context, args.kubeconfig,
-                    ["delete", "agents.core.orka.ai", _CONTROLLER_ALLOWLIST_PROBE_AGENT, "-n", args.namespace,
-                     "--ignore-not-found"])
+        cleanup_errors = []
+        deleted = run_kubectl(args.context, args.kubeconfig,
+                              ["delete", "task", _CONTROLLER_ALLOWLIST_PROBE_TASK, "-n", args.namespace,
+                               "--ignore-not-found"])
+        if deleted.returncode != 0:
+            cleanup_errors.append(f"controller allowlist probe Task cleanup failed (kubectl exited {deleted.returncode})")
+        deleted = run_kubectl(args.context, args.kubeconfig,
+                              ["delete", "agents.core.orka.ai", _CONTROLLER_ALLOWLIST_PROBE_AGENT, "-n", args.namespace,
+                               "--ignore-not-found"])
+        if deleted.returncode != 0:
+            cleanup_errors.append(f"controller allowlist probe Agent cleanup failed (kubectl exited {deleted.returncode})")
+        if cleanup_errors:
+            raise CliError("; ".join(cleanup_errors))
 
 # --- CLI entry points -----------------------------------------------------------------------
 def _guard(name: str, run, argv) -> int:
@@ -1782,6 +1821,9 @@ _INCOMPLETE_NOTES = ("Agent, Monitor, or prompt ConfigMap readback could not be 
                      "proposal inventory readback could not be established")
 def _validate_monitored_lifecycle_receipt(receipt, kind: str, *, legacy: bool) -> list[str]:
     assertions = receipt.get("assertions", {})
+    assertion_names = set(assertions) if isinstance(assertions, dict) else set()
+    digests = receipt.get("digests")
+    counts = receipt.get("counts")
     base_keys = LEGACY_LIFECYCLE_RECEIPT_KEYS if legacy else LIFECYCLE_RECEIPT_KEYS
     expected_keys = base_keys | ({"restored", "limitations"} if kind == "rollback" else set())
     expected_assertions = tuple(assertion for assertion in _LIFECYCLE[kind][2]
@@ -1795,19 +1837,22 @@ def _validate_monitored_lifecycle_receipt(receipt, kind: str, *, legacy: bool) -
     errors = [message for ok, message in (
         (set(receipt) == expected_keys, "lifecycle receipt fields are not the fixed public-safe set"),
         (receipt.get("kind") == kind, "lifecycle receipt declared kind does not match its filename"),
-        (set(assertions) == set(expected_assertions),
+        (assertion_names == set(expected_assertions),
          "lifecycle receipt assertions are not the fixed public-safe set"),
         (legacy or receipt.get("schema_version") == LIFECYCLE_RECEIPT_SCHEMA_VERSION,
          "lifecycle receipt schema_version is unsupported"),
         (legacy or namespace is None or is_safe_slug(namespace),
          "namespace must be null or a safe slug"),
+        (receipt.get("verdict") in _VERDICTS, f"verdict must be one of {sorted(_VERDICTS)}"),
         (legacy or receipt.get("verdict") != "pass" or isinstance(namespace, str),
          "a passing lifecycle receipt requires a readback namespace"),
         (_is_hex_digest(receipt.get("bundle_digest")), "bundle_digest must be a 64-character lowercase hex string"),
         (_is_date(receipt.get("date")), "date must be an ISO YYYY-MM-DD string"),
-        (all(is_safe_slug(name) and _is_image_digest(value) for name, value in receipt.get("digests", {}).items()),
+        (isinstance(digests, dict)
+         and all(is_safe_slug(name) and _is_image_digest(value) for name, value in digests.items()),
          "digests must map safe-slug names to SHA-256 digests"),
-        (all(is_safe_slug(name) and _is_count(value) for name, value in receipt.get("counts", {}).items()),
+        (isinstance(counts, dict)
+         and all(is_safe_slug(name) and _is_count(value) for name, value in counts.items()),
          "counts must map safe-slug names to non-negative integers"),
         (receipt.get("verdict") != "pass" or all_assertions_pass_and_complete(receipt.get("assertions")),
          "overall verdict 'pass' requires every assertion to be verdict 'pass' and complete"),
@@ -1820,16 +1865,18 @@ def _validate_monitored_lifecycle_receipt(receipt, kind: str, *, legacy: bool) -
 
 def _validate_native_composition_lifecycle_receipt(receipt, kind: str) -> list[str]:
     assertions = receipt.get("assertions", {})
+    assertion_names = set(assertions) if isinstance(assertions, dict) else set()
     expected_keys = NATIVE_COMPOSITION_LIFECYCLE_RECEIPT_KEYS | ({"limitations"} if kind == "rollback" else set())
     errors = [message for ok, message in (
         (set(receipt) == expected_keys, "lifecycle receipt fields are not the fixed public-safe set"),
         (receipt.get("kind") == kind, "lifecycle receipt declared kind does not match its filename"),
-        (set(assertions) == set(_NATIVE_COMPOSITION_LIFECYCLE[kind][2]),
+        (assertion_names == set(_NATIVE_COMPOSITION_LIFECYCLE[kind][2]),
          "lifecycle receipt assertions are not the fixed public-safe set"),
         (receipt.get("schema_version") == NATIVE_COMPOSITION_LIFECYCLE_RECEIPT_SCHEMA_VERSION,
          "lifecycle receipt schema_version is unsupported"),
         (receipt.get("namespace") is None or is_safe_slug(receipt.get("namespace")),
          "namespace must be null or a safe slug"),
+        (receipt.get("verdict") in _VERDICTS, f"verdict must be one of {sorted(_VERDICTS)}"),
         (receipt.get("verdict") != "pass" or isinstance(receipt.get("namespace"), str),
          "a passing lifecycle receipt requires a readback namespace"),
         (_is_hex_digest(receipt.get("coordinator_digest")),
@@ -2074,7 +2121,7 @@ def _native_composition_lifecycle_cli(kind: str, argv) -> int:
     sys.stdout.write(_json_text({"coordinator_digest": rendered["coordinator_digest"],
                                  "child_digest": rendered["child_digest"],
                                  "kind": kind, "verdict": receipt["verdict"]}))
-    return 0
+    return 0 if receipt["verdict"] == "pass" else 1
 
 
 def _monitored_runtime_lifecycle_cli(kind: str, argv) -> int:
@@ -2296,16 +2343,23 @@ def _prepare_composed_render_context(args, *, evidence_dir: Path | None) -> dict
         raise CliError("the pinned hello child could not be resolved in the catalogue")
     child_dir = coordinator_dir.parent.parent / "agents" / child_slug
     expected_phrase = load_fixed_greeting_expected_answer(child_dir)
+    pinned_child_digest = lock[_EXPECTED_COMPOSED_CHILD][args.environment]
     if evidence_dir is None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_root = Path(tmp_dir)
-            _, child_rendered = _render_bundle_checked(
+            child_render_result, child_rendered = _render_bundle_checked(
                 child_dir, args.environment, args.namespace, tmp_root / "hello-bundle.yaml")
             coordinator_render_result, coordinator_rendered = _render_checked(args, tmp_root / "bundle.yaml")
+            child_bundle_sha256 = _existing_file_sha256(tmp_root / "hello-bundle.yaml", "rendered hello-bundle.yaml")
+            coordinator_bundle_sha256 = _existing_file_sha256(tmp_root / "bundle.yaml", "rendered bundle.yaml")
     else:
-        _, child_rendered = _render_bundle_checked(
+        child_render_result, child_rendered = _render_bundle_checked(
             child_dir, args.environment, args.namespace, evidence_dir / "hello-bundle.yaml")
         coordinator_render_result, coordinator_rendered = _render_checked(args, evidence_dir / "bundle.yaml")
+        child_bundle_sha256 = _existing_file_sha256(evidence_dir / "hello-bundle.yaml", "rendered hello-bundle.yaml")
+        coordinator_bundle_sha256 = _existing_file_sha256(evidence_dir / "bundle.yaml", "rendered bundle.yaml")
+    if child_render_result["bundle_digest"] != pinned_child_digest:
+        raise CliError("catalogue dependency digest does not match dependencies.lock.yaml for this environment")
     bundle_digest = coordinator_render_result["bundle_digest"]
     child_agent_item = next((item for item in child_rendered.get("items", [])
                              if isinstance(item, dict) and item.get("kind") == "Agent"), None)
@@ -2324,6 +2378,8 @@ def _prepare_composed_render_context(args, *, evidence_dir: Path | None) -> dict
         "coordinator_agent_item": coordinator_agent_item,
         "child_agent_name": child_agent_name,
         "coordinator_agent_name": coordinator_agent_name,
+        "child_bundle_sha256": child_bundle_sha256,
+        "coordinator_bundle_sha256": coordinator_bundle_sha256,
     }
 
 
@@ -2679,6 +2735,8 @@ def _reuse_composed_coordination(args, case: dict) -> tuple[dict, dict, dict | N
     reuse_args.window_start = window_payload["window_start"]
     reuse_args.window_end = window_payload["window_end"]
     render_context = _prepare_composed_render_context(reuse_args, evidence_dir=None)
+    _require_reusable_composed_evidence(args.agent_dir, render_context["bundle_digest"], args.case_id,
+                                        evidence_dir, render_context)
     task_manifest = _read_json(evidence_dir / "task-manifest.json", "existing evidence task-manifest.json")
     terminal_task = _read_json(evidence_dir / "terminal-task.json", "existing evidence terminal-task.json")
     journal_payload = _read_json(evidence_dir / "journal-events.json", "existing evidence journal-events.json")
@@ -2754,9 +2812,11 @@ def _eval_cli(argv) -> int:
     _write_json(Path(args.agent_dir) / "eval" / "receipts" / receipt["bundle_digest"] / f"{args.case_id}.json",
                 receipt)
     if cleanup is not None:
-        run_kubectl(args.context, args.kubeconfig,
-                    ["delete", "task", cleanup["task_name"], "-n", cleanup["namespace"],
-                     "--ignore-not-found"])
+        deleted = run_kubectl(args.context, args.kubeconfig,
+                              ["delete", "task", cleanup["task_name"], "-n", cleanup["namespace"],
+                               "--ignore-not-found"])
+        if deleted.returncode != 0:
+            raise CliError(f"Task cleanup failed (kubectl exited {deleted.returncode})")
     sys.stdout.write(_json_text(summary))
     return 0
 def main_render(argv=None) -> int: return _guard("render", _render_cli, argv)

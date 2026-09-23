@@ -74,6 +74,27 @@ def native_lifecycle_receipt(kind: str, coordinator_digest: str, child_digest: s
     return receipt
 
 
+def monitored_lifecycle_receipt(kind: str, **overrides) -> dict:
+    assertion_ids = agentctl._LIFECYCLE[kind][2]
+    receipt = {
+        "schema_version": agentctl.LIFECYCLE_RECEIPT_SCHEMA_VERSION,
+        "kind": kind,
+        "bundle_digest": "d" * 64,
+        "date": "2026-09-17",
+        "namespace": "trial-namespace",
+        "verdict": "pass",
+        "assertions": {name: {"verdict": "pass", "evidence_completeness": True, "note": "n"}
+                        for name in assertion_ids},
+        "digests": {"prompt": "a" * 64},
+        "counts": {"memory-items": 0, "proposal-items": 0},
+    }
+    if kind == "rollback":
+        receipt["restored"] = {"model": "test-model", "request-cap": 60, "tools": ["Read"]}
+        receipt["limitations"] = list(agentctl.ROLLBACK_LIMITATIONS)
+    receipt.update(overrides)
+    return receipt
+
+
 class VerifyAgentTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -164,7 +185,9 @@ class VerifyAgentTestCase(unittest.TestCase):
     def test_malformed_acceptance_block_is_a_diagnostic(self):
         for text in ("no markers at all\n", "<!-- acceptance:end -->\n<!-- acceptance:begin -->\n",
                      "<!-- acceptance:begin -->\nnot json\n<!-- acceptance:end -->\n",
-                     "<!-- acceptance:begin -->\n{\"case_id\": \"x\"}\n<!-- acceptance:end -->\n"):
+                     "<!-- acceptance:begin -->\n{\"case_id\": \"x\"}\n<!-- acceptance:end -->\n",
+                     "<!-- acceptance:begin -->\nnull\n<!-- acceptance:end -->\n",
+                     "<!-- acceptance:begin -->\n1\n<!-- acceptance:end -->\n"):
             with self.subTest(text=text):
                 (self.agent / "eval" / "acceptance.md").write_text(text, encoding="utf-8")
                 self.assertTrue(any("verify failed" in error for error in self.verify()))
@@ -212,6 +235,25 @@ class VerifyAgentTestCase(unittest.TestCase):
         errors = agentctl.validate_lifecycle_receipt(
             native_lifecycle_receipt("deploy", "c" * 64, "short"), "deploy")
         self.assertTrue(any("child_digest" in error for error in errors))
+
+    def test_lifecycle_receipt_rejects_non_object_digests_and_counts(self):
+        errors = agentctl.validate_lifecycle_receipt(
+            monitored_lifecycle_receipt("deploy", digests="not-an-object", counts="not-a-map"), "deploy")
+        self.assertTrue(any("digests" in error for error in errors))
+        self.assertTrue(any("counts" in error for error in errors))
+
+    def test_grandfathered_legacy_lifecycle_receipt_still_requires_a_pass_or_fail_verdict(self):
+        path = REAL_AGENT / "lifecycle" / "receipts" / (
+            "50be51a4de3e857436fcebd244192d37590ea51f64d19a91216a2cfc13e532b8/deploy.json")
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+        receipt["verdict"] = "maybe"
+        errors = agentctl.validate_lifecycle_receipt(receipt, "deploy")
+        self.assertTrue(any("verdict" in error for error in errors))
+
+    def test_native_lifecycle_receipt_requires_a_pass_or_fail_verdict(self):
+        errors = agentctl.validate_lifecycle_receipt(
+            native_lifecycle_receipt("deploy", "c" * 64, "d" * 64, verdict="maybe"), "deploy")
+        self.assertTrue(any("verdict" in error for error in errors))
 
     def test_native_historical_deploy_receipt_stays_valid_after_source_rollback(self):
         (self.root / "agents").mkdir(exist_ok=True)
@@ -425,6 +467,13 @@ class AcceptanceParsingTestCase(unittest.TestCase):
                        "limits": dict(agentctl.MISSING_TOOLCHAIN_LIMITS)}
                 with self.assertRaises(agentctl.BundleError):
                     agentctl.parse_acceptance_cases(acceptance_block(case))
+
+    def test_a_json_scalar_or_null_case_is_rejected_not_a_type_error(self):
+        for raw in ("null", "1"):
+            with self.subTest(raw=raw):
+                text = f"{agentctl.ACCEPTANCE_BEGIN_MARKER}\n{raw}\n{agentctl.ACCEPTANCE_END_MARKER}\n"
+                with self.assertRaises(agentctl.BundleError):
+                    agentctl.parse_acceptance_cases(text)
 
     def test_a_partial_subset_of_policy_assertions_limits_is_rejected(self):
         base = required_case()
@@ -650,6 +699,15 @@ class EvaluationReceiptSchemaTestCase(unittest.TestCase):
             with self.subTest(observations=observations):
                 errors = agentctl.validate_evaluation_receipt(
                     self.composed_receipt("refuses-unlisted", observations=observations))
+                self.assertTrue(any("observations" in error for error in errors))
+
+    def test_non_object_assertions_with_observations_return_schema_errors_not_type_errors(self):
+        for assertions in (None, "not-an-object", ["safe-stop"]):
+            with self.subTest(assertions=assertions):
+                errors = agentctl.validate_evaluation_receipt(
+                    self.composed_receipt("refuses-unlisted", assertions=assertions,
+                                          observations=CONTROLLER_ALLOWLIST_PRE_DISPATCH))
+                self.assertTrue(any("assertions" in error for error in errors))
                 self.assertTrue(any("observations" in error for error in errors))
 
 
