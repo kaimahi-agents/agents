@@ -1510,6 +1510,25 @@ def _require_reusable_composed_evidence(agent_dir, bundle_digest: str, case_id: 
     return receipt
 
 
+def _require_reusable_composed_provider_binding(prior_receipt: dict, evidence_dir, render_context: dict,
+                                                coordinator_live) -> dict | None:
+    rendered_provider = render_context["coordinator_provider_item"]
+    if rendered_provider is None:
+        return None
+    provider_live = _read_receipt_bound_json(prior_receipt, evidence_dir, _COORDINATOR_PROVIDER_READBACK_FILE)
+    provider_namespace = render_context["coordinator_provider_namespace"]
+    if not (isinstance(provider_namespace, str) and provider_namespace):
+        raise CliError("rendered coordinator Provider metadata.namespace must be a non-empty string")
+    if not (_live_provider_matches_rendered(provider_live, rendered_provider, provider_namespace)
+            and _provider_ready_readback(provider_live) is True):
+        raise CliError(f"existing evidence {_COORDINATOR_PROVIDER_READBACK_FILE} does not match the current rendered coordinator Provider")
+    return _azure_provider_route_from_provider(
+        provider_live,
+        model_name=_require_rendered_coordinator_model_name(coordinator_live),
+        label="saved coordinator",
+    )
+
+
 def check_window_covers_task(window_start, window_end, task_start, task_end) -> list[str]:
     """Diagnostics; empty means the asserted window covers the Task exactly, with no tolerance."""
     if window_end < window_start:
@@ -1810,6 +1829,7 @@ _CONTROLLER_ALLOWLIST_PROBE_FILES = (
     "controller-allowlist-probe-task.json",
     "controller-allowlist-probe-jobs.json",
 )
+_COORDINATOR_PROVIDER_READBACK_FILE = "coordinator-provider-readback.json"
 _COMPOSED_EVIDENCE_FILES = (
     "task-manifest.json",
     "terminal-task.json",
@@ -1822,6 +1842,10 @@ _COMPOSED_EVIDENCE_FILES = (
     "child-tasks.json",
     "child-results.json",
 )
+
+
+def _composed_evidence_files(*, include_provider_readback: bool) -> tuple[str, ...]:
+    return _COMPOSED_EVIDENCE_FILES + ((_COORDINATOR_PROVIDER_READBACK_FILE,) if include_provider_readback else ())
 
 def _controller_allowlist_probe_name_suffix() -> str:
     return secrets.token_hex(_CONTROLLER_ALLOWLIST_PROBE_SUFFIX_BYTES)
@@ -2378,6 +2402,14 @@ _NATIVE_COMPOSITION_LIFECYCLE = {
     "rollback": ("tools/rollback-verify", "Read live child and coordinator Agents and verify the restored pair.",
                  ("child-matches-restored", "child-ready", "coordinator-matches-restored", "coordinator-ready")),
 }
+
+
+def _native_composition_assertion_ids(kind: str, *, include_provider: bool) -> tuple[str, ...]:
+    base = _NATIVE_COMPOSITION_LIFECYCLE[kind][2]
+    if not include_provider:
+        return base
+    suffix = "rendered" if kind == "deploy" else "restored"
+    return (*base, f"provider-matches-{suffix}", "provider-ready")
 _INCOMPLETE_NOTES = ("Agent, Monitor, or prompt ConfigMap readback could not be established",
                      "Agent readiness readback could not be established",
                      "runtime image selector readback could not be established",
@@ -2432,11 +2464,18 @@ def _validate_native_composition_lifecycle_receipt(receipt, kind: str) -> list[s
     assertion_names = set(assertions) if isinstance(assertions, dict) else set()
     route_keys = {"provider_route"} if kind == "deploy" and "provider_route" in receipt else set()
     expected_keys = NATIVE_COMPOSITION_LIFECYCLE_RECEIPT_KEYS | route_keys | ({"limitations"} if kind == "rollback" else set())
+    allowed_assertion_sets = {
+        frozenset(_native_composition_assertion_ids(kind, include_provider=False)),
+        frozenset(_native_composition_assertion_ids(kind, include_provider=True)),
+    }
     errors = [message for ok, message in (
         (set(receipt) == expected_keys, "lifecycle receipt fields are not the fixed public-safe set"),
         (receipt.get("kind") == kind, "lifecycle receipt declared kind does not match its filename"),
-        (assertion_names == set(_NATIVE_COMPOSITION_LIFECYCLE[kind][2]),
+        (frozenset(assertion_names) in allowed_assertion_sets,
          "lifecycle receipt assertions are not the fixed public-safe set"),
+        (kind != "deploy" or "provider_route" not in receipt
+         or assertion_names == set(_native_composition_assertion_ids(kind, include_provider=True)),
+         "provider_route requires the provider assertion set"),
         (receipt.get("schema_version") == NATIVE_COMPOSITION_LIFECYCLE_RECEIPT_SCHEMA_VERSION,
          "lifecycle receipt schema_version is unsupported"),
         (receipt.get("namespace") is None or is_safe_slug(receipt.get("namespace")),
@@ -2529,6 +2568,38 @@ def _agent_ready_readback(agent_obj):
     condition = _current_agent_ready_condition(agent_obj)
     return condition is not None and condition.get("status") == "True"
 
+
+def _provider_condition_with_usable_observed_generation(provider_obj):
+    if not isinstance(provider_obj, dict):
+        return None
+    metadata, status = provider_obj.get("metadata"), provider_obj.get("status")
+    generation = metadata.get("generation") if isinstance(metadata, dict) else None
+    conditions = status.get("conditions") if isinstance(status, dict) else None
+    if (not isinstance(generation, int) or isinstance(generation, bool) or generation < 1
+            or not isinstance(conditions, list)):
+        return None
+    return next((condition for condition in conditions
+                 if isinstance(condition, dict) and condition.get("type") == "Ready"
+                 and isinstance(condition.get("observedGeneration"), int)
+                 and not isinstance(condition["observedGeneration"], bool)
+                 and condition["observedGeneration"] > 0), None)
+
+
+def _provider_ready_readback(provider_obj):
+    """Return tri-state readiness from Provider status.ready plus Ready/observedGeneration when usable."""
+    if provider_obj is None:
+        return None
+    status = provider_obj.get("status") if isinstance(provider_obj, dict) else None
+    ready = status.get("ready") if isinstance(status, dict) else None
+    if ready is not True:
+        return False
+    condition = _provider_condition_with_usable_observed_generation(provider_obj)
+    if condition is None:
+        return True
+    generation = provider_obj.get("metadata", {}).get("generation")
+    return condition.get("status") == "True" and condition.get("observedGeneration") == generation
+
+
 def wait_for_current_agent_readback(read_fn, *, sleep_fn=None, max_attempts: int = 10,
                                     poll_interval_seconds: float = 0.5):
     """Boundedly wait for reconciliation to publish a current-generation Ready condition."""
@@ -2544,6 +2615,24 @@ def wait_for_current_agent_readback(read_fn, *, sleep_fn=None, max_attempts: int
         if attempt + 1 < max_attempts:
             sleep(poll_interval_seconds)
     return latest
+
+
+def wait_for_ready_provider_readback(read_fn, *, sleep_fn=None, max_attempts: int = 10,
+                                     poll_interval_seconds: float = 0.5):
+    """Boundedly wait for Provider readiness; a current Ready condition is required when usable."""
+    sleep = sleep_fn or time.sleep
+    latest = None
+    for attempt in range(max_attempts):
+        try:
+            latest = read_fn()
+        except KubectlError:
+            pass
+        if _provider_ready_readback(latest) is True:
+            return latest
+        if attempt + 1 < max_attempts:
+            sleep(poll_interval_seconds)
+    return latest
+
 
 def _inventory_readback(api_base_url, path, token, expected_count):
     """Compare one inventory endpoint's item *count*; the receipt records only the count, while the
@@ -2596,7 +2685,8 @@ def _load_native_composition_rendered(args) -> dict:
         raise CliError("catalogue dependency digest does not match dependencies.lock.yaml for this environment")
     coordinator_result, coordinator_rendered = _render_checked(args, Path(args.evidence_root) / "coordinator-bundle.yaml")
     child_item = _rendered_agent_item(child_rendered, label="child")
-    coordinator_item = _rendered_agent_item(coordinator_rendered, label="coordinator")
+    coordinator_item, provider_item, provider_name, provider_namespace = _resolve_rendered_coordinator_provider(
+        coordinator_rendered)
     return {
         "child_digest": child_digest,
         "child_item": child_item,
@@ -2606,6 +2696,9 @@ def _load_native_composition_rendered(args) -> dict:
         "coordinator_item": coordinator_item,
         "coordinator_name": (coordinator_item.get("metadata") or {}).get("name"),
         "coordinator_path": Path(args.evidence_root) / "coordinator-bundle.yaml",
+        "coordinator_provider_item": provider_item,
+        "coordinator_provider_name": provider_name,
+        "coordinator_provider_namespace": provider_namespace,
         "provider_route": _rendered_azure_provider_route(coordinator_rendered),
     }
 
@@ -2619,6 +2712,15 @@ def _native_agent_matches_rendered(live_agent, rendered_item, expected_namespace
                 and live_agent.get("spec") == rendered_item.get("spec"))
 
 
+def _live_provider_matches_rendered(live_provider, rendered_item, expected_namespace: str):
+    if live_provider is None:
+        return None
+    metadata = live_provider.get("metadata") if isinstance(live_provider, dict) else None
+    return bool(isinstance(metadata, dict)
+                and metadata.get("namespace") == expected_namespace
+                and live_provider.get("spec") == rendered_item.get("spec"))
+
+
 def _require_live_pinned_agents_before_task_submission(child_live, coordinator_live, *, render_context: dict,
                                                        namespace: str) -> None:
     if child_live is None or coordinator_live is None:
@@ -2626,6 +2728,26 @@ def _require_live_pinned_agents_before_task_submission(child_live, coordinator_l
     if not (_live_agent_matches(child_live, render_context["child_agent_item"], namespace)
             and _live_agent_matches(coordinator_live, render_context["coordinator_agent_item"], namespace)):
         raise CliError("pinned hello or coordinator Agent was not current-generation Ready and spec-identical before Task submission")
+
+
+def _require_live_rendered_provider_before_task_submission(provider_live, *, render_context: dict,
+                                                           coordinator_live) -> dict | None:
+    rendered_provider = render_context["coordinator_provider_item"]
+    if rendered_provider is None:
+        return None
+    if provider_live is None:
+        raise CliError("coordinator Provider readback could not be established before Task submission")
+    provider_namespace = render_context["coordinator_provider_namespace"]
+    if not (isinstance(provider_namespace, str) and provider_namespace):
+        raise CliError("rendered coordinator Provider metadata.namespace must be a non-empty string")
+    if not (_live_provider_matches_rendered(provider_live, rendered_provider, provider_namespace)
+            and _provider_ready_readback(provider_live) is True):
+        raise CliError("coordinator Provider was not Ready and spec-identical before Task submission")
+    return _azure_provider_route_from_provider(
+        provider_live,
+        model_name=_require_rendered_coordinator_model_name(coordinator_live),
+        label="live coordinator",
+    )
 
 
 def _shared_readback_namespace(*agent_objs):
@@ -2639,7 +2761,7 @@ def _shared_readback_namespace(*agent_objs):
 
 
 def _native_composition_lifecycle_cli(kind: str, argv) -> int:
-    prog, description, ids = _NATIVE_COMPOSITION_LIFECYCLE[kind]
+    prog, description, _base_ids = _NATIVE_COMPOSITION_LIFECYCLE[kind]
     parser = argparse.ArgumentParser(prog=prog, description=description)
     _add_lifecycle_mode_argument(parser, default=LIFECYCLE_MODE_NATIVE_COMPOSITION)
     _add_cluster_arguments(parser)
@@ -2659,14 +2781,26 @@ def _native_composition_lifecycle_cli(kind: str, argv) -> int:
     def get(name):
         return run_kubectl_json(args.context, args.kubeconfig, ["get", args.agent_resource_type, name, "-n", args.namespace])
 
+    def get_provider(name, namespace):
+        return run_kubectl_json(args.context, args.kubeconfig, ["get", "providers.core.orka.ai", name, "-n", namespace])
+
     child_agent = wait_for_current_agent_readback(lambda: get(rendered["child_name"]))
     coordinator_agent = wait_for_current_agent_readback(lambda: get(rendered["coordinator_name"]))
+    provider_live = (wait_for_ready_provider_readback(
+        lambda: get_provider(rendered["coordinator_provider_name"], rendered["coordinator_provider_namespace"]))
+        if rendered["coordinator_provider_item"] is not None else None)
     for name, data in (("child-agent-readback.json", child_agent),
-                       ("coordinator-agent-readback.json", coordinator_agent)):
-        _write_json(Path(args.evidence_root) / name, data)
+                       ("coordinator-agent-readback.json", coordinator_agent),
+                       (_COORDINATOR_PROVIDER_READBACK_FILE, provider_live)):
+        if name != _COORDINATOR_PROVIDER_READBACK_FILE or rendered["coordinator_provider_item"] is not None:
+            _write_json(Path(args.evidence_root) / name, data)
     restored = "rendered" if kind == "deploy" else "restored"
-    assertions = dict(zip(ids, (
-        tri_state(_native_agent_matches_rendered(child_agent, rendered["child_item"], args.namespace),
+    assertion_ids = _native_composition_assertion_ids(
+        kind, include_provider=rendered["coordinator_provider_item"] is not None)
+    child_matches = _native_agent_matches_rendered(child_agent, rendered["child_item"], args.namespace)
+    coordinator_matches = _native_agent_matches_rendered(coordinator_agent, rendered["coordinator_item"], args.namespace)
+    assertion_values = [
+        tri_state(child_matches,
                   f"live child Agent spec and namespace match the {restored} pinned child",
                   f"live child Agent spec or namespace does not match the {restored} pinned child",
                   "child Agent readback could not be established"),
@@ -2674,7 +2808,7 @@ def _native_composition_lifecycle_cli(kind: str, argv) -> int:
                   "child Agent Ready condition is True for the readback generation",
                   "child Agent Ready condition is not True for the readback generation",
                   "child Agent readiness readback could not be established"),
-        tri_state(_native_agent_matches_rendered(coordinator_agent, rendered["coordinator_item"], args.namespace),
+        tri_state(coordinator_matches,
                   f"live coordinator Agent spec and namespace match the {restored} coordinator",
                   f"live coordinator Agent spec or namespace does not match the {restored} coordinator",
                   "coordinator Agent readback could not be established"),
@@ -2682,19 +2816,45 @@ def _native_composition_lifecycle_cli(kind: str, argv) -> int:
                   "coordinator Agent Ready condition is True for the readback generation",
                   "coordinator Agent Ready condition is not True for the readback generation",
                   "coordinator Agent readiness readback could not be established"),
-    )))
+    ]
+    live_provider_route = None
+    if rendered["coordinator_provider_item"] is not None:
+        provider_namespace = rendered["coordinator_provider_namespace"]
+        provider_matches = (_live_provider_matches_rendered(
+            provider_live, rendered["coordinator_provider_item"], provider_namespace)
+            if isinstance(provider_namespace, str) and provider_namespace else False)
+        provider_ready = _provider_ready_readback(provider_live)
+        assertion_values.extend([
+            tri_state(provider_matches,
+                      f"live coordinator Provider spec and namespace match the {restored} coordinator Provider",
+                      f"live coordinator Provider spec or namespace does not match the {restored} coordinator Provider",
+                      "coordinator Provider readback could not be established"),
+            tri_state(provider_ready,
+                      "coordinator Provider status.ready is true and the Ready condition is current when observedGeneration is usable",
+                      "coordinator Provider is not ready for the readback generation",
+                      "coordinator Provider readiness readback could not be established"),
+        ])
+        if provider_matches is True and provider_ready is True and coordinator_matches is True:
+            live_provider_route = _azure_provider_route_from_provider(
+                provider_live,
+                model_name=_require_rendered_coordinator_model_name(coordinator_agent),
+                label="live coordinator",
+            )
+    assertions = dict(zip(assertion_ids, assertion_values))
     receipt = {
         "schema_version": NATIVE_COMPOSITION_LIFECYCLE_RECEIPT_SCHEMA_VERSION,
         "kind": kind,
         "coordinator_digest": rendered["coordinator_digest"],
         "child_digest": rendered["child_digest"],
         "date": args.date,
-        "namespace": _shared_readback_namespace(child_agent, coordinator_agent),
+        "namespace": _shared_readback_namespace(
+            child_agent, coordinator_agent,
+            *( [provider_live] if rendered["coordinator_provider_item"] is not None else [])),
         "assertions": assertions,
         "verdict": "pass" if all_assertions_pass_and_complete(assertions) else "fail",
     }
-    if kind == "deploy" and rendered["provider_route"] is not None:
-        receipt["provider_route"] = dict(rendered["provider_route"])
+    if kind == "deploy" and live_provider_route is not None:
+        receipt["provider_route"] = dict(live_provider_route)
     if kind == "rollback":
         receipt["limitations"] = list(NATIVE_COMPOSITION_ROLLBACK_LIMITATIONS)
     _require(validate_lifecycle_receipt(receipt, kind) + find_prohibited_in_document(receipt, "receipt"))
@@ -2933,35 +3093,43 @@ def _require_azure_provider_endpoint_host(base_url: str) -> str:
         raise CliError("rendered Azure provider baseURL must be an HTTPS origin without credentials, query, fragment, or a path beyond '/'")
     return parsed.hostname
 
-def _rendered_azure_provider_route(rendered_bundle) -> dict | None:
-    items = rendered_bundle.get("items") if isinstance(rendered_bundle, dict) else None
-    if not isinstance(items, list):
-        raise CliError("rendered bundle is missing the expected Agent resource")
-    agents = [item for item in items if isinstance(item, dict) and item.get("kind") == "Agent"]
-    if len(agents) != 1:
-        raise CliError("rendered bundle is missing the expected Agent resource")
-    coordinator_agent = agents[0]
-    spec = coordinator_agent.get("spec") if isinstance(coordinator_agent, dict) else None
+def _referenced_provider_identity(agent_obj) -> tuple[str | None, str | None]:
+    spec = agent_obj.get("spec") if isinstance(agent_obj, dict) else None
     provider_ref = spec.get("providerRef") if isinstance(spec, dict) else None
     provider_name = provider_ref.get("name") if isinstance(provider_ref, dict) else None
     if not isinstance(provider_name, str) or not provider_name:
-        return None
-    metadata = coordinator_agent.get("metadata") if isinstance(coordinator_agent, dict) else None
+        return None, None
+    metadata = agent_obj.get("metadata") if isinstance(agent_obj, dict) else None
     agent_namespace = metadata.get("namespace") if isinstance(metadata, dict) else None
     provider_namespace = (provider_ref.get("namespace")
                           if isinstance(provider_ref, dict) and isinstance(provider_ref.get("namespace"), str)
                           and provider_ref.get("namespace") else agent_namespace)
+    return provider_name, (provider_namespace if isinstance(provider_namespace, str) and provider_namespace else None)
+
+
+def _resolve_rendered_coordinator_provider(rendered_bundle) -> tuple[dict, dict | None, str | None, str | None]:
+    items = rendered_bundle.get("items") if isinstance(rendered_bundle, dict) else None
+    if not isinstance(items, list):
+        raise CliError("rendered bundle is missing the expected Agent resource")
+    coordinator_agent = _rendered_agent_item(rendered_bundle, label="coordinator")
+    provider_name, provider_namespace = _referenced_provider_identity(coordinator_agent)
+    if provider_name is None or provider_namespace is None:
+        return coordinator_agent, None, provider_name, provider_namespace
     providers = [item for item in items
                  if isinstance(item, dict) and item.get("kind") == "Provider"
                  and ((item.get("metadata") or {}).get("name") == provider_name)
                  and ((item.get("metadata") or {}).get("namespace") == provider_namespace)]
     if not providers:
-        return None
+        return coordinator_agent, None, provider_name, provider_namespace
     if len(providers) != 1:
         raise CliError("rendered bundle does not resolve exactly one coordinator Provider")
-    provider_spec = providers[0].get("spec") if isinstance(providers[0], dict) else None
+    return coordinator_agent, providers[0], provider_name, provider_namespace
+
+
+def _azure_provider_route_from_provider(provider_obj, *, model_name: str, label: str) -> dict | None:
+    provider_spec = provider_obj.get("spec") if isinstance(provider_obj, dict) else None
     if not isinstance(provider_spec, dict):
-        raise CliError("rendered coordinator Provider spec must be an object")
+        raise CliError(f"{label} Provider spec must be an object")
     if provider_spec.get("type") != _AZURE_PROVIDER_TYPE:
         return None
     base_url = provider_spec.get("baseURL")
@@ -2970,10 +3138,9 @@ def _rendered_azure_provider_route(rendered_bundle) -> dict | None:
     deployment = azure.get("deploymentName") if isinstance(azure, dict) else None
     api_version = azure.get("apiVersion") if isinstance(azure, dict) else None
     if not all(isinstance(value, str) and value for value in (base_url, default_model, deployment, api_version)):
-        raise CliError("rendered Azure provider route fields must be non-empty strings")
-    model_name = _require_rendered_coordinator_model_name(coordinator_agent)
+        raise CliError(f"{label} Azure provider route fields must be non-empty strings")
     if default_model != deployment or model_name != default_model:
-        raise CliError("rendered coordinator Agent and Azure Provider do not agree on the deployment/model")
+        raise CliError(f"{label} coordinator Agent and Azure Provider do not agree on the deployment/model")
     return {
         "type": _AZURE_PROVIDER_TYPE,
         "endpoint_host": _require_azure_provider_endpoint_host(base_url),
@@ -2981,6 +3148,18 @@ def _rendered_azure_provider_route(rendered_bundle) -> dict | None:
         "model": model_name,
         "api_version": api_version,
     }
+
+
+def _rendered_azure_provider_route(rendered_bundle) -> dict | None:
+    coordinator_agent, provider_item, _provider_name, _provider_namespace = _resolve_rendered_coordinator_provider(
+        rendered_bundle)
+    if provider_item is None:
+        return None
+    return _azure_provider_route_from_provider(
+        provider_item,
+        model_name=_require_rendered_coordinator_model_name(coordinator_agent),
+        label="rendered coordinator",
+    )
 
 
 def _require_supplied_model_matches_rendered_coordinator(supplied_model: str, rendered_model_name: str) -> None:
@@ -3019,8 +3198,8 @@ def _prepare_composed_render_context(args, *, evidence_dir: Path | None) -> dict
     bundle_digest = coordinator_render_result["bundle_digest"]
     child_agent_item = next((item for item in child_rendered.get("items", [])
                              if isinstance(item, dict) and item.get("kind") == "Agent"), None)
-    coordinator_agent_item = next((item for item in coordinator_rendered.get("items", [])
-                                   if isinstance(item, dict) and item.get("kind") == "Agent"), None)
+    coordinator_agent_item, provider_item, provider_name, provider_namespace = _resolve_rendered_coordinator_provider(
+        coordinator_rendered)
     if child_agent_item is None or coordinator_agent_item is None:
         raise CliError("rendered bundle is missing the expected Agent resource")
     child_agent_name = (child_agent_item.get("metadata") or {}).get("name")
@@ -3040,6 +3219,9 @@ def _prepare_composed_render_context(args, *, evidence_dir: Path | None) -> dict
         "child_bundle_sha256": child_bundle_sha256,
         "coordinator_bundle_sha256": coordinator_bundle_sha256,
         "coordinator_model_name": coordinator_model_name,
+        "coordinator_provider_item": provider_item,
+        "coordinator_provider_name": provider_name,
+        "coordinator_provider_namespace": provider_namespace,
         "provider_route": _rendered_azure_provider_route(coordinator_rendered),
     }
 
@@ -3047,6 +3229,7 @@ def _prepare_composed_render_context(args, *, evidence_dir: Path | None) -> dict
 def _score_composed_coordination(args, case: dict, *, render_context: dict, task_manifest, terminal_task,
                                  events, latest_seq, records, child_live, coordinator_live, parent_result,
                                  raw_child_inventory, child_terminal_tasks, child_results,
+                                 provider_route: dict | None,
                                  requested_agent: str | None = None,
                                  observation: dict | None = None) -> tuple[dict, dict]:
     limits = case["limits"]
@@ -3336,8 +3519,8 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
         "tool_calls": {"total": total_calls, "redacted": redacted_calls},
         "evidence_sha256": [],
     }
-    if render_context["provider_route"] is not None:
-        receipt["provider_route"] = dict(render_context["provider_route"])
+    if provider_route is not None:
+        receipt["provider_route"] = dict(provider_route)
         receipt["token_usage"] = summarize_parent_token_usage(events)
     if observation is not None and args.case_id == COMPOSED_REFUSAL_DENIAL_CASE_ID:
         receipt["observations"] = {CONTROLLER_ALLOWLIST_OBSERVATION_ID: observation}
@@ -3354,6 +3537,7 @@ def _score_composed_coordination_receipts(args, case_bindings: dict[str, dict], 
                                           task_manifest, terminal_task, events, latest_seq, records,
                                           child_live, coordinator_live, parent_result,
                                           raw_child_inventory, child_terminal_tasks, child_results,
+                                          provider_route: dict | None,
                                           observation: dict | None = None) -> tuple[dict[str, dict], dict[str, dict]]:
     summaries, receipts = {}, {}
     for case_id, binding in case_bindings.items():
@@ -3364,7 +3548,8 @@ def _score_composed_coordination_receipts(args, case_bindings: dict[str, dict], 
             terminal_task=terminal_task, events=events, latest_seq=latest_seq, records=records,
             child_live=child_live, coordinator_live=coordinator_live, parent_result=parent_result,
             raw_child_inventory=raw_child_inventory, child_terminal_tasks=child_terminal_tasks,
-            child_results=child_results, requested_agent=binding["requested_agent"],
+            child_results=child_results, provider_route=provider_route,
+            requested_agent=binding["requested_agent"],
             observation=(observation if case_id == COMPOSED_REFUSAL_DENIAL_CASE_ID else None))
         summaries[case_id] = summary
         receipts[case_id] = receipt
@@ -3409,6 +3594,10 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict]
         return run_kubectl_json(args.context, args.kubeconfig,
                                 ["get", "agents.core.orka.ai", name, "-n", args.namespace])
 
+    def get_provider(name, namespace):
+        return run_kubectl_json(args.context, args.kubeconfig,
+                                ["get", "providers.core.orka.ai", name, "-n", namespace])
+
     apply_bundle(evidence_dir / "hello-bundle.yaml")
     apply_bundle(evidence_dir / "bundle.yaml")
     child_live = wait_for_current_agent_readback(
@@ -3417,11 +3606,20 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict]
     coordinator_live = wait_for_current_agent_readback(
         lambda: get_agent(render_context["coordinator_agent_name"]), max_attempts=args.max_poll_attempts,
         poll_interval_seconds=args.poll_interval_seconds)
+    provider_live = (wait_for_ready_provider_readback(
+        lambda: get_provider(render_context["coordinator_provider_name"], render_context["coordinator_provider_namespace"]),
+        max_attempts=args.max_poll_attempts,
+        poll_interval_seconds=args.poll_interval_seconds)
+        if render_context["coordinator_provider_item"] is not None else None)
     for name, data in (("hello-agent-readback.json", child_live),
-                       ("coordinator-agent-readback.json", coordinator_live)):
-        _write_json(evidence_dir / name, data)
+                       ("coordinator-agent-readback.json", coordinator_live),
+                       (_COORDINATOR_PROVIDER_READBACK_FILE, provider_live)):
+        if name != _COORDINATOR_PROVIDER_READBACK_FILE or render_context["coordinator_provider_item"] is not None:
+            _write_json(evidence_dir / name, data)
     _require_live_pinned_agents_before_task_submission(
         child_live, coordinator_live, render_context=render_context, namespace=args.namespace)
+    provider_route = _require_live_rendered_provider_before_task_submission(
+        provider_live, render_context=render_context, coordinator_live=coordinator_live)
     reserved = reserve_campaign_entry(args.evidence_root, source_case_id, parent_count=1,
                                       child_count=limits["child_tasks"], probe_count=0)
     _require_task_inventory_clear(
@@ -3484,20 +3682,23 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict]
         terminal_task=terminal_task, events=events, latest_seq=latest_seq, records=records,
         child_live=child_live, coordinator_live=coordinator_live, parent_result=parent_result,
         raw_child_inventory=raw_child_inventory, child_terminal_tasks=child_terminal_tasks,
-        child_results=child_results, observation=observation)
+        child_results=child_results, provider_route=provider_route, observation=observation)
+    evidence_pairs = [
+        ("task-manifest.json", task_manifest),
+        ("terminal-task.json", terminal_task),
+        ("journal-events.json", {"events": events, "latestSeq": latest_seq}),
+        ("provider-records.json", records),
+        ("hello-agent-readback.json", child_live),
+        ("coordinator-agent-readback.json", coordinator_live),
+        ("parent-result.json", {"result": parent_result}),
+        ("child-inventory.json", raw_child_inventory),
+        ("child-tasks.json", {"items": child_terminal_tasks}),
+        ("child-results.json", child_results),
+    ]
+    if render_context["coordinator_provider_item"] is not None:
+        evidence_pairs.append((_COORDINATOR_PROVIDER_READBACK_FILE, provider_live))
     evidence_sha256 = list(dict.fromkeys(
-        _write_json(evidence_dir / name, data) for name, data in (
-            ("task-manifest.json", task_manifest),
-            ("terminal-task.json", terminal_task),
-            ("journal-events.json", {"events": events, "latestSeq": latest_seq}),
-            ("provider-records.json", records),
-            ("hello-agent-readback.json", child_live),
-            ("coordinator-agent-readback.json", coordinator_live),
-            ("parent-result.json", {"result": parent_result}),
-            ("child-inventory.json", raw_child_inventory),
-            ("child-tasks.json", {"items": child_terminal_tasks}),
-            ("child-results.json", child_results),
-        )))
+        _write_json(evidence_dir / name, data) for name, data in evidence_pairs))
     for case_id, receipt in receipts.items():
         receipt["evidence_sha256"] = (list(dict.fromkeys([*evidence_sha256, *probe_evidence_sha256]))
                                       if case_id == COMPOSED_REFUSAL_DENIAL_CASE_ID and observation is not None
@@ -3536,6 +3737,8 @@ def _reuse_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict
         raise CliError("existing evidence provider-records.json must contain an array")
     child_live = _read_receipt_bound_json(prior_receipt, evidence_dir, "hello-agent-readback.json")
     coordinator_live = _read_receipt_bound_json(prior_receipt, evidence_dir, "coordinator-agent-readback.json")
+    provider_route = _require_reusable_composed_provider_binding(
+        prior_receipt, evidence_dir, render_context, coordinator_live)
     parent_result_holder = _read_receipt_bound_json(prior_receipt, evidence_dir, "parent-result.json")
     parent_result = (parent_result_holder.get("result")
                      if isinstance(parent_result_holder, dict) and isinstance(parent_result_holder.get("result"), str)
@@ -3563,8 +3766,10 @@ def _reuse_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict
         terminal_task=terminal_task, events=events, latest_seq=latest_seq, records=records,
         child_live=child_live, coordinator_live=coordinator_live, parent_result=parent_result,
         raw_child_inventory=raw_child_inventory, child_terminal_tasks=child_terminal_tasks,
-        child_results=child_results, observation=observation)
-    evidence_sha256 = _existing_evidence_sha256(evidence_dir, _COMPOSED_EVIDENCE_FILES)
+        child_results=child_results, provider_route=provider_route, observation=observation)
+    evidence_sha256 = _existing_evidence_sha256(
+        evidence_dir,
+        _composed_evidence_files(include_provider_readback=render_context["coordinator_provider_item"] is not None))
     for case_id, receipt in receipts.items():
         receipt["evidence_sha256"] = (list(dict.fromkeys([*evidence_sha256, *probe_evidence_sha256]))
                                       if case_id == COMPOSED_REFUSAL_DENIAL_CASE_ID and observation is not None

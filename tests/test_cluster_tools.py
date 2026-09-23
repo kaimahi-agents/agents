@@ -137,6 +137,20 @@ def native_terminal_task(name, *, uid, agent_name, prompt, phase="Succeeded", st
     return task
 
 
+def live_provider(name: str, namespace: str, spec: dict, *, uid: str, generation: int = 1,
+                  ready: bool = True, conditions=None) -> dict:
+    status = {"ready": ready}
+    if conditions is not None:
+        status["conditions"] = conditions
+    return {
+        "apiVersion": "core.orka.ai/v1alpha1",
+        "kind": "Provider",
+        "metadata": {"name": name, "namespace": namespace, "uid": uid, "generation": generation},
+        "spec": copy.deepcopy(spec),
+        "status": status,
+    }
+
+
 class FakeKubectl:
     """Stands in for `subprocess.run`, keyed by the kubectl verb and target."""
 
@@ -1089,23 +1103,29 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             self.kubectl.responses[("agents.core.orka.ai", "coordinator")]["spec"] = self.coordinator_spec
 
     def _switch_coordinator_to_azure(self, *, base_url=AZURE_ENDPOINT):
-        write_json(self.coordinator / "resources" / "provider.yaml",
-                   {"apiVersion": "core.orka.ai/v1alpha1", "kind": "Provider",
-                    "metadata": {"name": AZURE_PROVIDER_NAME, "namespace": NAMESPACE},
-                    "spec": {"type": AZURE_PROVIDER_TYPE,
-                             "baseURL": base_url,
-                             "azure": {"deploymentName": AZURE_DEPLOYMENT, "apiVersion": AZURE_API_VERSION},
-                             "secretRef": {
-                                 "name": AZURE_CREDENTIAL_NAME,
-                                 "key": AZURE_CREDENTIAL_ENTRY,
-                             },
-                             "defaultModel": AZURE_DEPLOYMENT}})
+        provider_resource = {"apiVersion": "core.orka.ai/v1alpha1", "kind": "Provider",
+                             "metadata": {"name": AZURE_PROVIDER_NAME, "namespace": NAMESPACE},
+                             "spec": {"type": AZURE_PROVIDER_TYPE,
+                                      "baseURL": base_url,
+                                      "azure": {"deploymentName": AZURE_DEPLOYMENT,
+                                                "apiVersion": AZURE_API_VERSION},
+                                      "secretRef": {
+                                          "name": AZURE_CREDENTIAL_NAME,
+                                          "key": AZURE_CREDENTIAL_ENTRY,
+                                      },
+                                      "defaultModel": AZURE_DEPLOYMENT}}
+        write_json(self.coordinator / "resources" / "provider.yaml", provider_resource)
         self._rewrite_coordinator_agent_resource(
             lambda resource: resource["spec"].update({
                 "providerRef": {"name": AZURE_PROVIDER_NAME, "namespace": NAMESPACE},
                 "model": {"name": AZURE_DEPLOYMENT, "temperature": 0, "maxTokens": 512},
             }),
             refresh_live_readback=True,
+        )
+        self.kubectl.responses[("providers.core.orka.ai", AZURE_PROVIDER_NAME)] = live_provider(
+            AZURE_PROVIDER_NAME, NAMESPACE, provider_resource["spec"],
+            uid="coordinator-provider-uid",
+            conditions=[{"type": "Ready", "status": "True", "observedGeneration": 1}],
         )
 
     def _assert_rejected_before_side_effects(self, code, out, err, *, message: str, forbidden=()):
@@ -1380,10 +1400,68 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         summary = self.run_eval(
             "delegates", self.root / "delegates-task.json", **{"--model": AZURE_DEPLOYMENT})
         receipt = self.receipt("delegates")
+        provider_readback = self.evidence / "delegates" / "coordinator-provider-readback.json"
         self.assertEqual(summary["verdict"], "pass")
         self.assertEqual(receipt["provider_route"], azure_provider_route())
         self.assertEqual(receipt["token_usage"], {"input": 12, "output": 5, "total": 17})
+        self.assertIn(agentctl.sha256_hex(provider_readback.read_bytes()), receipt["evidence_sha256"])
         self.assertEqual(agentctl.find_prohibited_in_document(receipt, "receipt"), [])
+
+    def test_azure_provider_without_a_usable_observed_generation_uses_status_ready(self):
+        self._switch_coordinator_to_azure()
+        self.kubectl.responses[("providers.core.orka.ai", AZURE_PROVIDER_NAME)] = live_provider(
+            AZURE_PROVIDER_NAME,
+            NAMESPACE,
+            self.kubectl.responses[("providers.core.orka.ai", AZURE_PROVIDER_NAME)]["spec"],
+            uid="coordinator-provider-uid",
+            generation=2,
+            ready=True,
+            conditions=[{"type": "Ready", "status": "True"}],
+        )
+        self._set_delegate_result_evidence(self._delegate_events())
+        summary = self.run_eval(
+            "delegates", self.root / "delegates-task.json", **{"--model": AZURE_DEPLOYMENT})
+        self.assertEqual(summary["verdict"], "pass")
+        self.assertEqual(self.receipt("delegates")["provider_route"], azure_provider_route())
+
+    def test_composed_live_eval_requires_a_matching_ready_azure_provider_before_task_create(self):
+        cases = (
+            ("missing",
+             lambda: self.kubectl.failures.add(("providers.core.orka.ai", AZURE_PROVIDER_NAME)),
+             "eval failed: coordinator Provider readback could not be established before Task submission"),
+            ("not-ready",
+             lambda: self.kubectl.responses[("providers.core.orka.ai", AZURE_PROVIDER_NAME)].__setitem__(
+                 "status", {"ready": False}),
+             "eval failed: coordinator Provider was not Ready and spec-identical before Task submission"),
+            ("stale-ready-condition",
+             lambda: self.kubectl.responses[("providers.core.orka.ai", AZURE_PROVIDER_NAME)].update({
+                 "metadata": {"name": AZURE_PROVIDER_NAME, "namespace": NAMESPACE,
+                              "uid": "coordinator-provider-uid", "generation": 2},
+                 "status": {"ready": True,
+                           "conditions": [{"type": "Ready", "status": "True", "observedGeneration": 1}]},
+             }),
+             "eval failed: coordinator Provider was not Ready and spec-identical before Task submission"),
+            ("spec-drift",
+             lambda: self.kubectl.responses[("providers.core.orka.ai", AZURE_PROVIDER_NAME)]["spec"].update({"extra": True}),
+             "eval failed: coordinator Provider was not Ready and spec-identical before Task submission"),
+        )
+        for label, mutate, message in cases:
+            with self.subTest(case=label):
+                self.setUp()
+                self._switch_coordinator_to_azure()
+                mutate()
+                code, out, err = self.run_eval_main(
+                    "delegates", self.root / "delegates-task.json", **{"--model": AZURE_DEPLOYMENT})
+                self.assertEqual(code, 1)
+                self.assertEqual(out, "")
+                self.assertIn(message, err)
+                self.assertEqual(self.kubectl.verbs().count("apply"), 2)
+                self.assertEqual(self.kubectl.verbs().count("create"), 0)
+                self.assertTrue((self.evidence / "delegates" / "hello-agent-readback.json").is_file())
+                self.assertTrue((self.evidence / "delegates" / "coordinator-agent-readback.json").is_file())
+                self.assertTrue((self.evidence / "delegates" / "coordinator-provider-readback.json").is_file())
+                self.assertFalse((self.evidence / "campaign-ledger.json").exists())
+                self.assertEqual(sorted((self.coordinator / "eval" / "receipts").rglob("*.json")), [])
 
     def test_composed_live_eval_blocks_a_nonterminal_task_before_any_apply(self):
         self.cluster_inventory = {"items": [{
@@ -2605,6 +2683,36 @@ class ComposedEvalCliTestCase(unittest.TestCase):
                     message,
                 )
 
+    def test_reuse_current_azure_anchor_requires_receipt_bound_provider_readback_and_current_provider_equality(self):
+        self.seed_azure_delegate_evidence()
+        provider_path = self.evidence / "delegates" / "coordinator-provider-readback.json"
+        receipt = self.receipt("delegates")
+        provider_digest = agentctl.sha256_hex(provider_path.read_bytes())
+
+        unbound = copy.deepcopy(receipt)
+        unbound["evidence_sha256"] = [digest for digest in unbound["evidence_sha256"] if digest != provider_digest]
+        agentctl._write_json(self.receipt_path("delegates"), unbound)
+        self._assert_reuse_failure_preserves_bytes(
+            self.reuse_eval_argv("delegates", **{"--model": AZURE_DEPLOYMENT}),
+            "eval failed: existing evidence coordinator-provider-readback.json does not match a digest recorded by the existing live receipt",
+        )
+
+        self.setUp()
+        self.seed_azure_delegate_evidence()
+        provider_path = self.evidence / "delegates" / "coordinator-provider-readback.json"
+        receipt = self.receipt("delegates")
+        old_digest = agentctl.sha256_hex(provider_path.read_bytes())
+        saved_provider = json.loads(provider_path.read_text(encoding="utf-8"))
+        saved_provider["spec"]["baseURL"] = "https://other.example.com/"
+        provider_path.write_text(json.dumps(saved_provider, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        new_digest = agentctl.sha256_hex(provider_path.read_bytes())
+        receipt["evidence_sha256"] = [new_digest if digest == old_digest else digest for digest in receipt["evidence_sha256"]]
+        agentctl._write_json(self.receipt_path("delegates"), receipt)
+        self._assert_reuse_failure_preserves_bytes(
+            self.reuse_eval_argv("delegates", **{"--model": AZURE_DEPLOYMENT}),
+            "eval failed: existing evidence coordinator-provider-readback.json does not match the current rendered coordinator Provider",
+        )
+
     def test_reuse_only_migrates_the_exact_legacy_current_live_receipt_shape(self):
         cases = (
             ("delegates", self.seed_delegate_evidence, None, "pass"),
@@ -3382,17 +3490,18 @@ class LifecycleCliTestCase(unittest.TestCase):
         })
 
     def _switch_native_coordinator_to_azure(self, *, base_url=AZURE_ENDPOINT):
-        write_json(self.coordinator / "resources" / "provider.yaml",
-                   {"apiVersion": "core.orka.ai/v1alpha1", "kind": "Provider",
-                    "metadata": {"name": AZURE_PROVIDER_NAME, "namespace": NAMESPACE},
-                    "spec": {"type": AZURE_PROVIDER_TYPE,
-                             "baseURL": base_url,
-                             "azure": {"deploymentName": AZURE_DEPLOYMENT, "apiVersion": AZURE_API_VERSION},
-                             "secretRef": {
-                                 "name": AZURE_CREDENTIAL_NAME,
-                                 "key": AZURE_CREDENTIAL_ENTRY,
-                             },
-                             "defaultModel": AZURE_DEPLOYMENT}})
+        provider_resource = {"apiVersion": "core.orka.ai/v1alpha1", "kind": "Provider",
+                             "metadata": {"name": AZURE_PROVIDER_NAME, "namespace": NAMESPACE},
+                             "spec": {"type": AZURE_PROVIDER_TYPE,
+                                      "baseURL": base_url,
+                                      "azure": {"deploymentName": AZURE_DEPLOYMENT,
+                                                "apiVersion": AZURE_API_VERSION},
+                                      "secretRef": {
+                                          "name": AZURE_CREDENTIAL_NAME,
+                                          "key": AZURE_CREDENTIAL_ENTRY,
+                                      },
+                                      "defaultModel": AZURE_DEPLOYMENT}}
+        write_json(self.coordinator / "resources" / "provider.yaml", provider_resource)
         path = self.coordinator / "resources" / "agent.yaml"
         agent_resource = json.loads(path.read_text(encoding="utf-8"))
         agent_resource["spec"]["providerRef"] = {"name": AZURE_PROVIDER_NAME, "namespace": NAMESPACE}
@@ -3403,6 +3512,11 @@ class LifecycleCliTestCase(unittest.TestCase):
         coordinator_rendered = json.loads(Path(coordinator_render["bundle_path"]).read_text(encoding="utf-8"))
         self.coordinator_spec = next(item["spec"] for item in coordinator_rendered["items"] if item["kind"] == "Agent")
         self.native_kubectl.responses[("agents.core.orka.ai", "coordinator")]["spec"] = self.coordinator_spec
+        self.native_kubectl.responses[("providers.core.orka.ai", AZURE_PROVIDER_NAME)] = live_provider(
+            AZURE_PROVIDER_NAME, NAMESPACE, provider_resource["spec"],
+            uid="coordinator-provider-uid",
+            conditions=[{"type": "Ready", "status": "True", "observedGeneration": 1}],
+        )
 
     def native_argv(self, **overrides):
         args = {"--mode": "native-composition", "--context": "ctx", "--kubeconfig": "cred",
@@ -3740,9 +3854,58 @@ class LifecycleCliTestCase(unittest.TestCase):
         receipt = self.native_receipt("deploy")
         self.assertEqual(summary["verdict"], "pass")
         self.assertEqual(receipt["provider_route"], azure_provider_route())
+        self.assertEqual(set(receipt["assertions"]),
+                         {"child-matches-rendered", "child-ready",
+                          "coordinator-matches-rendered", "coordinator-ready",
+                          "provider-matches-rendered", "provider-ready"})
+        self.assertTrue((self.native_evidence / "coordinator-provider-readback.json").is_file())
         self.assertNotIn("token_usage", receipt)
         self.assertNotIn(AZURE_CREDENTIAL_NAME, json.dumps(receipt))
         self.assertNotIn(AZURE_CREDENTIAL_ENTRY, json.dumps(receipt))
+
+    def test_native_azure_provider_readback_must_be_present_ready_and_spec_identical(self):
+        cases = (
+            ("missing", lambda: self.native_kubectl.failures.add(("providers.core.orka.ai", AZURE_PROVIDER_NAME)),
+             "provider-matches-rendered", "not_evaluated"),
+            ("not-ready",
+             lambda: self.native_kubectl.responses[("providers.core.orka.ai", AZURE_PROVIDER_NAME)].__setitem__(
+                 "status", {"ready": False}),
+             "provider-ready", "fail"),
+            ("stale-ready-condition",
+             lambda: self.native_kubectl.responses[("providers.core.orka.ai", AZURE_PROVIDER_NAME)].update({
+                 "metadata": {"name": AZURE_PROVIDER_NAME, "namespace": NAMESPACE,
+                              "uid": "coordinator-provider-uid", "generation": 2},
+                 "status": {"ready": True,
+                           "conditions": [{"type": "Ready", "status": "True", "observedGeneration": 1}]},
+             }),
+             "provider-ready", "fail"),
+            ("spec-drift",
+             lambda: self.native_kubectl.responses[("providers.core.orka.ai", AZURE_PROVIDER_NAME)]["spec"].update({"extra": True}),
+             "provider-matches-rendered", "fail"),
+        )
+        for label, mutate, assertion, verdict in cases:
+            with self.subTest(case=label):
+                self.setup_native_composition()
+                self._switch_native_coordinator_to_azure()
+                mutate()
+                code, summary = self.run_native_lifecycle_with_code("deploy")
+                self.assertEqual(code, 1)
+                self.assertEqual(summary["verdict"], "fail")
+                receipt = self.native_receipt("deploy")
+                self.assertEqual(receipt["assertions"][assertion]["verdict"], verdict)
+                self.assertTrue((self.native_evidence / "coordinator-provider-readback.json").is_file())
+
+    def test_native_azure_rollback_compares_the_live_provider_readback(self):
+        self.setup_native_composition()
+        self._switch_native_coordinator_to_azure()
+        summary = self.run_native_lifecycle("rollback")
+        self.assertEqual(summary["verdict"], "pass")
+        receipt = self.native_receipt("rollback")
+        self.assertEqual(set(receipt["assertions"]),
+                         {"child-matches-restored", "child-ready",
+                          "coordinator-matches-restored", "coordinator-ready",
+                          "provider-matches-restored", "provider-ready"})
+        self.assertTrue((self.native_evidence / "coordinator-provider-readback.json").is_file())
 
     def test_native_mode_validates_catalogue_pins_before_cluster_calls(self):
         self.setup_native_composition()

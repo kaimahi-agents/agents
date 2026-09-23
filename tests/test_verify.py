@@ -67,13 +67,22 @@ COMPOSED_CASES = (
 NATIVE_DEPLOY_ASSERTIONS = (
     "child-matches-rendered", "child-ready", "coordinator-matches-rendered", "coordinator-ready",
 )
+NATIVE_DEPLOY_ASSERTIONS_WITH_PROVIDER = (
+    *NATIVE_DEPLOY_ASSERTIONS, "provider-matches-rendered", "provider-ready",
+)
 NATIVE_ROLLBACK_ASSERTIONS = (
     "child-matches-restored", "child-ready", "coordinator-matches-restored", "coordinator-ready",
 )
+NATIVE_ROLLBACK_ASSERTIONS_WITH_PROVIDER = (
+    *NATIVE_ROLLBACK_ASSERTIONS, "provider-matches-restored", "provider-ready",
+)
 
 
-def native_lifecycle_receipt(kind: str, coordinator_digest: str, child_digest: str, **overrides) -> dict:
-    assertion_ids = NATIVE_DEPLOY_ASSERTIONS if kind == "deploy" else NATIVE_ROLLBACK_ASSERTIONS
+def native_lifecycle_receipt(kind: str, coordinator_digest: str, child_digest: str,
+                             *, include_provider_assertions: bool = False, **overrides) -> dict:
+    assertion_ids = ((NATIVE_DEPLOY_ASSERTIONS_WITH_PROVIDER if include_provider_assertions else NATIVE_DEPLOY_ASSERTIONS)
+                     if kind == "deploy" else
+                     (NATIVE_ROLLBACK_ASSERTIONS_WITH_PROVIDER if include_provider_assertions else NATIVE_ROLLBACK_ASSERTIONS))
     receipt = {
         "schema_version": agentctl.NATIVE_COMPOSITION_LIFECYCLE_RECEIPT_SCHEMA_VERSION,
         "kind": kind,
@@ -655,7 +664,9 @@ class VerifyAzureComposedReceiptRouteTestCase(unittest.TestCase):
 
     def test_native_deploy_receipt_accepts_a_public_safe_azure_provider_route(self):
         receipt = native_lifecycle_receipt(
-            "deploy", "c" * 64, "d" * 64, provider_route=azure_provider_route())
+            "deploy", "c" * 64, "d" * 64,
+            include_provider_assertions=True,
+            provider_route=azure_provider_route())
         self.assertEqual(agentctl.validate_lifecycle_receipt(receipt, "deploy"), [])
 
     def test_native_lifecycle_receipt_rejects_malformed_or_rollback_provider_route(self):
