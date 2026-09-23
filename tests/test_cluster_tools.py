@@ -100,7 +100,7 @@ class FakeKubectl:
         self.failures = set(failures)
         self.calls = []
 
-    def key(self, argv):
+    def key(self, argv, kwargs=None):
         if not argv or argv[0] != "kubectl":
             return (argv[0],) if argv else ("",)
         rest = argv[5:]
@@ -108,13 +108,25 @@ class FakeKubectl:
             return (rest[1], rest[2])
         if rest[0] == "delete" and len(rest) > 2 and not rest[2].startswith("-"):
             return (rest[0], rest[1], rest[2])
+        if rest[0] == "create":
+            raw = (kwargs or {}).get("input")
+            if isinstance(raw, str):
+                try:
+                    manifest = json.loads(raw)
+                except json.JSONDecodeError:
+                    manifest = None
+                metadata = manifest.get("metadata") if isinstance(manifest, dict) else None
+                name = metadata.get("name") if isinstance(metadata, dict) else None
+                kind = manifest.get("kind") if isinstance(manifest, dict) else None
+                if isinstance(kind, str) and isinstance(name, str) and name:
+                    return ("create", kind, name)
         return (rest[1],) if rest[0] == "get" else (rest[0],)
 
     def __call__(self, argv, **kwargs):
         self.calls.append((argv, kwargs))
         if not argv or argv[0] != "kubectl":
             return subprocess.CompletedProcess(argv, 1, stdout="", stderr="not found")
-        key = self.key(argv)
+        key = self.key(argv, kwargs)
         generic = (key[0],)
         if key in self.failures or generic in self.failures:
             return subprocess.CompletedProcess(argv, 1, stdout="", stderr="not found")
@@ -839,8 +851,42 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.pages_by_task = {}
         self.results_by_task = {}
         self.child_inventory = {"items": [self.child_task]}
-        self.probe_agent_name = "coordinator-refuses-probe-agent"
-        self.probe_task_name = "coordinator-refuses-probe-task"
+        self.kubectl = FakeKubectl({
+            ("tasks.core.orka.ai",): self._task_list_response,
+            ("task", self.parent_tasks["delegates"]["metadata"]["name"]): self.parent_tasks["delegates"],
+            ("task", self.parent_tasks["refuses-unlisted"]["metadata"]["name"]):
+                self.parent_tasks["refuses-unlisted"],
+            ("task", self.child_task["metadata"]["name"]): self.child_task,
+            ("jobs.batch",): {"items": []},
+            ("agents.core.orka.ai", "hello"): {
+                "metadata": {"uid": "hello-agent-uid", "generation": 1, "namespace": NAMESPACE},
+                "spec": self.hello_spec,
+                "status": {"conditions": [{"type": "Ready", "status": "True", "observedGeneration": 1}]},
+            },
+            ("agents.core.orka.ai", "coordinator"): {
+                "metadata": {"uid": "coordinator-agent-uid", "generation": 1, "namespace": NAMESPACE},
+                "spec": self.coordinator_spec,
+                "status": {"conditions": [{"type": "Ready", "status": "True", "observedGeneration": 1}]},
+            },
+        })
+        self._set_probe_suffix("abc12345")
+
+    def _task_list_response(self, argv, _kwargs):
+        if "-A" in argv:
+            return {"items": []}
+        if "-l" in argv:
+            return copy.deepcopy(self.child_inventory)
+        return {"items": []}
+
+    def _set_probe_suffix(self, suffix):
+        old_agent_name = getattr(self, "probe_agent_name", None)
+        old_task_name = getattr(self, "probe_task_name", None)
+        if old_agent_name is not None:
+            self.kubectl.responses.pop(("agents.core.orka.ai", old_agent_name), None)
+        if old_task_name is not None:
+            self.kubectl.responses.pop(("task", old_task_name), None)
+        self.probe_suffix = suffix
+        self.probe_agent_name, self.probe_task_name = agentctl._controller_allowlist_probe_names(suffix)
         self.probe_agent = {
             "metadata": {"uid": "probe-agent-uid", "generation": 1, "namespace": NAMESPACE},
             "spec": {"providerRef": {"name": "hello"},
@@ -857,35 +903,13 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             completion="2026-09-17T10:05:31Z",
             parent_name=self.parent_tasks["refuses-unlisted"]["metadata"]["name"],
         )
-        self.probe_task["status"] |= {"jobName": "", "jobUID": "",
-                                        "message": "agent \"coordinator-refuses-probe-agent\" not in parent's allowedAgents"}
-        self.kubectl = FakeKubectl({
-            ("tasks.core.orka.ai",): self._task_list_response,
-            ("task", self.parent_tasks["delegates"]["metadata"]["name"]): self.parent_tasks["delegates"],
-            ("task", self.parent_tasks["refuses-unlisted"]["metadata"]["name"]):
-                self.parent_tasks["refuses-unlisted"],
-            ("task", self.child_task["metadata"]["name"]): self.child_task,
-            ("task", self.probe_task_name): self.probe_task,
-            ("jobs.batch",): {"items": []},
-            ("agents.core.orka.ai", "hello"): {
-                "metadata": {"uid": "hello-agent-uid", "generation": 1, "namespace": NAMESPACE},
-                "spec": self.hello_spec,
-                "status": {"conditions": [{"type": "Ready", "status": "True", "observedGeneration": 1}]},
-            },
-            ("agents.core.orka.ai", "coordinator"): {
-                "metadata": {"uid": "coordinator-agent-uid", "generation": 1, "namespace": NAMESPACE},
-                "spec": self.coordinator_spec,
-                "status": {"conditions": [{"type": "Ready", "status": "True", "observedGeneration": 1}]},
-            },
-            ("agents.core.orka.ai", self.probe_agent_name): self.probe_agent,
-        })
-
-    def _task_list_response(self, argv, _kwargs):
-        if "-A" in argv:
-            return {"items": []}
-        if "-l" in argv:
-            return copy.deepcopy(self.child_inventory)
-        return {"items": []}
+        self.probe_task["status"] |= {
+            "jobName": "",
+            "jobUID": "",
+            "message": f"agent \"{self.probe_agent_name}\" not in parent's allowedAgents",
+        }
+        self.kubectl.responses[("task", self.probe_task_name)] = self.probe_task
+        self.kubectl.responses[("agents.core.orka.ai", self.probe_agent_name)] = self.probe_agent
 
     def _http_get(self, url, *, token=None, **kwargs):
         self.http_calls.append((url, token, kwargs))
@@ -909,6 +933,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
     def run_eval(self, case_id, task_manifest, **overrides):
         with mock.patch.object(agentctl.subprocess, "run", self.kubectl), \
                 mock.patch.object(agentctl, "http_get_json", self._http_get), \
+                mock.patch.object(agentctl, "_controller_allowlist_probe_name_suffix", return_value=self.probe_suffix), \
                 mock.patch.object(agentctl.time, "sleep"), redirect_stdout(io.StringIO()) as out:
             agentctl._eval_cli(self.argv(case_id, task_manifest, **overrides))
         return json.loads(out.getvalue())
@@ -917,6 +942,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(agentctl.subprocess, "run", self.kubectl), \
                 mock.patch.object(agentctl, "http_get_json", self._http_get), \
+                mock.patch.object(agentctl, "_controller_allowlist_probe_name_suffix", return_value=self.probe_suffix), \
                 mock.patch.object(agentctl.time, "sleep"), redirect_stdout(out), redirect_stderr(err):
             code = agentctl.main_eval(self.argv(case_id, task_manifest, **overrides))
         return code, out.getvalue(), err.getvalue()
@@ -1188,13 +1214,17 @@ class ComposedEvalCliTestCase(unittest.TestCase):
 
         create_inputs = [json.loads(kwargs["input"]) for argv, kwargs in self.kubectl.calls
                          if argv and argv[0] == "kubectl" and argv[5] == "create"]
-        self.assertEqual(len(create_inputs), 2)
-        probe_manifest = create_inputs[1]
-        self.assertEqual(probe_manifest["spec"]["agentRef"]["name"], self.probe_agent_name)
-        self.assertEqual(probe_manifest["metadata"]["labels"]["orka.ai/parent-task"], parent_name)
-        self.assertEqual(probe_manifest["metadata"]["annotations"]["orka.ai/parent-task-name"], parent_name)
-        self.assertEqual(probe_manifest["metadata"]["annotations"]["orka.ai/coordination-depth"], "1")
-        self.assertNotIn("ownerReferences", probe_manifest["metadata"])
+        self.assertEqual(len(create_inputs), 3)
+        probe_agent_manifest = create_inputs[1]
+        probe_task_manifest = create_inputs[2]
+        self.assertEqual(probe_agent_manifest["kind"], "Agent")
+        self.assertEqual(probe_agent_manifest["metadata"]["name"], self.probe_agent_name)
+        self.assertEqual(probe_task_manifest["kind"], "Task")
+        self.assertEqual(probe_task_manifest["spec"]["agentRef"]["name"], self.probe_agent_name)
+        self.assertEqual(probe_task_manifest["metadata"]["labels"]["orka.ai/parent-task"], parent_name)
+        self.assertEqual(probe_task_manifest["metadata"]["annotations"]["orka.ai/parent-task-name"], parent_name)
+        self.assertEqual(probe_task_manifest["metadata"]["annotations"]["orka.ai/coordination-depth"], "1")
+        self.assertNotIn("ownerReferences", probe_task_manifest["metadata"])
         delete_calls = [argv for argv, _ in self.kubectl.calls if argv and argv[0] == "kubectl" and argv[5] == "delete"]
         self.assertEqual(delete_calls[-3:], [
             ["kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "task", self.probe_task_name,
@@ -1518,6 +1548,7 @@ class ControllerAllowlistProbeTestCase(unittest.TestCase):
             "evidence_root": self.evidence_root, "max_poll_attempts": 2, "poll_interval_seconds": 0.1,
         })()
         self.kubectl = FakeKubectl()
+        self._set_probe_suffix("abc12345")
 
     def _coordinator_spec(self):
         return {
@@ -1529,35 +1560,78 @@ class ControllerAllowlistProbeTestCase(unittest.TestCase):
                       {"name": "wait_for_tasks", "enabled": True}],
         }
 
+    def _set_probe_suffix(self, suffix):
+        old_agent_name = getattr(self, "probe_agent_name", None)
+        old_task_name = getattr(self, "probe_task_name", None)
+        if old_agent_name is not None:
+            self.kubectl.responses.pop(("agents.core.orka.ai", old_agent_name), None)
+        if old_task_name is not None:
+            self.kubectl.responses.pop(("task", old_task_name), None)
+        self.probe_suffix = suffix
+        self.probe_agent_name, self.probe_task_name = agentctl._controller_allowlist_probe_names(suffix)
+
     def _configure_probe_success(self):
-        probe_agent_name = "coordinator-refuses-probe-agent"
-        probe_task_name = "coordinator-refuses-probe-task"
-        self.kubectl.responses[("agents.core.orka.ai", probe_agent_name)] = {
+        self.kubectl.responses[("agents.core.orka.ai", self.probe_agent_name)] = {
             "metadata": {"uid": "probe-agent-uid", "generation": 1, "namespace": NAMESPACE},
             "spec": {"providerRef": {"name": "hello"},
                      "systemPrompt": {"inline": "Controller allowlist probe."}},
             "status": {"conditions": [{"type": "Ready", "status": "True", "observedGeneration": 1}]},
         }
         probe_task = native_terminal_task(
-            probe_task_name,
+            self.probe_task_name,
             uid="probe-task-uid",
-            agent_name=probe_agent_name,
+            agent_name=self.probe_agent_name,
             prompt="Controller allowlist probe.",
             phase="Failed",
             parent_name=self.parent_task["metadata"]["name"],
         )
-        probe_task["status"] |= {"jobName": "", "jobUID": "",
-                                  "message": "agent \"coordinator-refuses-probe-agent\" not in parent's allowedAgents"}
-        self.kubectl.responses[("task", probe_task_name)] = probe_task
+        probe_task["status"] |= {
+            "jobName": "",
+            "jobUID": "",
+            "message": f"agent \"{self.probe_agent_name}\" not in parent's allowedAgents",
+        }
+        self.kubectl.responses[("task", self.probe_task_name)] = probe_task
         self.kubectl.responses[("jobs.batch",)] = {"items": []}
-        return probe_agent_name, probe_task_name
+        return self.probe_agent_name, self.probe_task_name
 
     def _run_probe(self):
         with mock.patch.object(agentctl.subprocess, "run", self.kubectl), \
+                mock.patch.object(agentctl, "_controller_allowlist_probe_name_suffix", return_value=self.probe_suffix), \
                 mock.patch.object(agentctl.time, "sleep"):
             return agentctl.run_controller_allowlist_probe(
                 self.args, evidence_dir=self.evidence_dir, coordinator_live=self.coordinator,
                 refusal_parent_task=self.parent_task)
+
+    def test_controller_allowlist_probe_uses_unique_safe_names_and_creates_agent_without_apply(self):
+        self._set_probe_suffix("abc12345")
+        first_agent_name, first_task_name = self._configure_probe_success()
+        first_observation = self._run_probe()
+        self.assertEqual(first_observation, CONTROLLER_ALLOWLIST_PRE_DISPATCH["controller-allowlist-pre-dispatch"])
+        self.assertNotIn("apply", self.kubectl.verbs())
+        self.assertEqual(self.kubectl.verbs().count("create"), 2)
+        first_create_inputs = [json.loads(kwargs["input"]) for argv, kwargs in self.kubectl.calls
+                               if argv and argv[0] == "kubectl" and argv[5] == "create"]
+        self.assertEqual([(manifest["kind"], manifest["metadata"]["name"]) for manifest in first_create_inputs], [
+            ("Agent", first_agent_name),
+            ("Task", first_task_name),
+        ])
+        for name in (first_agent_name, first_task_name):
+            self.assertRegex(name, r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+            self.assertLessEqual(len(name), 63)
+        self.assertEqual({path.name for path in self.evidence_dir.iterdir()}, set(agentctl._CONTROLLER_ALLOWLIST_PROBE_FILES))
+
+        self.kubectl.calls = []
+        self._set_probe_suffix("def67890")
+        second_agent_name, second_task_name = self._configure_probe_success()
+        second_observation = self._run_probe()
+        self.assertEqual(second_observation, CONTROLLER_ALLOWLIST_PRE_DISPATCH["controller-allowlist-pre-dispatch"])
+        second_create_inputs = [json.loads(kwargs["input"]) for argv, kwargs in self.kubectl.calls
+                                if argv and argv[0] == "kubectl" and argv[5] == "create"]
+        self.assertEqual([(manifest["kind"], manifest["metadata"]["name"]) for manifest in second_create_inputs], [
+            ("Agent", second_agent_name),
+            ("Task", second_task_name),
+        ])
+        self.assertNotEqual((first_agent_name, first_task_name), (second_agent_name, second_task_name))
 
     def test_controller_allowlist_probe_returns_the_fixed_observation_and_cleans_up(self):
         probe_agent_name, probe_task_name = self._configure_probe_success()
@@ -1579,22 +1653,43 @@ class ControllerAllowlistProbeTestCase(unittest.TestCase):
         ])
 
     def test_controller_allowlist_probe_failures_still_clean_up_and_keep_budget_consumed(self):
-        for scenario in ("agent-apply", "agent-not-ready", "task-create", "task-not-allowlist-failure",
+        for scenario in ("agent-create", "agent-not-ready", "task-create", "task-not-allowlist-failure",
                          "job-created"):
             with self.subTest(scenario=scenario):
                 self.setUp()
                 probe_agent_name, probe_task_name = self._configure_probe_success()
-                if scenario == "agent-apply":
-                    self.kubectl.failures.add(("apply",))
+                if scenario == "agent-create":
+                    self.kubectl.failures.add(("create", "Agent", probe_agent_name))
+                    expected_deletes = []
                 elif scenario == "agent-not-ready":
                     self.kubectl.responses[("agents.core.orka.ai", probe_agent_name)]["status"] = {
                         "conditions": [{"type": "Ready", "status": "False", "observedGeneration": 1}]}
+                    expected_deletes = [
+                        ["kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "agents.core.orka.ai",
+                         probe_agent_name, "-n", NAMESPACE, "--ignore-not-found"],
+                    ]
                 elif scenario == "task-create":
-                    self.kubectl.failures.add(("create",))
+                    self.kubectl.failures.add(("create", "Task", probe_task_name))
+                    expected_deletes = [
+                        ["kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "agents.core.orka.ai",
+                         probe_agent_name, "-n", NAMESPACE, "--ignore-not-found"],
+                    ]
                 elif scenario == "task-not-allowlist-failure":
                     self.kubectl.responses[("task", probe_task_name)]["status"]["message"] = "different failure"
+                    expected_deletes = [
+                        ["kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "task", probe_task_name,
+                         "-n", NAMESPACE, "--ignore-not-found"],
+                        ["kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "agents.core.orka.ai",
+                         probe_agent_name, "-n", NAMESPACE, "--ignore-not-found"],
+                    ]
                 elif scenario == "job-created":
                     self.kubectl.responses[("jobs.batch",)] = {"items": [{"metadata": {"name": "job-1"}}]}
+                    expected_deletes = [
+                        ["kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "task", probe_task_name,
+                         "-n", NAMESPACE, "--ignore-not-found"],
+                        ["kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "agents.core.orka.ai",
+                         probe_agent_name, "-n", NAMESPACE, "--ignore-not-found"],
+                    ]
                 with self.assertRaises(agentctl.CliError):
                     self._run_probe()
                 ledger = json.loads((self.evidence_root / "campaign-ledger.json").read_text(encoding="utf-8"))
@@ -1604,12 +1699,7 @@ class ControllerAllowlistProbeTestCase(unittest.TestCase):
                 }]})
                 delete_calls = [argv for argv, _ in self.kubectl.calls
                                 if argv and argv[0] == "kubectl" and argv[5] == "delete"]
-                self.assertEqual(delete_calls[-2:], [
-                    ["kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "task", probe_task_name,
-                     "-n", NAMESPACE, "--ignore-not-found"],
-                    ["kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "agents.core.orka.ai",
-                     probe_agent_name, "-n", NAMESPACE, "--ignore-not-found"],
-                ])
+                self.assertEqual(delete_calls, expected_deletes)
 
     def test_controller_allowlist_probe_task_cleanup_failure_fails_closed_after_attempting_both_deletes(self):
         probe_agent_name, probe_task_name = self._configure_probe_success()
@@ -1639,13 +1729,13 @@ class ControllerAllowlistProbeTestCase(unittest.TestCase):
 
     def test_controller_allowlist_probe_rejects_non_empty_job_name(self):
         self._configure_probe_success()
-        self.kubectl.responses[("task", "coordinator-refuses-probe-task")]["status"]["jobName"] = "job-1"
+        self.kubectl.responses[("task", self.probe_task_name)]["status"]["jobName"] = "job-1"
         with self.assertRaises(agentctl.CliError):
             self._run_probe()
 
     def test_controller_allowlist_probe_rejects_non_empty_job_uid(self):
         self._configure_probe_success()
-        self.kubectl.responses[("task", "coordinator-refuses-probe-task")]["status"]["jobUID"] = "job-uid-1"
+        self.kubectl.responses[("task", self.probe_task_name)]["status"]["jobUID"] = "job-uid-1"
         with self.assertRaises(agentctl.CliError):
             self._run_probe()
 

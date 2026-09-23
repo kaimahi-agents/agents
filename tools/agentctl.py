@@ -13,6 +13,7 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -1400,8 +1401,10 @@ _TASK_LABEL = "orka.ai/task"
 _DELEGATED_AGENT_LABEL = "orka.ai/delegated-agent"
 _EXPECTED_COMPOSED_CHILD = "hello"
 _FIXED_GREETING_CASE_ID = "fixed-greeting"
-_CONTROLLER_ALLOWLIST_PROBE_AGENT = "coordinator-refuses-probe-agent"
-_CONTROLLER_ALLOWLIST_PROBE_TASK = "coordinator-refuses-probe-task"
+_CONTROLLER_ALLOWLIST_PROBE_AGENT_BASE = "coordinator-refuses-probe-agent"
+_CONTROLLER_ALLOWLIST_PROBE_TASK_BASE = "coordinator-refuses-probe-task"
+_CONTROLLER_ALLOWLIST_PROBE_SUFFIX_BYTES = 8
+_KUBERNETES_NAME_MAX_LENGTH = 63
 _CONTROLLER_ALLOWLIST_PROBE_PROMPT = "Controller allowlist probe."
 _CONTROLLER_ALLOWLIST_FAILURE_FRAGMENT = "not in parent's allowedAgents"
 _CONTROLLER_ALLOWLIST_PROBE_FILES = (
@@ -1423,6 +1426,24 @@ _COMPOSED_EVIDENCE_FILES = (
     "child-tasks.json",
     "child-results.json",
 )
+
+def _controller_allowlist_probe_name_suffix() -> str:
+    return secrets.token_hex(_CONTROLLER_ALLOWLIST_PROBE_SUFFIX_BYTES)
+
+
+def _controller_allowlist_probe_name(base: str, suffix: str) -> str:
+    if not isinstance(suffix, str) or not suffix or not re.fullmatch(r"[a-z0-9]+", suffix):
+        raise CliError("controller allowlist probe suffix must be lowercase letters and digits only")
+    name = f"{base}-{suffix}"
+    if len(name) > _KUBERNETES_NAME_MAX_LENGTH or not is_safe_slug(name):
+        raise CliError("controller allowlist probe resource names must be safe slugs no longer than 63 characters")
+    return name
+
+
+def _controller_allowlist_probe_names(suffix: str | None = None) -> tuple[str, str]:
+    probe_suffix = _controller_allowlist_probe_name_suffix() if suffix is None else suffix
+    return (_controller_allowlist_probe_name(_CONTROLLER_ALLOWLIST_PROBE_AGENT_BASE, probe_suffix),
+            _controller_allowlist_probe_name(_CONTROLLER_ALLOWLIST_PROBE_TASK_BASE, probe_suffix))
 
 def get_task_result(base_url, task_name, namespace, *, token=None) -> str:
     """Fetch one authenticated task result as plain text."""
@@ -1596,13 +1617,14 @@ def run_controller_allowlist_probe(args, *, evidence_dir: Path, coordinator_live
         raise CliError("controller allowlist probe requires a live coordinator providerRef.name")
     if not isinstance(parent_name, str) or not parent_name:
         raise CliError("controller allowlist probe requires the completed refusal parent name")
+    probe_agent_name, probe_task_name = _controller_allowlist_probe_names()
     reserve_campaign_entry(args.evidence_root, CONTROLLER_ALLOWLIST_OBSERVATION_ID,
                            parent_count=0, child_count=0, probe_count=1)
     evidence_dir = Path(evidence_dir)
     probe_agent_manifest = {
         "apiVersion": "core.orka.ai/v1alpha1",
         "kind": "Agent",
-        "metadata": {"name": _CONTROLLER_ALLOWLIST_PROBE_AGENT, "namespace": args.namespace},
+        "metadata": {"name": probe_agent_name, "namespace": args.namespace},
         "spec": {"providerRef": {"name": provider_name},
                   "systemPrompt": {"inline": _CONTROLLER_ALLOWLIST_PROBE_PROMPT}},
     }
@@ -1610,27 +1632,28 @@ def run_controller_allowlist_probe(args, *, evidence_dir: Path, coordinator_live
         "apiVersion": "core.orka.ai/v1alpha1",
         "kind": "Task",
         "metadata": {
-            "name": _CONTROLLER_ALLOWLIST_PROBE_TASK,
+            "name": probe_task_name,
             "namespace": args.namespace,
             "labels": {_PARENT_TASK_LABEL: parent_name},
             "annotations": {_PARENT_TASK_NAME_ANNOTATION: parent_name,
                              _COORDINATION_DEPTH_ANNOTATION: "1"},
         },
-        "spec": {"type": "ai", "agentRef": {"name": _CONTROLLER_ALLOWLIST_PROBE_AGENT},
+        "spec": {"type": "ai", "agentRef": {"name": probe_agent_name},
                  "prompt": _CONTROLLER_ALLOWLIST_PROBE_PROMPT,
                  "retryPolicy": {"maxRetries": 0}},
     }
     _write_json(evidence_dir / _CONTROLLER_ALLOWLIST_PROBE_FILES[0], probe_agent_manifest)
     _write_json(evidence_dir / _CONTROLLER_ALLOWLIST_PROBE_FILES[2], probe_task_manifest)
+    created_agent, created_task = False, False
     try:
-        applied = run_kubectl(args.context, args.kubeconfig,
-                              ["apply", "-n", args.namespace,
-                               "-f", str(evidence_dir / _CONTROLLER_ALLOWLIST_PROBE_FILES[0])])
-        if applied.returncode != 0:
-            raise CliError(f"controller allowlist probe Agent apply failed (kubectl exited {applied.returncode})")
+        created = run_kubectl(args.context, args.kubeconfig, ["create", "-n", args.namespace, "-f", "-"],
+                              input=json.dumps(probe_agent_manifest))
+        if created.returncode != 0:
+            raise CliError(f"controller allowlist probe Agent create failed (kubectl exited {created.returncode})")
+        created_agent = True
         probe_agent = wait_for_current_agent_readback(
             lambda: run_kubectl_json(args.context, args.kubeconfig,
-                                     ["get", "agents.core.orka.ai", _CONTROLLER_ALLOWLIST_PROBE_AGENT,
+                                     ["get", "agents.core.orka.ai", probe_agent_name,
                                       "-n", args.namespace]),
             max_attempts=args.max_poll_attempts, poll_interval_seconds=args.poll_interval_seconds)
         _write_json(evidence_dir / _CONTROLLER_ALLOWLIST_PROBE_FILES[1], probe_agent)
@@ -1640,14 +1663,15 @@ def run_controller_allowlist_probe(args, *, evidence_dir: Path, coordinator_live
                              input=json.dumps(probe_task_manifest))
         if submit.returncode != 0:
             raise CliError(f"controller allowlist probe Task submission failed (kubectl exited {submit.returncode})")
+        created_task = True
         probe_task = wait_for_terminal(
             lambda: run_kubectl_json(args.context, args.kubeconfig,
-                                     ["get", "task", _CONTROLLER_ALLOWLIST_PROBE_TASK, "-n", args.namespace]),
+                                     ["get", "task", probe_task_name, "-n", args.namespace]),
             max_attempts=args.max_poll_attempts, poll_interval_seconds=args.poll_interval_seconds)
         _write_json(evidence_dir / _CONTROLLER_ALLOWLIST_PROBE_FILES[3], probe_task)
         jobs = run_kubectl_json(args.context, args.kubeconfig,
                                 ["get", "jobs.batch", "-n", args.namespace,
-                                 "-l", f"{_TASK_LABEL}={_CONTROLLER_ALLOWLIST_PROBE_TASK}"])
+                                 "-l", f"{_TASK_LABEL}={probe_task_name}"])
         _write_json(evidence_dir / _CONTROLLER_ALLOWLIST_PROBE_FILES[4], jobs)
         status = probe_task.get("status") if isinstance(probe_task, dict) else None
         phase = status.get("phase") if isinstance(status, dict) else None
@@ -1666,16 +1690,18 @@ def run_controller_allowlist_probe(args, *, evidence_dir: Path, coordinator_live
         return dict(CONTROLLER_ALLOWLIST_OBSERVATION)
     finally:
         cleanup_errors = []
-        deleted = run_kubectl(args.context, args.kubeconfig,
-                              ["delete", "task", _CONTROLLER_ALLOWLIST_PROBE_TASK, "-n", args.namespace,
-                               "--ignore-not-found"])
-        if deleted.returncode != 0:
-            cleanup_errors.append(f"controller allowlist probe Task cleanup failed (kubectl exited {deleted.returncode})")
-        deleted = run_kubectl(args.context, args.kubeconfig,
-                              ["delete", "agents.core.orka.ai", _CONTROLLER_ALLOWLIST_PROBE_AGENT, "-n", args.namespace,
-                               "--ignore-not-found"])
-        if deleted.returncode != 0:
-            cleanup_errors.append(f"controller allowlist probe Agent cleanup failed (kubectl exited {deleted.returncode})")
+        if created_task:
+            deleted = run_kubectl(args.context, args.kubeconfig,
+                                  ["delete", "task", probe_task_name, "-n", args.namespace,
+                                   "--ignore-not-found"])
+            if deleted.returncode != 0:
+                cleanup_errors.append(f"controller allowlist probe Task cleanup failed (kubectl exited {deleted.returncode})")
+        if created_agent:
+            deleted = run_kubectl(args.context, args.kubeconfig,
+                                  ["delete", "agents.core.orka.ai", probe_agent_name, "-n", args.namespace,
+                                   "--ignore-not-found"])
+            if deleted.returncode != 0:
+                cleanup_errors.append(f"controller allowlist probe Agent cleanup failed (kubectl exited {deleted.returncode})")
         if cleanup_errors:
             raise CliError("; ".join(cleanup_errors))
 
