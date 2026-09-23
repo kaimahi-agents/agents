@@ -36,8 +36,8 @@ render-and-apply flow above rather than the monitored-runtime path.
 ## What the tests check
 
 `delegates` proves the coordinator delegated once to `hello`, waited for the
-child, returned `Hello world.` verbatim, and stayed within the fixed request,
-tool-call, child-count, and retry limits.
+child, propagated the authenticated child greeting into the parent result, and
+stayed within the fixed request, tool-call, child-count, and retry limits.
 
 `refuses-unlisted` proves the coordinator attempted to delegate to
 `not-allowed`, Orka refused that call before child creation, the parent still
@@ -46,6 +46,7 @@ answer.
 
 ## Where it has run
 
-No committed live receipts exist for the current digest yet, so the catalogue
-status remains `ran, no tests yet` until the required trial receipts are
-recorded.
+Passing live trial receipts now exist for the current digest. The committed
+`delegates` and `refuses-unlisted` receipts capture one successful delegation
+to the pinned `hello` child and one pre-dispatch refusal for an unlisted
+target, so the catalogue status is `tested`.

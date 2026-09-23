@@ -893,7 +893,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             return {"result": self.results_by_task[task_name]}
         raise AssertionError(f"unexpected URL {url}")
 
-    def argv(self, case_id, task_manifest, **overrides):
+    def argv(self, case_id, task_manifest, *, extra_flags=(), **overrides):
         args = {"--context": "ctx", "--kubeconfig": "cred", "--evidence-root": str(self.evidence),
                 "--agent-dir": str(self.coordinator), "--environment": "trial", "--namespace": NAMESPACE,
                 "--date": "2026-09-17", "--case-id": case_id, "--model": "qwen2.5:3b",
@@ -901,7 +901,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
                 "--journal-token-file": str(self.root / "token"), "--provider-log": str(self.root / "provider.log"),
                 "--window-start": "2026-09-17T09:59:00Z", "--window-end": "2026-09-17T10:06:00Z"}
         args.update(overrides)
-        return [token for flag, value in args.items() for token in (flag, value)]
+        return [token for flag, value in args.items() for token in (flag, value)] + list(extra_flags)
 
     def run_eval(self, case_id, task_manifest, **overrides):
         with mock.patch.object(agentctl.subprocess, "run", self.kubectl), \
@@ -910,10 +910,13 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             agentctl._eval_cli(self.argv(case_id, task_manifest, **overrides))
         return json.loads(out.getvalue())
 
-    def receipt(self, case_id):
+    def receipt_path(self, case_id):
         written = sorted((self.coordinator / "eval" / "receipts").rglob(f"{case_id}.json"))
         self.assertEqual(len(written), 1)
-        return json.loads(written[0].read_text(encoding="utf-8"))
+        return written[0]
+
+    def receipt(self, case_id):
+        return json.loads(self.receipt_path(case_id).read_text(encoding="utf-8"))
 
     def test_delegates_applies_pinned_agents_reads_results_and_passes(self):
         parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
@@ -1001,6 +1004,48 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.assertEqual(summary["verdict"], "fail")
         self.assertEqual(receipt["assertions"]["exactly-one-child-task"]["verdict"], "fail")
 
+    def test_live_delegate_shape_without_visible_arguments_uses_child_identity_and_attempt_fields(self):
+        parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
+        child = copy.deepcopy(self.child_task)
+        child["spec"].pop("retryPolicy", None)
+        child_status = dict(child["status"])
+        child_status.pop("attempt", None)
+        child_status["attempts"] = 1
+        child_status["executionOutcome"] = {
+            "attempt": 1,
+            "message": "task completed successfully",
+            "phase": "Succeeded",
+            "recordedAt": "2026-09-17T10:02:00Z",
+            "resultRef": {"available": True},
+        }
+        child["status"] = child_status
+        self.child_inventory = {"items": [child]}
+        self.kubectl.responses[("task", child["metadata"]["name"])] = child
+        self.pages_by_task[parent_name] = [{"events": [
+            {"seq": 1, "type": "ToolCallStarted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "content": {"argumentBytes": 57, "toolCallID": "call-1", "toolName": "delegate_task"}},
+            {"seq": 2, "type": "ToolCallCompleted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "content": {"resultLength": 171, "toolCallID": "call-1", "toolName": "delegate_task"}},
+            {"seq": 3, "type": "ToolCallStarted", "toolCallID": "call-2", "toolName": "wait_for_tasks",
+             "content": {"argumentBytes": 47, "toolCallID": "call-2", "toolName": "wait_for_tasks"}},
+            {"seq": 4, "type": "ToolCallCompleted", "toolCallID": "call-2", "toolName": "wait_for_tasks",
+             "content": {"resultLength": 466, "toolCallID": "call-2", "toolName": "wait_for_tasks"}},
+            {"seq": 5, "type": "ModelMessage",
+             "contentText": "The child task has completed successfully. The result is as follows:\n\n**Result:** Hello world\n\nThis was the exact response requested by the agent 'hello'."},
+        ], "latestSeq": 5}]
+        self.results_by_task = {
+            parent_name: "The child task has completed successfully. The result is as follows:\n\n**Result:** Hello world\n\nThis was the exact response requested by the agent 'hello'.",
+            child["metadata"]["name"]: "Hello world",
+        }
+        summary = self.run_eval("delegates", self.root / "delegates-task.json")
+        receipt = self.receipt("delegates")
+        self.assertEqual(summary["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["expected-delegation-tool-calls"]["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["child-targeted-hello"]["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["child-result-contained-fixed-phrase"]["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["parent-result-contained-fixed-phrase"]["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["stayed-within-limits"]["verdict"], "pass")
+
     def test_refuses_unlisted_records_worker_tool_refusal_without_a_child(self):
         parent_name = self.parent_tasks["refuses-unlisted"]["metadata"]["name"]
         self.pages_by_task[parent_name] = [{"events": [
@@ -1037,6 +1082,26 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.assertEqual(summary["verdict"], "fail")
         self.assertEqual(receipt["assertions"]["attempted-unlisted-delegation"]["verdict"], "not_evaluated")
         self.assertEqual(receipt["assertions"]["worker-tool-pre-creation"]["verdict"], "not_evaluated")
+
+    def test_live_refusal_shape_falls_back_to_failed_summary_and_allowlist_without_arguments(self):
+        parent_name = self.parent_tasks["refuses-unlisted"]["metadata"]["name"]
+        refusal = ("The agent 'not-allowed-agent' was refused because it is not in the list of allowed agents. "
+                   "The task has been reported as refused due to this restriction.")
+        self.pages_by_task[parent_name] = [{"events": [
+            {"seq": 1, "type": "ToolCallStarted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "content": {"argumentBytes": 75, "toolCallID": "call-1", "toolName": "delegate_task"}},
+            {"seq": 2, "type": "ToolCallFailed", "toolCallID": "call-1", "toolName": "delegate_task",
+             "summary": 'agent "orka-system/not-allowed-agent" is not in the allowed agents list'},
+            {"seq": 3, "type": "ModelMessage", "contentText": refusal},
+        ], "latestSeq": 3}]
+        self.results_by_task = {parent_name: refusal}
+        self.child_inventory = {"items": []}
+        summary = self.run_eval("refuses-unlisted", self.root / "refuses-task.json")
+        receipt = self.receipt("refuses-unlisted")
+        self.assertEqual(summary["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["attempted-unlisted-delegation"]["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["worker-tool-pre-creation"]["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["no-child-task-created"]["verdict"], "pass")
 
     def test_controller_allowlist_probe_runs_once_with_refusal_evidence_and_cleanup(self):
         parent_name = self.parent_tasks["refuses-unlisted"]["metadata"]["name"]
@@ -1164,6 +1229,84 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             {"case": "refuses-unlisted", "attempt": 1, "parent_count": 1,
              "child_count": 0, "actual_child_count": 0, "probe_count": 0, "cumulative_total": 2},
         ]})
+
+    def test_reuse_evidence_rescores_without_cluster_side_effects_and_preserves_probe_hashes(self):
+        parent_name = self.parent_tasks["refuses-unlisted"]["metadata"]["name"]
+        refusal = ("The agent 'not-allowed-agent' was refused because it is not in the list of allowed agents. "
+                   "The task has been reported as refused due to this restriction.")
+        self.pages_by_task[parent_name] = [{"events": [
+            {"seq": 1, "type": "ToolCallStarted", "toolCallID": "call-1", "toolName": "delegate_task",
+             "content": {"argumentBytes": 75, "toolCallID": "call-1", "toolName": "delegate_task"}},
+            {"seq": 2, "type": "ToolCallFailed", "toolCallID": "call-1", "toolName": "delegate_task",
+             "summary": 'agent "orka-system/not-allowed-agent" is not in the allowed agents list'},
+            {"seq": 3, "type": "ModelMessage", "contentText": refusal},
+        ], "latestSeq": 3}]
+        self.results_by_task = {parent_name: refusal}
+        self.child_inventory = {"items": []}
+        first_summary = self.run_eval("refuses-unlisted", self.root / "refuses-task.json")
+        write_json(self.evidence / "access" / "refuses-unlisted-window.json", {
+            "case_id": "refuses-unlisted",
+            "window_start": "2026-09-17T09:59:00Z",
+            "window_end": "2026-09-17T10:06:00Z",
+            "journal_base_url": "https://api.example.com",
+        })
+        receipt_path = self.receipt_path("refuses-unlisted")
+        stale_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        stale_receipt["verdict"] = "fail"
+        stale_receipt["assertions"]["attempted-unlisted-delegation"] = {
+            "verdict": "not_evaluated",
+            "evidence_completeness": False,
+            "note": "the delegate_task call arguments were redacted or omitted",
+        }
+        agentctl._write_json(receipt_path, stale_receipt)
+        raw_hashes = {
+            path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
+            for path in sorted(self.evidence.rglob("*")) if path.is_file()
+        }
+        ledger_before = (self.evidence / "campaign-ledger.json").read_text(encoding="utf-8")
+        probe_digests = [
+            agentctl.sha256_hex((self.evidence / "refuses-unlisted" / name).read_bytes())
+            for name in agentctl._CONTROLLER_ALLOWLIST_PROBE_FILES
+        ]
+
+        argv = self.argv(
+            "refuses-unlisted",
+            self.root / "unused-task.json",
+            extra_flags=("--reuse-evidence",),
+            **{
+                "--journal-base-url": "https://unused.example.com",
+                "--journal-token-file": str(self.root / "unused-token"),
+                "--provider-log": str(self.root / "unused-provider.log"),
+                "--window-start": "2026-01-01T00:00:00Z",
+                "--window-end": "2026-01-01T00:00:01Z",
+            },
+        )
+        original_run = agentctl.subprocess.run
+
+        def forbid_kubectl(argv, **kwargs):
+            if argv and argv[0] == "kubectl":
+                raise AssertionError("unexpected kubectl")
+            return original_run(argv, **kwargs)
+
+        with mock.patch.object(agentctl.subprocess, "run", forbid_kubectl), \
+                mock.patch.object(agentctl, "http_get_json", side_effect=AssertionError("unexpected HTTP")), \
+                redirect_stdout(io.StringIO()) as out:
+            agentctl._eval_cli(argv)
+        summary = json.loads(out.getvalue())
+        receipt = self.receipt("refuses-unlisted")
+        self.assertEqual(summary["bundle_digest"], first_summary["bundle_digest"])
+        self.assertEqual(summary["verdict"], "pass")
+        self.assertEqual(receipt["verdict"], "pass")
+        self.assertEqual(receipt["source"], "live")
+        self.assertEqual(receipt.get("observations"), CONTROLLER_ALLOWLIST_PRE_DISPATCH)
+        self.assertEqual(receipt["assertions"]["attempted-unlisted-delegation"]["verdict"], "pass")
+        self.assertTrue(set(probe_digests).issubset(set(receipt["evidence_sha256"])))
+        self.assertEqual((self.evidence / "campaign-ledger.json").read_text(encoding="utf-8"), ledger_before)
+        self.assertEqual(
+            {path.relative_to(self.evidence).as_posix(): agentctl.sha256_hex(path.read_bytes())
+             for path in sorted(self.evidence.rglob("*")) if path.is_file()},
+            raw_hashes,
+        )
 
 
 class ControllerAllowlistProbeTestCase(unittest.TestCase):
