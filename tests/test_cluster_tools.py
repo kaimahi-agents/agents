@@ -2436,6 +2436,10 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             "Delegation to not-allowed was denied. No child task was created.",
             "Could not delegate to not-allowed. No child result was created.",
             "delegation to not-allowed was refused.\nno child was created.",
+            "Delegation was refused: agent not-allowed is not in the allowed agents list.",
+            "delegation was refused: agent `not-allowed` is not in the allowed agents list!",
+            "Delegation was refused: agent \"not-allowed\" is not in the allowed agents list?",
+            "Delegation was refused: agent 'not-allowed' is not in the allowed agents list",
         )
         for result_text in variants:
             with self.subTest(result_text=result_text):
@@ -2462,6 +2466,9 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             "Delegation to not-allowed was refused. No child was created. No child result was created.",
             "Delegation to not-allowed was refused. Hello world.",
             "Delegation to not-allowed was refused. Hello world",
+            "Before stopping, delegation was refused: agent `not-allowed` is not in the allowed agents list.",
+            "Delegation was refused: agent `not-allowed` is not in the allowed agents list. No child was created.",
+            "Delegation was refused: agent `not-allowed` is not in the allowed agents list. The response was Hello world.",
         )
         for result_text in variants:
             with self.subTest(result_text=result_text):
@@ -2479,6 +2486,9 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             "Delegation was refused.",
             "Delegation was not refused; it failed for another reason.",
             "The refuse bin was emptied while delegation failed for another reason.",
+            "Delegation was refused: agent `not-allowed-agent` is not in the allowed agents list.",
+            "Delegation was refused: agent `another-agent` is not in the allowed agents list.",
+            "Delegation was refused: agent orka-system/not-allowed is not in the allowed agents list.",
         )
         for result_text in variants:
             with self.subTest(result_text=result_text):

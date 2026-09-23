@@ -14,6 +14,7 @@ ALLOWED_STATUSES = {
     "ran, no tests yet",
     "tested, ran on real PRs",
     "tested, trial red on report receipt",
+    "tested, trial/production verify green",
 }
 LINK_RE = re.compile(r"(?<!!)\[[^]]+\]\(([^)]+)\)")
 TOOL_COMMAND_RE = re.compile(r"^\s*(tools/[a-z0-9-]+)\b")
@@ -64,7 +65,7 @@ class CatalogueTestCase(unittest.TestCase):
         rows = [line for line in README.read_text(encoding="utf-8").splitlines()
                 if line.startswith("| [coordinator](agents/coordinator/)")]
         self.assertEqual(len(rows), 1)
-        self.assertEqual(catalogue_rows().get("coordinator"), "tested, trial red on report receipt")
+        self.assertEqual(catalogue_rows().get("coordinator"), "tested, trial/production verify green")
         self.assertTrue((ROOT / "agents" / "coordinator" / "README.md").is_file())
 
     def test_versioning_docs_have_one_pinned_composition_paragraph(self):

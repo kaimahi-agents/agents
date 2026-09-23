@@ -2340,7 +2340,7 @@ def _normalize_result_whitespace(text: str) -> str:
 def _parent_result_names_requested_agent(text: str, requested_agent: str) -> bool:
     if not isinstance(requested_agent, str) or not requested_agent:
         return False
-    pattern = re.compile(rf"(?<![a-z0-9-]){re.escape(requested_agent)}(?![a-z0-9-])", re.IGNORECASE)
+    pattern = re.compile(rf"(?<![a-z0-9-/]){re.escape(requested_agent)}(?![a-z0-9-/])", re.IGNORECASE)
     return bool(pattern.search(text))
 
 
@@ -2357,7 +2357,22 @@ def _parent_result_matches_closed_denial_report(text: str, requested_agent: str)
         for template in _REFUSAL_REPORT_REFUSAL_TEMPLATES
         for tail in _REFUSAL_REPORT_NO_CHILD_TEMPLATES
     }
-    return normalized.casefold() in allowed
+    if normalized.casefold() in allowed:
+        return True
+    quoted_or_bare_agent = "|".join(
+        re.escape(candidate)
+        for candidate in (
+            requested_agent,
+            f"`{requested_agent}`",
+            f'"{requested_agent}"',
+            f"'{requested_agent}'",
+        )
+    )
+    return bool(re.fullmatch(
+        rf"delegation was refused:\s+agent\s+(?:{quoted_or_bare_agent})\s+is not in the allowed agents list(?:[.!?]+)?",
+        normalized,
+        re.IGNORECASE,
+    ))
 
 
 def run_controller_allowlist_probe(args, *, evidence_dir: Path, coordinator_live, refusal_parent_task) -> dict:

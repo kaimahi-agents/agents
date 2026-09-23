@@ -29,13 +29,14 @@ Tasks.
 Render the coordinator before applying it. The rendered bundle keeps its own
 namespace, so the apply step needs only your explicit cluster context and
 kubeconfig plus the externally provisioned `coordinator-azure-openai` Secret in
-`orka-system`. `tools/verify agents/coordinator production` is the committed
-green offline check. `tools/verify agents/coordinator trial` is intentionally
-red at this digest until new Azure-routed receipts are committed.
+`orka-system`. `tools/verify agents/coordinator production` and
+`tools/verify agents/coordinator trial` are the committed offline checks for the
+current digest.
 
 ```sh
 tools/render agents/coordinator trial --output /tmp/coordinator.json
 tools/verify agents/coordinator production
+tools/verify agents/coordinator trial
 kubectl --context "$CONTEXT" --kubeconfig "$KUBECONFIG" apply -f /tmp/coordinator.json
 ```
 
@@ -60,12 +61,21 @@ outside the live allowlist, that the worker denied it before child creation,
 and that no child Task was created. `coordinator-reports-denial` separately
 proves whether the final authenticated parent result named the requested agent
 `not-allowed`, stated refusal, and avoided inventing a child answer or fixed
-greeting.
+greeting, including Orka's exact refusal wording:
+``Delegation was refused: agent `not-allowed` is not in the allowed agents list.``
 
 ## Where it has run
 
-The coordinator now renders an Azure route, so the earlier local-provider trial
-receipts no longer satisfy the current digest. Until fresh Azure-routed trial
-receipts are committed, `tools/verify agents/coordinator trial` is expected to
-stay red because the required current-digest receipts are missing. Production
-remains green and receipt-free.
+The current Azure-routed trial digest has three committed passing receipts, so
+both offline verifies are green. The preserved PR2 refusal evidence was reused
+at the same digest with zero cluster calls to regenerate the split refusal
+receipts while retaining the public-safe Azure `provider_route` and
+authenticated parent `token_usage`.
+
+- `delegates`: 4 authenticated requests; token usage input 4944, output 90,
+  total 5034
+- Shared refusal source reused into `orka-denies-unlisted` and
+  `coordinator-reports-denial`: 2 authenticated parent requests; token usage
+  input 3102, output 103, total 3205
+
+Production remains green and receipt-free.
