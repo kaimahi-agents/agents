@@ -1017,7 +1017,7 @@ def _json_pairs_object(pairs):
 def _unquote(value: str) -> str:
     return value[1:-1] if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'" else value
 
-def _strip_plain_yaml_comment(text: str) -> str:
+def _split_plain_yaml_comment(text: str) -> tuple[str, str | None]:
     in_single = in_double = False
     escaped = False
     for index, char in enumerate(text):
@@ -1034,8 +1034,17 @@ def _strip_plain_yaml_comment(text: str) -> str:
             in_double = not in_double
             continue
         if char == "#" and not in_single and not in_double and (index == 0 or text[index - 1].isspace()):
-            return text[:index]
-    return text
+            return text[:index], text[index + 1:]
+    return text, None
+
+
+def _strip_plain_yaml_comment(text: str) -> str:
+    return _split_plain_yaml_comment(text)[0]
+
+
+def _plain_yaml_comment_fragment(text: str) -> str | None:
+    comment = _split_plain_yaml_comment(text)[1]
+    return comment.lstrip() if isinstance(comment, str) else None
 
 def _plain_yaml_indent(line: str) -> int | None:
     spaces = 0
@@ -1100,6 +1109,12 @@ def _is_structural_secret_ref_opener_line(line: str) -> bool:
         normalized = _strip_plain_yaml_comment(_unquote(match.group(2).strip())).rstrip(",").strip()
         return normalized in ("", "{", "[")
     return bool(re.fullmatch(r"\s*[\"']?secretRef[\"']?\s*:\s*(?:#.*)?", line))
+
+
+def _plain_yaml_secret_ref_comment_contains_credential(line: str) -> bool:
+    comment = _plain_yaml_comment_fragment(line)
+    return _is_credential_assignment(comment) if isinstance(comment, str) and comment else False
+
 
 def _is_credential_assignment(line: str) -> bool:
     match = _ASSIGNMENT_RE.match(line)
@@ -1266,13 +1281,17 @@ def scan_file(root: Path, relative_path: str) -> list[tuple[str, int, str]]:
     if b"\x00" in data[:_BINARY_PROBE_BYTES]:
         return []
     text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()
     findings = [(relative_path, number, rule_id)
-                for number, line in enumerate(text.splitlines(), start=1)
+                for number, line in enumerate(lines, start=1)
                 for rule_id in scan_line(line)]
     ref_findings, ref_validation_succeeded = _scan_json_compatible_ref_bindings(relative_path, text)
+    suffix = Path(relative_path).suffix
     if ref_validation_succeeded:
-        opener_lines = {number for number, line in enumerate(text.splitlines(), start=1)
-                        if _is_structural_secret_ref_opener_line(line)}
+        opener_lines = {number for number, line in enumerate(lines, start=1)
+                        if (_is_structural_secret_ref_opener_line(line)
+                            and not (suffix in _PLAIN_YAML_SCAN_SUFFIXES
+                                     and _plain_yaml_secret_ref_comment_contains_credential(line)))}
         findings = [finding for finding in findings
                     if not (finding[2] == "credential-assignment" and finding[1] in opener_lines)]
     findings += ref_findings
@@ -3430,6 +3449,9 @@ def _lifecycle_cli(kind: str, argv) -> int:
 _PENDING_SUBMITTED_TASK_CLEANUP_ATTR = "_pending_submitted_task_cleanup"
 _SUBMITTED_TASK_CLEANUP_WARNING = "eval warning: submitted Task cleanup failed while handling an earlier error"
 _SUBMITTED_TASK_CREATE_IDENTITY_ERROR = "Task submission did not return the expected created Task identity"
+_PARENT_TASK_READBACK_IDENTITY_ERROR = "terminal parent Task readback did not match the created Task identity"
+_CHILD_TASK_INVENTORY_IDENTITY_ERROR = "genuine child Task inventory did not provide a stable child identity"
+_CHILD_TASK_READBACK_IDENTITY_ERROR = "genuine child Task readback did not match the authenticated inventory identity"
 
 def _task_raw_resource_url(namespace: str, task_name: str) -> str:
     return ("/apis/core.orka.ai/v1alpha1/namespaces/"
@@ -3451,6 +3473,17 @@ def _validated_task_cleanup_binding(create_result, *, task_name: str, namespace:
             and created_namespace == namespace and isinstance(uid, str) and uid):
         raise CliError(_SUBMITTED_TASK_CREATE_IDENTITY_ERROR)
     return {"task_name": task_name, "namespace": namespace, "uid": uid}
+
+
+def _task_uid(task) -> str | None:
+    metadata = task.get("metadata") if isinstance(task, dict) else None
+    uid = metadata.get("uid") if isinstance(metadata, dict) else None
+    return uid if isinstance(uid, str) and uid else None
+
+
+def _require_task_uid_match(task, expected_uid: str, *, error_message: str) -> None:
+    if _task_uid(task) != expected_uid:
+        raise CliError(error_message)
 
 def _set_pending_submitted_task_cleanup(args, *, task_name: str, namespace: str, uid: str) -> None:
     setattr(args, _PENDING_SUBMITTED_TASK_CLEANUP_ATTR,
@@ -4153,6 +4186,7 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict]
     terminal_task = wait_for_terminal(
         lambda: get_task(task_name), max_attempts=args.max_poll_attempts,
         poll_interval_seconds=args.poll_interval_seconds)
+    _require_task_uid_match(terminal_task, cleanup_binding["uid"], error_message=_PARENT_TASK_READBACK_IDENTITY_ERROR)
     try:
         parent_result = get_task_result(args.journal_base_url, task_name, args.namespace, token=journal_token)
     except CliError:
@@ -4176,10 +4210,15 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict]
     child_terminal_tasks, child_results = [], {}
     for child in genuine_children:
         phase = (child.get("status") or {}).get("phase") if isinstance(child, dict) else None
-        child_name = (child.get("metadata") or {}).get("name") if isinstance(child, dict) else None
+        child_metadata = child.get("metadata") if isinstance(child, dict) else None
+        child_name = child_metadata.get("name") if isinstance(child_metadata, dict) else None
+        child_uid = child_metadata.get("uid") if isinstance(child_metadata, dict) else None
+        if not (isinstance(child_name, str) and child_name and isinstance(child_uid, str) and child_uid):
+            raise CliError(_CHILD_TASK_INVENTORY_IDENTITY_ERROR)
         child_terminal = child if phase in TASK_TERMINAL_PHASES else wait_for_terminal(
             lambda name=child_name: get_task(name), max_attempts=args.max_poll_attempts,
             poll_interval_seconds=args.poll_interval_seconds)
+        _require_task_uid_match(child_terminal, child_uid, error_message=_CHILD_TASK_READBACK_IDENTITY_ERROR)
         child_terminal_tasks.append(child_terminal)
         try:
             child_results[child_name] = get_task_result(args.journal_base_url, child_name, args.namespace,
@@ -4386,6 +4425,11 @@ def _eval_cli(argv) -> int:
         for receipt in receipts.values():
             _require(validate_evaluation_receipt(receipt) + find_prohibited_in_document(receipt, "receipt"))
             validated_receipts.append(receipt)
+        if cleanup is not None:
+            _clear_pending_submitted_task_cleanup(args)
+            deleted = _run_task_uid_precondition_delete(args, cleanup)
+            if deleted.returncode != 0:
+                raise CliError(f"Task cleanup failed (kubectl exited {deleted.returncode})")
         for receipt in validated_receipts:
             _write_json(Path(args.agent_dir) / "eval" / "receipts" / receipt["bundle_digest"] /
                         f"{receipt['case_id']}.json", receipt)
@@ -4394,10 +4438,6 @@ def _eval_cli(argv) -> int:
         raise
     finally:
         _clear_pending_submitted_task_cleanup(args)
-    if cleanup is not None:
-        deleted = _run_task_uid_precondition_delete(args, cleanup)
-        if deleted.returncode != 0:
-            raise CliError(f"Task cleanup failed (kubectl exited {deleted.returncode})")
     sys.stdout.write(_json_text(summary))
     return 0
 def main_render(argv=None) -> int: return _guard("render", _render_cli, argv)

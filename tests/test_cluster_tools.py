@@ -3068,6 +3068,30 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.assertFalse(report_path.exists())
         self._assert_required_composed_cases_missing(REFUSAL_DENIAL_CASE_ID, REFUSAL_REPORT_CASE_ID)
 
+    def test_live_same_digest_refusal_rerun_cleanup_conflict_leaves_required_receipts_missing(self):
+        refusal = "Delegation to not-allowed was refused."
+        self._configure_passing_required_refusal_cases()
+        self.seed_refusal_evidence()
+        self._set_refusal_result_evidence(refusal)
+        self.run_refusal_eval()
+        self._set_refusal_result_evidence(refusal)
+        self.assertEqual(agentctl.verify_agent(self.coordinator, "trial"), [])
+        bundle_digest = self.denial_receipt()["bundle_digest"]
+        denial_path = self._receipt_file(REFUSAL_DENIAL_CASE_ID, bundle_digest)
+        report_path = self._receipt_file(REFUSAL_REPORT_CASE_ID, bundle_digest)
+        parent_name = self.parent_tasks["refuses-unlisted"]["metadata"]["name"]
+        raw_delete_url = self._task_delete_raw_url(parent_name)
+        self.kubectl.failures.add(("delete", "--raw", raw_delete_url))
+
+        code, out, err = self.run_eval_main(REFUSAL_DENIAL_CASE_ID, self.root / "refuses-task.json")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("cleanup failed", err)
+        self.assertNotIn(SUBMITTED_TASK_CLEANUP_WARNING, err)
+        self.assertFalse(denial_path.exists())
+        self.assertFalse(report_path.exists())
+        self._assert_required_composed_cases_missing(REFUSAL_DENIAL_CASE_ID, REFUSAL_REPORT_CASE_ID)
+
     def test_reuse_evidence_rescores_without_cluster_side_effects_and_preserves_probe_hashes(self):
         first_summary = self.seed_refusal_evidence()
         raw_hashes = {
@@ -3815,6 +3839,64 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         })
         self.assertEqual(sorted((self.coordinator / "eval" / "receipts").rglob("*.json")), [])
 
+    def test_parent_task_uid_mismatch_fails_closed_before_result_journal_or_runtime_evidence(self):
+        parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
+        created = copy.deepcopy(self.parent_tasks["delegates"])
+        created["metadata"]["uid"] = "created-parent-uid"
+        replacement = copy.deepcopy(self.parent_tasks["delegates"])
+        replacement["metadata"]["uid"] = "replacement-parent-uid"
+        self.kubectl.responses[("create", "Task", parent_name)] = created
+        self.kubectl.responses[("task", parent_name)] = replacement
+        raw_delete_url = self._task_delete_raw_url(parent_name)
+        self.kubectl.failures.add(("delete", "--raw", raw_delete_url))
+
+        code, out, err = self.run_eval_main("delegates", self.root / "delegates-task.json")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("eval failed: terminal parent Task readback did not match the created Task identity", err)
+        self.assertIn(SUBMITTED_TASK_CLEANUP_WARNING, err)
+        self.assertEqual(self.http_calls, [])
+        delete_argv, delete_kwargs = self._raw_task_delete_call()
+        self.assertEqual(delete_argv, [
+            "kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "--raw",
+            raw_delete_url, "-f", "-",
+        ])
+        self.assertEqual(json.loads(delete_kwargs["input"]), {
+            "apiVersion": "meta.k8s.io/v1",
+            "kind": "DeleteOptions",
+            "preconditions": {"uid": "created-parent-uid"},
+        })
+        self.assertFalse((self.evidence / "delegates" / "terminal-task.json").exists())
+        self.assertEqual(sorted((self.coordinator / "eval" / "receipts").rglob("*.json")), [])
+
+    def test_nonterminal_genuine_child_uid_mismatch_fails_closed_before_child_result_or_journal(self):
+        parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
+        child_name = self.child_task["metadata"]["name"]
+        running_child = copy.deepcopy(self.child_task)
+        running_child["metadata"]["uid"] = "child-inventory-uid"
+        running_child["status"] = {"phase": "Running", "startTime": self.child_task["status"]["startTime"]}
+        replacement_child = copy.deepcopy(self.child_task)
+        replacement_child["metadata"]["uid"] = "child-replacement-uid"
+        self.kubectl.responses[("task", child_name)] = replacement_child
+        self._set_delegate_result_evidence(self._delegate_events(), child_items=[running_child])
+
+        code, out, err = self.run_eval_main("delegates", self.root / "delegates-task.json")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("eval failed: genuine child Task readback did not match the authenticated inventory identity", err)
+        self.assertFalse(any(child_name in url for url, _, _ in self.http_calls if "/result?" in url or "/events?" in url))
+        delete_argv, delete_kwargs = self._raw_task_delete_call()
+        self.assertEqual(delete_argv, [
+            "kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "--raw",
+            self._task_delete_raw_url(parent_name), "-f", "-",
+        ])
+        self.assertEqual(json.loads(delete_kwargs["input"]), {
+            "apiVersion": "meta.k8s.io/v1",
+            "kind": "DeleteOptions",
+            "preconditions": {"uid": self.parent_tasks["delegates"]["metadata"]["uid"]},
+        })
+        self.assertEqual(sorted((self.coordinator / "eval" / "receipts").rglob("*.json")), [])
+
     def test_post_submit_receipt_validation_failure_cleans_up_and_cleanup_failures_do_not_mask_it(self):
         parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
         raw_delete_url = self._task_delete_raw_url(parent_name)
@@ -3895,7 +3977,44 @@ class ComposedEvalCliTestCase(unittest.TestCase):
                 "eval failed: synthetic validation failure",
             )
 
-    def test_parent_task_cleanup_failure_returns_nonzero_after_writing_receipt(self):
+    def test_successful_eval_cleans_up_before_writing_receipt(self):
+        parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
+        self._set_delegate_result_evidence(self._delegate_events())
+        order = []
+        original_write_json = agentctl._write_json
+        original_run_kubectl = agentctl.run_kubectl
+
+        def recording_write_json(path, data):
+            if "/eval/receipts/" in Path(path).as_posix():
+                order.append(("receipt", Path(path).as_posix()))
+            return original_write_json(path, data)
+
+        def recording_run_kubectl(context, kubeconfig, args, *, input=None, timeout=60):
+            if args[:2] == ["delete", "--raw"]:
+                order.append(("delete", tuple(args)))
+            return original_run_kubectl(context, kubeconfig, args, input=input, timeout=timeout)
+
+        with mock.patch.object(agentctl, "_write_json", recording_write_json), \
+                mock.patch.object(agentctl, "run_kubectl", recording_run_kubectl):
+            summary = self.run_eval("delegates", self.root / "delegates-task.json")
+        self.assertEqual(summary["verdict"], "pass")
+        self.assertLess(
+            next(index for index, item in enumerate(order) if item[0] == "delete"),
+            next(index for index, item in enumerate(order) if item[0] == "receipt"),
+        )
+        delete_argv, delete_kwargs = self._raw_task_delete_call()
+        self.assertEqual(delete_argv, [
+            "kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "--raw",
+            self._task_delete_raw_url(parent_name), "-f", "-",
+        ])
+        self.assertEqual(json.loads(delete_kwargs["input"]), {
+            "apiVersion": "meta.k8s.io/v1",
+            "kind": "DeleteOptions",
+            "preconditions": {"uid": self.parent_tasks["delegates"]["metadata"]["uid"]},
+        })
+        self.assertEqual(self.receipt("delegates")["verdict"], "pass")
+
+    def test_parent_task_cleanup_failure_returns_nonzero_without_writing_receipt(self):
         parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
         self.pages_by_task[parent_name] = [{"events": [
             {"seq": 1, "type": "ToolCallStarted", "toolCallID": "call-1", "toolName": "delegate_task",
@@ -3917,6 +4036,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(out, "")
         self.assertIn("cleanup failed", err)
+        self.assertNotIn(SUBMITTED_TASK_CLEANUP_WARNING, err)
         self.assertNotIn(raw_delete_url, err)
         self.assertNotIn(self.parent_tasks["delegates"]["metadata"]["uid"], err)
         delete_argv, delete_kwargs = self._raw_task_delete_call()
@@ -3929,7 +4049,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             "kind": "DeleteOptions",
             "preconditions": {"uid": self.parent_tasks["delegates"]["metadata"]["uid"]},
         })
-        self.assertEqual(self.receipt("delegates")["verdict"], "pass")
+        self.assertEqual(sorted((self.coordinator / "eval" / "receipts").rglob("*.json")), [])
         self.assertTrue((self.evidence / "delegates" / "terminal-task.json").is_file())
 
 

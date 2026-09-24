@@ -177,6 +177,33 @@ class ScanFileTestCase(unittest.TestCase):
         )
         self.assertEqual(agentctl.scan_file(self.root, "provider.yaml"), [])
 
+    def test_valid_yaml_secret_ref_comment_sensitive_assignment_retains_credential_finding(self):
+        self._write_lines(
+            "provider.yaml",
+            "spec:",
+            "  secret" + "Ref: # password = literal",
+            "    name: provider-key",
+        )
+        self.assertEqual(agentctl.scan_file(self.root, "provider.yaml"), [("provider.yaml", 2, "credential-assignment")])
+
+    def test_valid_yaml_secret_ref_quoted_hash_comment_is_benign(self):
+        self._write_lines(
+            "provider.yaml",
+            "spec:",
+            "  secret" + "Ref: # \"# password = literal\"",
+            "    name: provider-key",
+        )
+        self.assertEqual(agentctl.scan_file(self.root, "provider.yaml"), [])
+
+    def test_valid_yaml_secret_ref_ordinary_comment_is_suppressed(self):
+        self._write_lines(
+            "provider.yaml",
+            "spec:",
+            "  secret" + "Ref: # ordinary note",
+            "    name: provider-key",
+        )
+        self.assertEqual(agentctl.scan_file(self.root, "provider.yaml"), [])
+
     def test_plain_yaml_secret_ref_shape_reports_invalid_blocks_by_position_only(self):
         cases = (
             ("malformed", [
