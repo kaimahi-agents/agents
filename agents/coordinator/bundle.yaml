@@ -1,0 +1,78 @@
+{
+  "apiVersion": "v1",
+  "items": [
+    {
+      "apiVersion": "core.orka.ai/v1alpha1",
+      "kind": "Agent",
+      "metadata": {
+        "labels": {
+          "environment": "production",
+          "kaimahi.dev/agent": "coordinator",
+          "kaimahi.dev/environment": "production"
+        },
+        "name": "coordinator",
+        "namespace": "orka-system"
+      },
+      "spec": {
+        "coordination": {
+          "allowedAgents": [
+            {
+              "name": "hello"
+            }
+          ],
+          "enabled": true,
+          "maxConcurrentChildren": 1,
+          "maxDepth": 1
+        },
+        "model": {
+          "maxTokens": 512,
+          "name": "gpt-5.6-terra"
+        },
+        "providerRef": {
+          "name": "coordinator-azure-openai",
+          "namespace": "orka-system"
+        },
+        "systemPrompt": {
+          "inline": "Delegate only to hello and report refusals truthfully."
+        },
+        "tools": [
+          {
+            "enabled": true,
+            "name": "delegate_task"
+          },
+          {
+            "enabled": true,
+            "name": "wait_for_tasks"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "core.orka.ai/v1alpha1",
+      "kind": "Provider",
+      "metadata": {
+        "labels": {
+          "environment": "production",
+          "kaimahi.dev/agent": "coordinator",
+          "kaimahi.dev/environment": "production"
+        },
+        "name": "coordinator-azure-openai",
+        "namespace": "orka-system"
+      },
+      "spec": {
+        "azure": {
+          "apiVersion": "2025-03-01-preview",
+          "deploymentName": "gpt-5.6-terra"
+        },
+        "baseURL": "https://orka-open-ai.openai.azure.com/",
+        "defaultModel": "gpt-5.6-terra",
+        "secretRef": {
+          "key": "api-key",
+          "name": "coordinator-azure-openai"
+        },
+        "type": "azure-openai"
+      }
+    }
+  ],
+  "kind": "List"
+}

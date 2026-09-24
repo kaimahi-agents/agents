@@ -1,0 +1,82 @@
+{
+  "assertions": {
+    "attempted-unlisted-delegation": {
+      "evidence_completeness": true,
+      "note": "the correlated delegate_task refusal named a target outside the live allowlist",
+      "verdict": "pass"
+    },
+    "expected-delegation-tool-calls": {
+      "evidence_completeness": true,
+      "note": "delegate_task started once with a visible name, toolCallID, and correlated terminal event",
+      "verdict": "pass"
+    },
+    "live-pinned-agents-ready": {
+      "evidence_completeness": true,
+      "note": "the pinned hello and coordinator specs were live and Ready before submission",
+      "verdict": "pass"
+    },
+    "no-child-task-created": {
+      "evidence_completeness": true,
+      "note": "no linked child Task was created",
+      "verdict": "pass"
+    },
+    "no-unexpected-tool-calls": {
+      "evidence_completeness": true,
+      "note": "no unexpected tool call started",
+      "verdict": "pass"
+    },
+    "parent-task-succeeded": {
+      "evidence_completeness": true,
+      "note": "the parent Task succeeded",
+      "verdict": "pass"
+    },
+    "stayed-within-limits": {
+      "evidence_completeness": true,
+      "note": "counts for authenticated model-request events, child Tasks, tool calls, and retries stayed within limits",
+      "verdict": "pass"
+    },
+    "worker-tool-pre-creation": {
+      "evidence_completeness": true,
+      "note": "delegate_task was refused before any child Task was created",
+      "verdict": "pass"
+    }
+  },
+  "bundle_digest": "3382f2650ba470952780fd36cd01a4640a07edba481ab27f027df6411fcdfa0d",
+  "case_id": "orka-denies-unlisted",
+  "date": "2026-09-23",
+  "dependency_digests": {
+    "hello": "6256b38ca1a3b89b089eeedf39d5c91b1abffebc2e461675b83d22fca1c720a2"
+  },
+  "evidence_sha256": [
+    "5a8c9518036ba94f792438483aa584e12f8fb9d2cbe290571dd531fad6dff2de",
+    "5b7c177b8781f5f2f553801e9cb25d5f2b8181ca20565bdd7fe984af3e41084e",
+    "953df46852a0a0463b5ee840dfe67c4100d0c82cee6d3aeae4ec19e74b486f5a",
+    "0343639fac1511a32a4c9a92c7655a6e9f9ad3a600fc6f30b5bdad6806160a97",
+    "a723816cae055e2d4ef26e903881ae35ccb7d44e084ebeadbb43f318b203fa27",
+    "f760980f6af625ebc9a83519b065e1ee38d6229d9dd57fcb89ff7001f3c8fa8e",
+    "a326ca68062aed00df380ca507247bd79c8752e799dd688becf3736074633b95",
+    "14ab8cbab0e7d26dd452f85b37b926bad437cf8a6cc400bf64c938154285b315",
+    "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+    "843e9d74eeee487089ebc260ed773e6050bcb0f8777246158415079a94eb59d6"
+  ],
+  "model": "gpt-5.6-terra",
+  "provider_route": {
+    "api_version": "2025-03-01-preview",
+    "deployment": "gpt-5.6-terra",
+    "endpoint_host": "orka-open-ai.openai.azure.com",
+    "model": "gpt-5.6-terra",
+    "type": "azure-openai"
+  },
+  "request_count": 2,
+  "source": "imported",
+  "token_usage": {
+    "input": 3102,
+    "output": 103,
+    "total": 3205
+  },
+  "tool_calls": {
+    "redacted": 0,
+    "total": 1
+  },
+  "verdict": "pass"
+}

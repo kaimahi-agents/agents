@@ -1,0 +1,93 @@
+{
+  "assertions": {
+    "child-result-contained-fixed-phrase": {
+      "evidence_completeness": true,
+      "note": "the authenticated child result matched the fixed phrase ignoring terminal sentence punctuation",
+      "verdict": "pass"
+    },
+    "child-targeted-hello": {
+      "evidence_completeness": true,
+      "note": "the genuine child targeted hello",
+      "verdict": "pass"
+    },
+    "child-task-succeeded": {
+      "evidence_completeness": true,
+      "note": "the genuine child Task succeeded",
+      "verdict": "pass"
+    },
+    "exactly-one-child-task": {
+      "evidence_completeness": true,
+      "note": "exactly one linked child Task was captured and it was genuine",
+      "verdict": "pass"
+    },
+    "expected-delegation-tool-calls": {
+      "evidence_completeness": true,
+      "note": "delegate_task and wait_for_tasks each started once with visible names, toolCallIDs, and correlated terminal events",
+      "verdict": "pass"
+    },
+    "live-pinned-agents-ready": {
+      "evidence_completeness": true,
+      "note": "the pinned hello and coordinator specs were live and Ready before submission",
+      "verdict": "pass"
+    },
+    "no-unexpected-tool-calls": {
+      "evidence_completeness": true,
+      "note": "no unexpected tool call started",
+      "verdict": "pass"
+    },
+    "parent-result-contained-fixed-phrase": {
+      "evidence_completeness": true,
+      "note": "the authenticated parent result contained the authenticated child result",
+      "verdict": "pass"
+    },
+    "parent-task-succeeded": {
+      "evidence_completeness": true,
+      "note": "the parent Task succeeded",
+      "verdict": "pass"
+    },
+    "stayed-within-limits": {
+      "evidence_completeness": true,
+      "note": "counts for authenticated model-request events, child Tasks, tool calls, and retries stayed within limits",
+      "verdict": "pass"
+    }
+  },
+  "bundle_digest": "f5228cca5d6c63c7baa3bf9920e4000012888190a6a49bdc21cdd9037817153a",
+  "case_id": "delegates",
+  "date": "2026-09-23",
+  "dependency_digests": {
+    "hello": "6256b38ca1a3b89b089eeedf39d5c91b1abffebc2e461675b83d22fca1c720a2"
+  },
+  "evidence_sha256": [
+    "6ef7088013d70abee5158fe17b4fce269c734e38376d6a7da3fa922612113430",
+    "0bc7aa3632ce0e4d4d3df5cc4afe7cccfd73b9fca7e799687690aa9efc2df79f",
+    "a596ff94025373f3ae0988f9185f61f1a39d877fe866fc89a512c45885104512",
+    "d6b5280209daa709e6e1287c768b74e2ccec8703521cbe3862e0a849f732fd75",
+    "8d33f42065b61599bd072ffad52b19dae4c9160f12fea1eb13253ca34bdd7ee3",
+    "1d4c94809a66361b416ef59957ad1ec3ec3b375ee0c9fb11135f2330182a147a",
+    "9b1a05620c19bd25e35540ec627d4f5c892a393460af86ff41d09cbc9a71700c",
+    "591dd0eadf4d9c17ffc8872b57dc8927f08f088a57c7449c690b027a6b076266",
+    "8b19c9f7b2a8ab3b7403019691d27851dc38c833813d24b91111a5f2ee488bd9",
+    "388e0bbb6cbf71ed16c624d657c06c99225bab7ad1617054b89d7f92e1a91c15",
+    "843e9d74eeee487089ebc260ed773e6050bcb0f8777246158415079a94eb59d6"
+  ],
+  "model": "gpt-5.6-terra",
+  "provider_route": {
+    "api_version": "2025-03-01-preview",
+    "deployment": "gpt-5.6-terra",
+    "endpoint_host": "orka-open-ai.openai.azure.com",
+    "model": "gpt-5.6-terra",
+    "type": "azure-openai"
+  },
+  "request_count": 4,
+  "source": "live",
+  "token_usage": {
+    "input": 4944,
+    "output": 90,
+    "total": 5034
+  },
+  "tool_calls": {
+    "redacted": 0,
+    "total": 2
+  },
+  "verdict": "pass"
+}

@@ -1,0 +1,41 @@
+{
+  "apiVersion": "core.orka.ai/v1alpha1",
+  "kind": "Agent",
+  "metadata": {
+    "name": "coordinator",
+    "namespace": "orka-system"
+  },
+  "spec": {
+    "providerRef": {
+      "name": "coordinator-azure-openai",
+      "namespace": "orka-system"
+    },
+    "model": {
+      "name": "gpt-5.6-terra",
+      "maxTokens": 512
+    },
+    "systemPrompt": {
+      "inline": "Delegate only to hello and report refusals truthfully."
+    },
+    "coordination": {
+      "enabled": true,
+      "allowedAgents": [
+        {
+          "name": "hello"
+        }
+      ],
+      "maxDepth": 1,
+      "maxConcurrentChildren": 1
+    },
+    "tools": [
+      {
+        "name": "delegate_task",
+        "enabled": true
+      },
+      {
+        "name": "wait_for_tasks",
+        "enabled": true
+      }
+    ]
+  }
+}

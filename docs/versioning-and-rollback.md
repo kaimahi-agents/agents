@@ -18,11 +18,21 @@ A changed agent can merge only when every required case has a passing receipt
 for the new digest. CI renders the bundle and checks those receipts offline. It
 never contacts a cluster.
 
+For coordinating native agents, `dependencies.lock.yaml.catalogueAgents` is a
+catalogue/promotion pin, not immutable runtime binding: CI rerenders each
+pinned child per environment, requires the coordinator lock to match
+`allowedAgents`, and expands the reverse-dependent gate so a changed child also
+re-verifies every pinned coordinator that depends on it. That proves the
+catalogue pair is promoted together, but not that an already-running native
+Task is frozen to one child revision.
+
 ## Deploy and roll back
 
-`tools/deploy` applies the rendered bundle. It reads the Agent, prompt, runtime
-selection, memory count, and proposal count back from the cluster, then writes
-a deploy receipt.
+`tools/deploy` applies the rendered bundle. In monitored-runtime mode it reads
+the Agent, prompt, runtime selection, memory count, and proposal count back
+from the cluster, then writes a deploy receipt. In native-composition mode it
+applies the pinned child and coordinator bundles, then verifies both live Agent
+definitions and Ready conditions before writing the receipt.
 
 Rollback is `git revert`. Reverting restores the earlier behavior inputs, so the
 digest returns to its earlier value. Its test receipts already exist and the
@@ -41,9 +51,12 @@ tools/rollback-verify \
 ```
 
 Rollback does not undo work already published outside the cluster. It does not
-restore the Agent object's UID or generation. Memory is checked against its
-baseline instead of being rewritten. Work already running finishes on the
-version Orka pinned when it dispatched the Task.
+restore the Agent object's UID or generation. In monitored-runtime mode, memory
+is checked against its baseline instead of being rewritten. In
+native-composition mode, rollback verifies the restored live pinned child and
+coordinator definitions plus their Ready conditions. It does not move work
+already running, and it does not guarantee that a later delegation will use a
+frozen child revision.
 
 ## Worked example
 

@@ -10,7 +10,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tests.fixtures import PROMPT_TEXT, acceptance_block, write_agent, write_json, write_native_agent  # noqa: E402
+from tests.fixtures import (  # noqa: E402
+    AZURE_ENDPOINT,
+    AZURE_HOST,
+    PROMPT_TEXT,
+    acceptance_block,
+    write_agent,
+    write_azure_native_coordinator,
+    write_json,
+    write_native_agent,
+    write_native_coordinator,
+)
 from tools import agentctl  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -20,6 +30,28 @@ POLICY_CASE = {"case_id": "toolchain-unavailable", "environment": "trial", "case
               "required": False, "policy": agentctl.MISSING_TOOLCHAIN_POLICY,
               "assertions": sorted(agentctl.MISSING_TOOLCHAIN_ASSERTIONS),
               "limits": dict(agentctl.MISSING_TOOLCHAIN_LIMITS)}
+COMPOSED_POLICY_CASES = (
+    {"case_id": "delegates", "environment": "trial", "case_sha256": "a" * 64, "required": False,
+     "policy": "composed-coordination-v1",
+     "assertions": ["live-pinned-agents-ready", "parent-task-succeeded", "expected-delegation-tool-calls",
+                    "no-unexpected-tool-calls", "exactly-one-child-task", "child-targeted-hello",
+                    "child-task-succeeded", "child-result-contained-fixed-phrase",
+                    "parent-result-contained-fixed-phrase", "stayed-within-limits"],
+     "limits": {"provider_requests": 10, "tool_calls": 2, "child_tasks": 1, "retries": 0}},
+    {"case_id": "orka-denies-unlisted", "environment": "trial", "case_sha256": "a" * 64, "required": False,
+     "policy": "composed-coordination-v1",
+     "assertions": ["live-pinned-agents-ready", "parent-task-succeeded", "expected-delegation-tool-calls",
+                    "attempted-unlisted-delegation", "worker-tool-pre-creation", "no-child-task-created",
+                    "no-unexpected-tool-calls", "stayed-within-limits"],
+     "limits": {"provider_requests": 10, "tool_calls": 1, "child_tasks": 0, "retries": 0}},
+    {"case_id": "coordinator-reports-denial", "environment": "trial", "case_sha256": "a" * 64, "required": False,
+     "policy": "composed-coordination-v1",
+     "assertions": ["live-pinned-agents-ready", "parent-task-succeeded", "expected-delegation-tool-calls",
+                    "no-child-task-created", "no-unexpected-tool-calls",
+                    "parent-result-named-requested-agent", "parent-result-reported-refusal",
+                    "stayed-within-limits"],
+     "limits": {"provider_requests": 10, "tool_calls": 1, "child_tasks": 0, "retries": 0}},
+)
 
 
 class RenderTestCase(unittest.TestCase):
@@ -58,6 +90,103 @@ class RenderTestCase(unittest.TestCase):
                    {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "hello-settings"}})
         self.assertNotEqual(agentctl.render_agent(native, "trial", self.root / "added.yaml")["bundle_digest"],
                             baseline)
+
+    def test_azure_route_rejects_explicit_model_temperature(self):
+        coordinator = write_azure_native_coordinator(self.root / "azure-coordinator")
+        agent_path = coordinator / "resources" / "agent.yaml"
+        agent = json.loads(agent_path.read_text(encoding="utf-8"))
+        agent["spec"]["model"]["temperature"] = 0
+        write_json(agent_path, agent)
+        with self.assertRaises(agentctl.BundleError) as caught:
+            agentctl.render_agent(coordinator, "trial", self.root / "never.yaml")
+        self.assertIn("spec.model.temperature", str(caught.exception))
+
+    def test_current_public_safe_azure_route_renders(self):
+        coordinator = write_azure_native_coordinator(self.root / "azure-coordinator")
+        agentctl.render_agent(coordinator, "trial", self.root / "azure-coordinator.yaml")
+
+    def test_duplicate_matching_embedded_providers_raise_a_fixed_safe_error_regardless_of_file_order(self):
+        duplicate_message = "resources/ must not contain more than one embedded Provider matching the Agent providerRef"
+        cases = (
+            ("hostile-current-safe-later-duplicate", "z-provider.yaml", "https://127.0.0.1/", AZURE_ENDPOINT),
+            ("safe-current-hostile-earlier-duplicate", "a-provider.yaml", AZURE_ENDPOINT, "https://127.0.0.1/"),
+        )
+        for label, duplicate_file, current_url, duplicate_url in cases:
+            with self.subTest(case=label):
+                coordinator = write_azure_native_coordinator(self.root / label)
+                provider_path = coordinator / "resources" / "provider.yaml"
+                current = json.loads(provider_path.read_text(encoding="utf-8"))
+                current["spec"]["baseURL"] = current_url
+                duplicate = json.loads(provider_path.read_text(encoding="utf-8"))
+                duplicate["spec"]["baseURL"] = duplicate_url
+                write_json(provider_path, current)
+                write_json(coordinator / "resources" / duplicate_file, duplicate)
+                with self.assertRaises(agentctl.BundleError) as caught:
+                    agentctl.render_agent(coordinator, "trial", self.root / f"{label}.yaml")
+                self.assertEqual(str(caught.exception), duplicate_message)
+                self.assertNotIn("baseURL", str(caught.exception))
+                self.assertNotIn("127.0.0.1", str(caught.exception))
+
+    def test_two_safe_duplicate_matching_embedded_providers_are_rejected(self):
+        duplicate_message = "resources/ must not contain more than one embedded Provider matching the Agent providerRef"
+        coordinator = write_azure_native_coordinator(self.root / "azure-duplicate-safe")
+        provider_path = coordinator / "resources" / "provider.yaml"
+        duplicate = json.loads(provider_path.read_text(encoding="utf-8"))
+        write_json(coordinator / "resources" / "a-provider.yaml", duplicate)
+        with self.assertRaises(agentctl.BundleError) as caught:
+            agentctl.render_agent(coordinator, "trial", self.root / "never.yaml")
+        self.assertEqual(str(caught.exception), duplicate_message)
+
+    def test_unrelated_embedded_providers_do_not_count_toward_the_single_match(self):
+        coordinator = write_azure_native_coordinator(self.root / "azure-unrelated-provider")
+        provider_path = coordinator / "resources" / "provider.yaml"
+        unrelated = json.loads(provider_path.read_text(encoding="utf-8"))
+        unrelated["metadata"]["name"] = "other-provider"
+        unrelated["spec"]["baseURL"] = "https://127.0.0.1/"
+        write_json(coordinator / "resources" / "a-unrelated-provider.yaml", unrelated)
+        agentctl.render_agent(coordinator, "trial", self.root / "azure-unrelated-provider.yaml")
+
+    def test_azure_route_requires_a_public_openai_resource_subdomain_endpoint(self):
+        coordinator = write_azure_native_coordinator(self.root / "azure-coordinator")
+        provider_path = coordinator / "resources" / "provider.yaml"
+        provider = json.loads(provider_path.read_text(encoding="utf-8"))
+        variants = (
+            "https://openai.azure.com/",
+            "https://" + AZURE_HOST + ".example.com/",
+            "https://127.0.0.1/",
+            "https://localhost/",
+            "https://" + AZURE_HOST + ":443/",
+            AZURE_ENDPOINT + "deployments",
+        )
+        for base_url in variants:
+            with self.subTest(base_url=base_url):
+                provider["spec"]["baseURL"] = base_url
+                write_json(provider_path, provider)
+                with self.assertRaises(agentctl.BundleError) as caught:
+                    agentctl.render_agent(coordinator, "trial", self.root / "never.yaml")
+                self.assertIn("baseURL", str(caught.exception))
+                provider["spec"]["baseURL"] = AZURE_ENDPOINT
+                write_json(provider_path, provider)
+
+    def test_non_azure_route_may_retain_explicit_model_temperature(self):
+        coordinator = write_native_coordinator(self.root / "local-coordinator")
+        write_json(coordinator / "resources" / "provider.yaml",
+                   {"apiVersion": "core.orka.ai/v1alpha1", "kind": "Provider",
+                    "metadata": {"name": "hello", "namespace": "trial-namespace"},
+                    "spec": {"type": "openai",
+                             "secret" + "Ref": {"name": "hello", "key": "api-key"},
+                             "defaultModel": "qwen2.5:3b"}})
+        agentctl.render_agent(coordinator, "trial", self.root / "local-coordinator.yaml")
+        rendered = json.loads((self.root / "local-coordinator.yaml").read_text(encoding="utf-8"))
+        agent = next(item for item in rendered["items"] if item["kind"] == "Agent")
+        provider = next(item for item in rendered["items"] if item["kind"] == "Provider")
+        resolved_agent, resolved_provider, provider_name, provider_namespace = agentctl._resolve_rendered_coordinator_provider(
+            rendered)
+        self.assertEqual(resolved_agent, agent)
+        self.assertEqual(resolved_provider, provider)
+        self.assertEqual((provider_name, provider_namespace), ("hello", "trial-namespace"))
+        self.assertIsNone(agentctl._rendered_azure_provider_route(rendered))
+        self.assertEqual(agent["spec"]["model"]["temperature"], 0)
 
     def test_resource_directory_rejects_misplaced_files_and_subdirectories(self):
         for relative in ("resources/provider.yml", "resources/nested/provider.yaml"):
@@ -217,6 +346,13 @@ class RenderTestCase(unittest.TestCase):
         (self.agent / "eval" / "policies" / "missing-toolchain.md").write_text("policy text\n", encoding="utf-8")
         self.assertEqual(self.render(name="unreferenced.yaml")["bundle_digest"], baseline)
 
+    def test_an_unreferenced_composed_policy_file_never_affects_the_digest(self):
+        baseline = self.render()["bundle_digest"]
+        (self.agent / "eval" / "policies").mkdir(parents=True, exist_ok=True)
+        (self.agent / "eval" / "policies" / "composed-coordination.md").write_text("policy text\n",
+                                                                                           encoding="utf-8")
+        self.assertEqual(self.render(name="unreferenced-composed.yaml")["bundle_digest"], baseline)
+
     def test_a_declared_policy_requires_its_policy_file_to_render(self):
         (self.agent / "eval" / "acceptance.md").write_text(acceptance_block(POLICY_CASE), encoding="utf-8")
         with self.assertRaises(agentctl.BundleError):
@@ -231,6 +367,23 @@ class RenderTestCase(unittest.TestCase):
         self.assertNotEqual(with_policy, baseline)
         (self.agent / "eval" / "policies" / "missing-toolchain.md").write_text("different text\n", encoding="utf-8")
         self.assertNotEqual(self.render(name="changed-policy.yaml")["bundle_digest"], with_policy)
+
+    def test_a_declared_composed_policy_requires_its_policy_file_to_render(self):
+        (self.agent / "eval" / "acceptance.md").write_text(acceptance_block(*COMPOSED_POLICY_CASES), encoding="utf-8")
+        with self.assertRaises(agentctl.BundleError):
+            self.render(name="missing-composed-policy.yaml")
+
+    def test_declaring_the_composed_policy_changes_the_digest(self):
+        baseline = self.render()["bundle_digest"]
+        (self.agent / "eval" / "policies").mkdir(parents=True, exist_ok=True)
+        (self.agent / "eval" / "policies" / "composed-coordination.md").write_text("policy text\n",
+                                                                                           encoding="utf-8")
+        (self.agent / "eval" / "acceptance.md").write_text(acceptance_block(*COMPOSED_POLICY_CASES), encoding="utf-8")
+        with_policy = self.render(name="with-composed-policy.yaml")["bundle_digest"]
+        self.assertNotEqual(with_policy, baseline)
+        (self.agent / "eval" / "policies" / "composed-coordination.md").write_text("different text\n",
+                                                                                           encoding="utf-8")
+        self.assertNotEqual(self.render(name="changed-composed-policy.yaml")["bundle_digest"], with_policy)
 
     def test_the_missing_toolchain_policy_requires_the_exact_bound_limits(self):
         for limits in ({"provider_requests": 10, "tool_calls": 5}, {"provider_requests": 9, "tool_calls": 4}, {}):
