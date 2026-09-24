@@ -99,6 +99,7 @@ REFUSAL_PROMPT = "Attempt to delegate to not-allowed. If Orka refuses, report th
 ALLOWLIST_DENIAL_SUMMARY = 'agent "orka-system/not-allowed" is not in the allowed agents list'
 LIVE_OMITTED_ALLOWLIST_DENIAL_SUMMARY = ALLOWLIST_DENIAL_SUMMARY
 LEGACY_LIVE_OMITTED_ALLOWLIST_DENIAL_SUMMARY = 'agent "orka-system/not-allowed-agent" is not in the allowed agents list'
+ALLOWLIST_PROBE_WARNING = "eval warning: controller allowlist probe failed; continuing without informational observation"
 
 
 def provider_rows(count, minute="01"):
@@ -2257,6 +2258,46 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.results_by_task = {parent_name: result_text}
         self.child_inventory = {"items": [] if child_items is None else child_items}
 
+    def _configure_passing_refusal_probe_evidence(self):
+        self._configure_passing_required_refusal_cases()
+        self._set_refusal_result_evidence(
+            "Delegation to not-allowed was refused.",
+            visible_arguments=True,
+            failed_events=[self._failed_delegate_event('agent "not-allowed" is not in the allowed agents list')],
+        )
+
+    def _assert_probe_failure_is_informational(self, *, expected_delete_count: int):
+        code, out, err = self.run_eval_main(REFUSAL_DENIAL_CASE_ID, self.root / "refuses-task.json")
+        self.assertEqual(code, 0)
+        summary = json.loads(out)
+        denial = self.denial_receipt()
+        report = self.report_receipt()
+        evidence_files = [
+            path for path in sorted((self.evidence / "refuses-unlisted").glob("*.json"))
+            if not path.name.startswith("controller-allowlist-probe-")
+        ]
+        expected_evidence_digests = {agentctl.sha256_hex(path.read_bytes()) for path in evidence_files}
+        self.assertEqual(err, ALLOWLIST_PROBE_WARNING + "\n")
+        self.assertNotIn(self.probe_agent_name, err)
+        self.assertNotIn(self.probe_task_name, err)
+        self.assertNotIn("kubectl exited 1", err)
+        self.assertEqual(summary["verdict"], "pass")
+        self.assertEqual(denial["verdict"], "pass")
+        self.assertEqual(report["verdict"], "pass")
+        self.assertNotIn("observations", denial)
+        self.assertNotIn("observations", report)
+        self.assertEqual(set(denial["evidence_sha256"]), expected_evidence_digests)
+        self.assertEqual(set(report["evidence_sha256"]), expected_evidence_digests)
+        self.assertEqual(self.kubectl.verbs().count("delete"), expected_delete_count)
+        self.assertEqual(agentctl.verify_agent(self.coordinator, "trial"), [])
+        ledger = json.loads((self.evidence / "campaign-ledger.json").read_text(encoding="utf-8"))
+        self.assertEqual(ledger, {"entries": [
+            {"case": "refuses-unlisted", "attempt": 1, "parent_count": 1,
+             "child_count": 0, "actual_child_count": 0, "probe_count": 0, "cumulative_total": 1},
+            {"case": "controller-allowlist-pre-dispatch", "attempt": 1, "parent_count": 0,
+             "child_count": 0, "probe_count": 1, "cumulative_total": 2},
+        ]})
+
     def _assert_refusal_assertions_fail_without_allowlist_denial(self, *, visible_arguments: bool, failed_events):
         refusal = ("The agent 'not-allowed-agent' was refused because it is not in the list of allowed agents. "
                    "The task has been reported as refused due to this restriction.")
@@ -2711,6 +2752,20 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             ["kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "task", parent_name,
              "-n", NAMESPACE, "--ignore-not-found"],
         ])
+
+    def test_live_refusal_probe_failures_become_informational_after_evidence_capture(self):
+        cases = (
+            ("create", lambda: self.kubectl.failures.add(("create", "Agent", self.probe_agent_name)), 1),
+            ("readback", lambda: self.kubectl.responses[("agents.core.orka.ai", self.probe_agent_name)].__setitem__(
+                "status", {"conditions": [{"type": "Ready", "status": "False", "observedGeneration": 1}]}), 2),
+            ("cleanup", lambda: self.kubectl.failures.add(("delete", "task", self.probe_task_name)), 3),
+        )
+        for label, arrange, expected_delete_count in cases:
+            with self.subTest(case=label):
+                self.setUp()
+                self._configure_passing_refusal_probe_evidence()
+                arrange()
+                self._assert_probe_failure_is_informational(expected_delete_count=expected_delete_count)
 
     def test_controller_allowlist_same_digest_rerun_preserves_existing_observation(self):
         parent_name = self.parent_tasks["refuses-unlisted"]["metadata"]["name"]

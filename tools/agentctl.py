@@ -1004,11 +1004,63 @@ _SENSITIVE_KEYS = ("password", "passwd", "pwd", "secret", "apikey", "api_key", "
 _PLACEHOLDERS = frozenset({"", "changeme", "change-me", "placeholder", "redacted", "example", "xxx", "xxxx",
                            "todo", "n/a", "na", "null", "none", "true", "false"})
 _JSON_COMPATIBLE_SCAN_SUFFIXES = frozenset({".json", ".yaml", ".yml"})
+_PLAIN_YAML_SCAN_SUFFIXES = frozenset({".yaml", ".yml"})
 _REF_BINDING_SHAPE_RULE = "secret-ref-structure"
 _REF_KEY_LINE_RE = re.compile(r'(?:["\']secretRef["\']|\bsecretRef\b)\s*:')
 _REF_ALLOWED_KEYS = frozenset({"name", "key"})
 def _unquote(value: str) -> str:
     return value[1:-1] if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'" else value
+
+def _strip_plain_yaml_comment(text: str) -> str:
+    in_single = in_double = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_double and escaped:
+            escaped = False
+            continue
+        if char == "\\" and in_double:
+            escaped = True
+            continue
+        if char == "'" and not in_double:
+            in_single = not in_single
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            continue
+        if char == "#" and not in_single and not in_double and (index == 0 or text[index - 1].isspace()):
+            return text[:index]
+    return text
+
+def _plain_yaml_indent(line: str) -> int | None:
+    spaces = 0
+    for char in line:
+        if char == " ":
+            spaces += 1
+        elif char == "\t":
+            return None
+        else:
+            return spaces
+    return spaces
+
+def _plain_yaml_mapping_entry(line: str) -> tuple[int, str, str] | None:
+    if not line.strip() or line.lstrip().startswith("#"):
+        return None
+    indent = _plain_yaml_indent(line)
+    if indent is None:
+        return -1, "", ""
+    key_text, separator, rest = line[indent:].partition(":")
+    key = _unquote(key_text.strip())
+    if separator != ":" or not key or any(char.isspace() for char in key):
+        return -1, "", ""
+    return indent, key, rest
+
+def _plain_yaml_secret_ref_scalar(rest: str) -> str | None:
+    value = _strip_plain_yaml_comment(rest).strip()
+    if (not value or value[0] in "|>&*!" or any(char in value for char in "{}[]")):
+        return None
+    value = _unquote(value)
+    return value if is_safe_slug(value) else None
+
 def _is_credential_assignment(line: str) -> bool:
     match = _ASSIGNMENT_RE.match(line)
     raw_key = _unquote(match.group(1)) if match else ""
@@ -1017,8 +1069,10 @@ def _is_credential_assignment(line: str) -> bool:
         return False
     value = _unquote(match.group(2).strip())
     normalized = value.rstrip(",").strip()
-    if normalized in ("{", "[") and raw_key == "secretRef":
-        return False
+    if raw_key == "secretRef":
+        normalized = _strip_plain_yaml_comment(normalized).strip()
+        if normalized in ("", "{", "["):
+            return False
     if value.lower() in _PLACEHOLDERS or value.lower().startswith(("$", "{{", "<")):
         return False
     return not _is_image_digest(value) and not _CALL_RE.match(value)
@@ -1041,13 +1095,68 @@ def _walk_invalid_ref_bindings(node):
             yield from _walk_invalid_ref_bindings(item)
 
 
+def _scan_plain_yaml_ref_bindings(relative_path: str, text: str) -> list[tuple[str, int, str]]:
+    if Path(relative_path).suffix not in _PLAIN_YAML_SCAN_SUFFIXES:
+        return []
+    findings, lines, index = [], text.splitlines(), 0
+    while index < len(lines):
+        entry = _plain_yaml_mapping_entry(lines[index])
+        if entry is None or entry[0] < 0 or entry[1] != "secretRef":
+            index += 1
+            continue
+        indent, _, rest = entry
+        line_number = index + 1
+        if _strip_plain_yaml_comment(rest).strip():
+            findings.append((relative_path, line_number, _REF_BINDING_SHAPE_RULE))
+            index += 1
+            continue
+        index += 1
+        child_indent, seen_keys, valid = None, set(), True
+        while index < len(lines):
+            current = lines[index]
+            if not current.strip() or current.lstrip().startswith("#"):
+                index += 1
+                continue
+            current_indent = _plain_yaml_indent(current)
+            if current_indent is None:
+                valid = False
+                break
+            if current_indent <= indent:
+                break
+            child = _plain_yaml_mapping_entry(current)
+            if child is None or child[0] < 0:
+                valid = False
+                break
+            current_indent, child_key, child_rest = child
+            if child_indent is None:
+                child_indent = current_indent
+            if (current_indent != child_indent or child_key not in _REF_ALLOWED_KEYS or child_key in seen_keys
+                    or _plain_yaml_secret_ref_scalar(child_rest) is None):
+                valid = False
+                break
+            seen_keys.add(child_key)
+            index += 1
+        if not valid or "name" not in seen_keys:
+            findings.append((relative_path, line_number, _REF_BINDING_SHAPE_RULE))
+            while index < len(lines):
+                current = lines[index]
+                if not current.strip() or current.lstrip().startswith("#"):
+                    index += 1
+                    continue
+                current_indent = _plain_yaml_indent(current)
+                if current_indent is None or current_indent <= indent:
+                    break
+                index += 1
+    return findings
+
 def _scan_json_compatible_ref_bindings(relative_path: str, text: str) -> list[tuple[str, int, str]]:
-    if Path(relative_path).suffix not in _JSON_COMPATIBLE_SCAN_SUFFIXES:
+    suffix = Path(relative_path).suffix
+    if suffix not in _JSON_COMPATIBLE_SCAN_SUFFIXES:
         return []
     try:
         document = json.loads(text)
     except json.JSONDecodeError:
-        return []
+        return _scan_plain_yaml_ref_bindings(relative_path, text) if suffix in _PLAIN_YAML_SCAN_SUFFIXES else []
     ref_lines = [number for number, line in enumerate(text.splitlines(), start=1) if _REF_KEY_LINE_RE.search(line)]
     ref_validity = list(_walk_invalid_ref_bindings(document))
     return [(relative_path, ref_lines[index] if index < len(ref_lines) else 1, _REF_BINDING_SHAPE_RULE)
@@ -2057,6 +2166,9 @@ _CONTROLLER_ALLOWLIST_PROBE_SUFFIX_BYTES = 8
 _KUBERNETES_NAME_MAX_LENGTH = 63
 _CONTROLLER_ALLOWLIST_PROBE_PROMPT = "Controller allowlist probe."
 _CONTROLLER_ALLOWLIST_FAILURE_FRAGMENT = "not in parent's allowedAgents"
+_CONTROLLER_ALLOWLIST_PROBE_WARNING = (
+    "eval warning: controller allowlist probe failed; continuing without informational observation"
+)
 _CONTROLLER_ALLOWLIST_PROBE_FILES = (
     "controller-allowlist-probe-agent-manifest.json",
     "controller-allowlist-probe-agent-readback.json",
@@ -3966,14 +4078,17 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict]
                              child_count=len(genuine_children), probe_count=0)
     records = ([] if provider_route is not None
                else parse_provider_log_for_composed_coordination(_read_text(args.provider_log, "--provider-log")))
-    observation, probe_evidence_sha256 = None, []
+    observation, probe_evidence_sha256, probe_warning = None, [], False
     if args.case_id in COMPOSED_REFUSAL_CASE_IDS:
         if not campaign_case_reserved(args.evidence_root, CONTROLLER_ALLOWLIST_OBSERVATION_ID):
             if child_inventory_known and len(linked_children) == 0:
-                observation = run_controller_allowlist_probe(
-                    args, evidence_dir=evidence_dir, coordinator_live=coordinator_live,
-                    refusal_parent_task=terminal_task)
-                probe_evidence_sha256 = _controller_allowlist_probe_evidence_digests(evidence_dir) or []
+                try:
+                    observation = run_controller_allowlist_probe(
+                        args, evidence_dir=evidence_dir, coordinator_live=coordinator_live,
+                        refusal_parent_task=terminal_task)
+                    probe_evidence_sha256 = _controller_allowlist_probe_evidence_digests(evidence_dir) or []
+                except CliError:
+                    observation, probe_evidence_sha256, probe_warning = None, [], True
         else:
             observation, probe_evidence_sha256 = preserved_observation, preserved_probe_evidence_sha256
     summaries, receipts = _score_composed_coordination_receipts(
@@ -4006,6 +4121,8 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict]
         receipt["evidence_sha256"] = (list(dict.fromkeys([*evidence_sha256, *probe_evidence_sha256]))
                                       if case_id == COMPOSED_REFUSAL_DENIAL_CASE_ID and observation is not None
                                       else evidence_sha256)
+    if probe_warning:
+        print(_CONTROLLER_ALLOWLIST_PROBE_WARNING, file=sys.stderr)
     cleanup = {"task_name": task_name, "namespace": args.namespace} if reserved else None
     return summaries[args.case_id], receipts, cleanup
 
@@ -4107,8 +4224,9 @@ def _reuse_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict
     return summaries[args.case_id], receipts, None
 
 def _eval_cli(argv) -> int:
-    """`tools/eval`: submit exactly one Task, dispatch to the case's closed policy mechanics,
-    write raw evidence outside Git, and write a public-safe receipt inside it."""
+    """`tools/eval`: either submit exactly one live Task or reuse bound composed evidence with
+    zero cluster or HTTP calls, then dispatch to the case's closed policy mechanics, write any raw
+    evidence under the supplied evidence root, and write a public-safe receipt inside the repo."""
     parser = argparse.ArgumentParser(prog="tools/eval", description="Submit one Task, page its journal, count "
                                      "authoritative provider requests and write an evaluation receipt.")
     _add_cluster_arguments(parser)

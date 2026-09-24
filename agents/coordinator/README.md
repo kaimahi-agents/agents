@@ -67,10 +67,12 @@ greeting, including Orka's exact refusal wording:
 ## Where it has run
 
 The current Azure-routed trial digest has three committed passing receipts, so
-both offline verifies are green. The preserved PR2 refusal evidence was reused
-at the same digest with zero cluster calls to regenerate the split refusal
-receipts while retaining the public-safe Azure `provider_route` and
-authenticated parent `token_usage`.
+both offline verifies are green. The original PR2 live refusal evidence was
+first reused at its original live digest with zero cluster calls while
+retaining the public-safe Azure `provider_route` and authenticated parent
+`token_usage`, then mechanically imported to the current prose-only digest
+after the executable inputs and rendered coordinator/hello bundle bytes were
+proven unchanged.
 
 - `delegates`: 4 authenticated requests; token usage input 4944, output 90,
   total 5034

@@ -156,6 +156,88 @@ class ScanFileTestCase(unittest.TestCase):
         )
         self.assertEqual(agentctl.scan_file(self.root, "provider.yaml"), [])
 
+    def test_plain_yaml_secret_ref_shape_accepts_comments_and_blank_lines(self):
+        self._write_lines(
+            "provider.yaml",
+            "kind: Provider",
+            "spec:",
+            "  secret" + "Ref: # external secret",
+            "    # keep this out of git",
+            "    name: provider-key",
+            "",
+            "    key: api-key",
+        )
+        self.assertEqual(agentctl.scan_file(self.root, "provider.yaml"), [])
+
+    def test_plain_yaml_secret_ref_shape_reports_invalid_blocks_by_position_only(self):
+        cases = (
+            ("malformed", [
+                "spec:",
+                "  secret" + "Ref:",
+                "    name provider-key",
+            ], 2),
+            ("nested", [
+                "spec:",
+                "  secret" + "Ref:",
+                "    name:",
+                "      nested: bad",
+            ], 2),
+            ("duplicate", [
+                "spec:",
+                "  secret" + "Ref:",
+                "    name: provider-key",
+                "    name: other-key",
+            ], 2),
+            ("extra", [
+                "spec:",
+                "  secret" + "Ref:",
+                "    name: provider-key",
+                "    value: real-secret",
+            ], 2),
+            ("multiline", [
+                "spec:",
+                "  secret" + "Ref:",
+                "    name: |",
+                "      provider-key",
+            ], 2),
+            ("alias", [
+                "spec:",
+                "  secret" + "Ref:",
+                "    name: *provider-key",
+            ], 2),
+            ("flow", [
+                "spec:",
+                "  secret" + "Ref:",
+                "    name: [provider-key]",
+            ], 2),
+        )
+        for label, lines, line_number in cases:
+            with self.subTest(case=label):
+                self._write_lines("bad.yaml", *lines)
+                findings = agentctl.scan_file(self.root, "bad.yaml")
+                self.assertIn(("bad.yaml", line_number, REF_SHAPE_RULE_ID), findings)
+                self.assertFalse(any("real-secret" in str(item) or "provider-key" in str(item) for item in findings))
+
+    def test_plain_yaml_secret_ref_shape_does_not_run_for_non_yaml_files(self):
+        self._write_lines(
+            "notes.txt",
+            "spec:",
+            "  secret" + "Ref:",
+            "    name: provider-key",
+            "    key: api-key",
+        )
+        self.assertEqual(agentctl.scan_file(self.root, "notes.txt"), [])
+
+    def test_plain_yaml_secret_ref_shape_does_not_run_for_invalid_json_files(self):
+        self._write_lines(
+            "provider.json",
+            "spec:",
+            "  secret" + "Ref:",
+            "    name: provider-key",
+            "    key: api-key",
+        )
+        self.assertEqual(agentctl.scan_file(self.root, "provider.json"), [])
+
     def test_document_scan_reports_malformed_secret_ref_structures_by_position_only(self):
         cases = (
             (
