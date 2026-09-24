@@ -1149,6 +1149,11 @@ def _scan_plain_yaml_ref_bindings(relative_path: str, text: str) -> list[tuple[s
                 index += 1
     return findings
 
+def _scan_malformed_json_ref_bindings(relative_path: str, text: str) -> list[tuple[str, int, str]]:
+    return [(relative_path, number, _REF_BINDING_SHAPE_RULE)
+            for number, line in enumerate(text.splitlines(), start=1)
+            if (match := _REF_KEY_LINE_RE.search(line)) and line[match.end():].strip()[:1] in ("", "{", "[")]
+
 def _scan_json_compatible_ref_bindings(relative_path: str, text: str) -> list[tuple[str, int, str]]:
     suffix = Path(relative_path).suffix
     if suffix not in _JSON_COMPATIBLE_SCAN_SUFFIXES:
@@ -1156,6 +1161,8 @@ def _scan_json_compatible_ref_bindings(relative_path: str, text: str) -> list[tu
     try:
         document = json.loads(text)
     except json.JSONDecodeError:
+        if suffix == ".json":
+            return _scan_malformed_json_ref_bindings(relative_path, text)
         return _scan_plain_yaml_ref_bindings(relative_path, text) if suffix in _PLAIN_YAML_SCAN_SUFFIXES else []
     ref_lines = [number for number, line in enumerate(text.splitlines(), start=1) if _REF_KEY_LINE_RE.search(line)]
     ref_validity = list(_walk_invalid_ref_bindings(document))
@@ -3360,6 +3367,31 @@ def _lifecycle_cli(kind: str, argv) -> int:
     return (_native_composition_lifecycle_cli if _parse_lifecycle_mode(argv) == LIFECYCLE_MODE_NATIVE_COMPOSITION
             else _monitored_runtime_lifecycle_cli)(kind, argv)
 
+_PENDING_SUBMITTED_TASK_CLEANUP_ATTR = "_pending_submitted_task_cleanup"
+_SUBMITTED_TASK_CLEANUP_WARNING = "eval warning: submitted Task cleanup failed while handling an earlier error"
+
+def _set_pending_submitted_task_cleanup(args, *, task_name: str, namespace: str) -> None:
+    setattr(args, _PENDING_SUBMITTED_TASK_CLEANUP_ATTR, {"task_name": task_name, "namespace": namespace})
+
+def _clear_pending_submitted_task_cleanup(args) -> dict | None:
+    cleanup = getattr(args, _PENDING_SUBMITTED_TASK_CLEANUP_ATTR, None)
+    setattr(args, _PENDING_SUBMITTED_TASK_CLEANUP_ATTR, None)
+    return cleanup if isinstance(cleanup, dict) else None
+
+def _best_effort_cleanup_submitted_task(args) -> None:
+    cleanup = _clear_pending_submitted_task_cleanup(args)
+    if not cleanup:
+        return
+    try:
+        deleted = run_kubectl(args.context, args.kubeconfig,
+                              ["delete", "task", cleanup["task_name"], "-n", cleanup["namespace"],
+                               "--ignore-not-found"])
+    except Exception:
+        print(_SUBMITTED_TASK_CLEANUP_WARNING, file=sys.stderr)
+        return
+    if deleted.returncode != 0:
+        print(_SUBMITTED_TASK_CLEANUP_WARNING, file=sys.stderr)
+
 def _prepare_eval_inputs(args) -> dict:
     if not is_safe_slug(args.case_id):
         raise CliError(f"case_id must be a safe slug ({SAFE_SLUG_CONTRACT})")
@@ -4026,6 +4058,7 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict]
                          input=json.dumps(task_manifest))
     if submit.returncode != 0:
         raise CliError(f"Task submission failed (kubectl exited {submit.returncode})")
+    _set_pending_submitted_task_cleanup(args, task_name=task_name, namespace=args.namespace)
     terminal_task = wait_for_terminal(
         lambda: get_task(task_name), max_attempts=args.max_poll_attempts,
         poll_interval_seconds=args.poll_interval_seconds)
@@ -4245,24 +4278,31 @@ def _eval_cli(argv) -> int:
     args = parser.parse_args(argv)
     case = load_evaluation_case(args.agent_dir, args.case_id, args.environment)
     policy = case.get("policy")
-    if args.reuse_evidence:
-        if policy != COMPOSED_COORDINATION_POLICY:
-            raise CliError("--reuse-evidence is supported only for the fixed composed coordination policy")
-        summary, receipts, cleanup = _reuse_composed_coordination(args, case)
-    elif policy == MISSING_TOOLCHAIN_POLICY:
-        summary, receipts, cleanup = _eval_missing_toolchain(args, case)
-    elif policy == COMPOSED_COORDINATION_POLICY:
-        summary, receipts, cleanup = _eval_composed_coordination(args, case)
-    else:
-        raise CliError(f"case_id is not bound to the {MISSING_TOOLCHAIN_POLICY!r} policy in eval/acceptance.md "
-                       "for this environment; refusing to evaluate")
-    validated_receipts = []
-    for receipt in receipts.values():
-        _require(validate_evaluation_receipt(receipt) + find_prohibited_in_document(receipt, "receipt"))
-        validated_receipts.append(receipt)
-    for receipt in validated_receipts:
-        _write_json(Path(args.agent_dir) / "eval" / "receipts" / receipt["bundle_digest"] /
-                    f"{receipt['case_id']}.json", receipt)
+    _clear_pending_submitted_task_cleanup(args)
+    try:
+        if args.reuse_evidence:
+            if policy != COMPOSED_COORDINATION_POLICY:
+                raise CliError("--reuse-evidence is supported only for the fixed composed coordination policy")
+            summary, receipts, cleanup = _reuse_composed_coordination(args, case)
+        elif policy == MISSING_TOOLCHAIN_POLICY:
+            summary, receipts, cleanup = _eval_missing_toolchain(args, case)
+        elif policy == COMPOSED_COORDINATION_POLICY:
+            summary, receipts, cleanup = _eval_composed_coordination(args, case)
+        else:
+            raise CliError(f"case_id is not bound to the {MISSING_TOOLCHAIN_POLICY!r} policy in eval/acceptance.md "
+                           "for this environment; refusing to evaluate")
+        validated_receipts = []
+        for receipt in receipts.values():
+            _require(validate_evaluation_receipt(receipt) + find_prohibited_in_document(receipt, "receipt"))
+            validated_receipts.append(receipt)
+        for receipt in validated_receipts:
+            _write_json(Path(args.agent_dir) / "eval" / "receipts" / receipt["bundle_digest"] /
+                        f"{receipt['case_id']}.json", receipt)
+    except Exception:
+        _best_effort_cleanup_submitted_task(args)
+        raise
+    finally:
+        _clear_pending_submitted_task_cleanup(args)
     if cleanup is not None:
         deleted = run_kubectl(args.context, args.kubeconfig,
                               ["delete", "task", cleanup["task_name"], "-n", cleanup["namespace"],

@@ -228,7 +228,7 @@ class ScanFileTestCase(unittest.TestCase):
         )
         self.assertEqual(agentctl.scan_file(self.root, "notes.txt"), [])
 
-    def test_plain_yaml_secret_ref_shape_does_not_run_for_invalid_json_files(self):
+    def test_malformed_json_secret_ref_shape_fails_closed_by_opener_line(self):
         self._write_lines(
             "provider.json",
             "spec:",
@@ -236,7 +236,50 @@ class ScanFileTestCase(unittest.TestCase):
             "    name: provider-key",
             "    key: api-key",
         )
-        self.assertEqual(agentctl.scan_file(self.root, "provider.json"), [])
+        self.assertEqual(agentctl.scan_file(self.root, "provider.json"), [("provider.json", 2, REF_SHAPE_RULE_ID)])
+
+    def test_malformed_json_secret_ref_openers_report_structure_by_position_only(self):
+        cases = (
+            (
+                "truncated-nested-safe-value",
+                [
+                    "{",
+                    '  "spec": {',
+                    '    "secret' + 'Ref": {',
+                    '      "name": {',
+                    '        "note": "safe"',
+                ],
+                [3],
+            ),
+            (
+                "multiple-openers",
+                [
+                    "{",
+                    '  "first": {"secret' + 'Ref": {',
+                    '    "name": "provider-key"',
+                    "  },",
+                    '  "second": {"secret' + 'Ref": {',
+                ],
+                [2, 5],
+            ),
+        )
+        for label, lines, line_numbers in cases:
+            with self.subTest(case=label):
+                self._write_lines("bad.json", *lines)
+                findings = agentctl.scan_file(self.root, "bad.json")
+                self.assertEqual(
+                    findings,
+                    [("bad.json", line_number, REF_SHAPE_RULE_ID) for line_number in line_numbers],
+                )
+                self.assertFalse(any("safe" in str(item) or "provider-key" in str(item) for item in findings))
+
+    def test_malformed_json_without_secret_ref_does_not_report_structure(self):
+        self._write_lines(
+            "bad.json",
+            "{",
+            '  "note": "safe"',
+        )
+        self.assertEqual(agentctl.scan_file(self.root, "bad.json"), [])
 
     def test_document_scan_reports_malformed_secret_ref_structures_by_position_only(self):
         cases = (

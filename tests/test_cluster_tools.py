@@ -100,6 +100,7 @@ ALLOWLIST_DENIAL_SUMMARY = 'agent "orka-system/not-allowed" is not in the allowe
 LIVE_OMITTED_ALLOWLIST_DENIAL_SUMMARY = ALLOWLIST_DENIAL_SUMMARY
 LEGACY_LIVE_OMITTED_ALLOWLIST_DENIAL_SUMMARY = 'agent "orka-system/not-allowed-agent" is not in the allowed agents list'
 ALLOWLIST_PROBE_WARNING = "eval warning: controller allowlist probe failed; continuing without informational observation"
+SUBMITTED_TASK_CLEANUP_WARNING = "eval warning: submitted Task cleanup failed while handling an earlier error"
 
 
 def provider_rows(count, minute="01"):
@@ -1282,6 +1283,9 @@ class ComposedEvalCliTestCase(unittest.TestCase):
     def report_receipt(self, bundle_digest=None):
         return self.receipt(REFUSAL_REPORT_CASE_ID, bundle_digest)
 
+    def _delete_calls(self):
+        return [argv for argv, _ in self.kubectl.calls if argv and argv[0] == "kubectl" and argv[5] == "delete"]
+
     def test_composed_live_eval_validates_catalogue_pins_before_cluster_calls(self):
         lock = json.loads((self.coordinator / "dependencies.lock.yaml").read_text(encoding="utf-8"))
         lock["catalogueAgents"]["hello"]["trial"] = "f" * 64
@@ -2047,7 +2051,10 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         with mock.patch.object(agentctl, "_write_json", fail_on_receipt), self.assertRaises(agentctl.CliError):
             self.run_eval("delegates", self.root / "delegates-task.json")
         delete_calls = [argv for argv, _ in self.kubectl.calls if argv and argv[0] == "kubectl" and argv[5] == "delete"]
-        self.assertEqual(delete_calls, [])
+        self.assertEqual(delete_calls, [[
+            "kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "task", parent_name,
+            "-n", NAMESPACE, "--ignore-not-found",
+        ]])
         ledger = json.loads((self.evidence / "campaign-ledger.json").read_text(encoding="utf-8"))
         self.assertEqual(ledger, {"entries": [{"case": "delegates", "attempt": 1, "parent_count": 1,
                                                 "child_count": 1, "actual_child_count": 1,
@@ -3665,6 +3672,105 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.assertEqual(self.kubectl.verbs().count("apply"), 2)
         self.assertEqual(self.kubectl.verbs().count("create"), 1)
         self.assertEqual(self.kubectl.verbs().count("delete"), 1)
+
+    def test_post_submit_terminal_poll_failure_cleans_up_and_preserves_the_original_error(self):
+        parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
+        with mock.patch.object(agentctl, "wait_for_terminal", side_effect=agentctl.CliError("synthetic terminal failure")):
+            code, out, err = self.run_eval_main("delegates", self.root / "delegates-task.json")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("eval failed: synthetic terminal failure", err)
+        self.assertEqual(self._delete_calls(), [[
+            "kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "task", parent_name,
+            "-n", NAMESPACE, "--ignore-not-found",
+        ]])
+        self.assertEqual(sorted((self.coordinator / "eval" / "receipts").rglob("*.json")), [])
+
+    def test_post_submit_journal_failure_cleans_up_and_preserves_the_original_error(self):
+        parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
+        self._set_delegate_result_evidence(self._delegate_events())
+        with mock.patch.object(agentctl, "page_journal", side_effect=agentctl.HttpError("synthetic journal failure")):
+            code, out, err = self.run_eval_main("delegates", self.root / "delegates-task.json")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("eval failed: could not retrieve the complete event journal", err)
+        self.assertEqual(self._delete_calls(), [[
+            "kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "task", parent_name,
+            "-n", NAMESPACE, "--ignore-not-found",
+        ]])
+        self.assertEqual(sorted((self.coordinator / "eval" / "receipts").rglob("*.json")), [])
+
+    def test_post_submit_receipt_validation_failure_cleans_up_and_cleanup_failures_do_not_mask_it(self):
+        parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
+        cases = (
+            ("returncode", lambda: self.kubectl.failures.add(("delete", "task", parent_name)), ("kubectl exited 1",)),
+            ("exception", None, ("TimeoutExpired",)),
+        )
+        for label, arrange, forbidden in cases:
+            with self.subTest(case=label):
+                self.setUp()
+                parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
+                self._set_delegate_result_evidence(self._delegate_events())
+                original_run_kubectl = agentctl.run_kubectl
+                attempted = []
+
+                def flaky_run_kubectl(context, kubeconfig, args, *, input=None, timeout=60):
+                    attempted.append(tuple(args))
+                    if label == "exception" and args[:3] == ["delete", "task", parent_name]:
+                        raise subprocess.TimeoutExpired(cmd=["kubectl", *args], timeout=timeout)
+                    return original_run_kubectl(context, kubeconfig, args, input=input, timeout=timeout)
+
+                if arrange is not None:
+                    arrange()
+                with mock.patch.object(agentctl, "validate_evaluation_receipt", return_value=["synthetic validation failure"]), \
+                        mock.patch.object(agentctl, "run_kubectl", flaky_run_kubectl):
+                    code, out, err = self.run_eval_main("delegates", self.root / "delegates-task.json")
+                self.assertEqual(code, 1)
+                self.assertEqual(out, "")
+                self.assertIn(SUBMITTED_TASK_CLEANUP_WARNING, err)
+                self.assertIn("eval failed: synthetic validation failure", err)
+                for text in forbidden:
+                    self.assertNotIn(text, err)
+                if label == "exception":
+                    self.assertIn(("delete", "task", parent_name, "-n", NAMESPACE, "--ignore-not-found"), attempted)
+                    self.assertEqual(self._delete_calls(), [])
+                else:
+                    self.assertEqual(self._delete_calls(), [[
+                        "kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "task", parent_name,
+                        "-n", NAMESPACE, "--ignore-not-found",
+                    ]])
+                self.assertEqual(sorted((self.coordinator / "eval" / "receipts").rglob("*.json")), [])
+
+    def test_submitted_task_cleanup_does_not_run_for_pre_submit_or_failed_submit_failures(self):
+        parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
+        code, out, err = self.run_eval_main("delegates", self.root / "delegates-task.json", **{"--model": "other-model"})
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("eval failed: --model must match rendered coordinator Agent spec.model.name", err)
+        self.assertEqual(self._delete_calls(), [])
+
+        self.setUp()
+        parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
+        self.kubectl.failures.add(("create", "Task", parent_name))
+        code, out, err = self.run_eval_main("delegates", self.root / "delegates-task.json")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("eval failed: Task submission failed (kubectl exited 1)", err)
+        self.assertEqual(self._delete_calls(), [])
+
+    def test_submitted_task_cleanup_does_not_run_for_reuse_failures(self):
+        self.seed_delegate_evidence()
+        calls = {"count": 0}
+
+        def fail_only_final_receipt_validation(_receipt):
+            calls["count"] += 1
+            return [] if calls["count"] == 1 else ["synthetic validation failure"]
+
+        with mock.patch.object(agentctl, "validate_evaluation_receipt", side_effect=fail_only_final_receipt_validation):
+            self._assert_reuse_failure_preserves_bytes(
+                self.reuse_eval_argv("delegates"),
+                "eval failed: synthetic validation failure",
+            )
 
     def test_parent_task_cleanup_failure_returns_nonzero_after_writing_receipt(self):
         parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
