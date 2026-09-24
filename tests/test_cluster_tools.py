@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import urllib.parse
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -162,6 +163,28 @@ class FakeKubectl:
         self.failures = set(failures)
         self.calls = []
 
+    def _submitted_manifest(self, kwargs=None):
+        raw = (kwargs or {}).get("input")
+        if isinstance(raw, str):
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                return None
+        return None
+
+    def _default_create_payload(self, key, kwargs=None):
+        manifest = self._submitted_manifest(kwargs)
+        metadata = manifest.get("metadata") if isinstance(manifest, dict) else None
+        if key[:2] == ("create", "Task") and isinstance(metadata, dict):
+            name = metadata.get("name")
+            if isinstance(name, str) and (live := self.responses.get(("task", name))) is not None:
+                return copy.deepcopy(live)
+        if key[:2] == ("create", "Agent") and isinstance(metadata, dict):
+            name = metadata.get("name")
+            if isinstance(name, str) and (live := self.responses.get(("agents.core.orka.ai", name))) is not None:
+                return copy.deepcopy(live)
+        return {}
+
     def key(self, argv, kwargs=None):
         if not argv or argv[0] != "kubectl":
             return (argv[0],) if argv else ("",)
@@ -171,17 +194,12 @@ class FakeKubectl:
         if rest[0] == "delete" and len(rest) > 2 and not rest[2].startswith("-"):
             return (rest[0], rest[1], rest[2])
         if rest[0] == "create":
-            raw = (kwargs or {}).get("input")
-            if isinstance(raw, str):
-                try:
-                    manifest = json.loads(raw)
-                except json.JSONDecodeError:
-                    manifest = None
-                metadata = manifest.get("metadata") if isinstance(manifest, dict) else None
-                name = metadata.get("name") if isinstance(metadata, dict) else None
-                kind = manifest.get("kind") if isinstance(manifest, dict) else None
-                if isinstance(kind, str) and isinstance(name, str) and name:
-                    return ("create", kind, name)
+            manifest = self._submitted_manifest(kwargs)
+            metadata = manifest.get("metadata") if isinstance(manifest, dict) else None
+            name = metadata.get("name") if isinstance(metadata, dict) else None
+            kind = manifest.get("kind") if isinstance(manifest, dict) else None
+            if isinstance(kind, str) and isinstance(name, str) and name:
+                return ("create", kind, name)
         return (rest[1],) if rest[0] == "get" else (rest[0],)
 
     def __call__(self, argv, **kwargs):
@@ -192,7 +210,11 @@ class FakeKubectl:
         generic = (key[0],)
         if key in self.failures or generic in self.failures:
             return subprocess.CompletedProcess(argv, 1, stdout="", stderr="not found")
-        payload = self.responses.get(key, self.responses.get(generic, {}))
+        payload = self.responses.get(key, self.responses.get(generic))
+        if payload is None and key[:1] == ("create",):
+            payload = self._default_create_payload(key, kwargs)
+        elif payload is None:
+            payload = {}
         if callable(payload):
             payload = payload(argv, kwargs)
         return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(payload), stderr="")
@@ -1286,6 +1308,27 @@ class ComposedEvalCliTestCase(unittest.TestCase):
     def _delete_calls(self):
         return [argv for argv, _ in self.kubectl.calls if argv and argv[0] == "kubectl" and argv[5] == "delete"]
 
+    def _task_create_call(self, task_name):
+        matches = []
+        for argv, kwargs in self.kubectl.calls:
+            if not (argv and argv[0] == "kubectl" and argv[5] == "create"):
+                continue
+            manifest = json.loads(kwargs["input"])
+            if manifest.get("kind") == "Task" and manifest.get("metadata", {}).get("name") == task_name:
+                matches.append((argv, kwargs))
+        self.assertEqual(len(matches), 1)
+        return matches[0]
+
+    def _task_delete_raw_url(self, task_name):
+        return ("/apis/core.orka.ai/v1alpha1/namespaces/"
+                f"{urllib.parse.quote(NAMESPACE, safe='')}/tasks/{urllib.parse.quote(task_name, safe='')}")
+
+    def _raw_task_delete_call(self):
+        matches = [(argv, kwargs) for argv, kwargs in self.kubectl.calls
+                   if argv and argv[0] == "kubectl" and argv[5:7] == ["delete", "--raw"]]
+        self.assertEqual(len(matches), 1)
+        return matches[0]
+
     def test_composed_live_eval_validates_catalogue_pins_before_cluster_calls(self):
         lock = json.loads((self.coordinator / "dependencies.lock.yaml").read_text(encoding="utf-8"))
         lock["catalogueAgents"]["hello"]["trial"] = "f" * 64
@@ -2019,12 +2062,41 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         result_calls = [(url, token) for url, token, _ in self.http_calls if "/result?" in url]
         self.assertEqual({token for _, token in result_calls}, {"journal-token"})
         self.assertEqual(len(result_calls), 2)
+        create_argv, _ = self._task_create_call(parent_name)
+        self.assertEqual(create_argv[-2:], ["-o", "json"])
+        delete_argv, delete_kwargs = self._raw_task_delete_call()
+        self.assertEqual(delete_argv, [
+            "kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "--raw",
+            self._task_delete_raw_url(parent_name), "-f", "-",
+        ])
+        self.assertEqual(json.loads(delete_kwargs["input"]), {
+            "apiVersion": "meta.k8s.io/v1",
+            "kind": "DeleteOptions",
+            "preconditions": {"uid": self.parent_tasks["delegates"]["metadata"]["uid"]},
+        })
         self.assertEqual(self.kubectl.verbs().count("apply"), 2)
         self.assertEqual(self.kubectl.verbs().count("delete"), 1)
         ledger = json.loads((self.evidence / "campaign-ledger.json").read_text(encoding="utf-8"))
         self.assertEqual(ledger, {"entries": [{"case": "delegates", "attempt": 1, "parent_count": 1,
                                                 "child_count": 1, "actual_child_count": 1,
                                                 "probe_count": 0, "cumulative_total": 2}]})
+
+    def test_malformed_task_create_response_fails_closed_without_unsafe_cleanup(self):
+        parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
+        parent_uid = self.parent_tasks["delegates"]["metadata"]["uid"]
+        self.kubectl.responses[("create", "Task", parent_name)] = {
+            "metadata": {"name": parent_name, "namespace": NAMESPACE},
+        }
+
+        code, out, err = self.run_eval_main("delegates", self.root / "delegates-task.json")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("eval failed: Task submission did not return the expected created Task identity", err)
+        self.assertNotIn(parent_uid, err)
+        self.assertNotIn(self._task_delete_raw_url(parent_name), err)
+        self.assertEqual(self.kubectl.verbs().count("create"), 1)
+        self.assertEqual(self.kubectl.verbs().count("delete"), 0)
+        self.assertEqual(sorted((self.coordinator / "eval" / "receipts").rglob("*.json")), [])
 
     def test_failure_after_evidence_capture_preserves_root_and_monotonic_budget(self):
         parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
@@ -2050,11 +2122,16 @@ class ComposedEvalCliTestCase(unittest.TestCase):
 
         with mock.patch.object(agentctl, "_write_json", fail_on_receipt), self.assertRaises(agentctl.CliError):
             self.run_eval("delegates", self.root / "delegates-task.json")
-        delete_calls = [argv for argv, _ in self.kubectl.calls if argv and argv[0] == "kubectl" and argv[5] == "delete"]
-        self.assertEqual(delete_calls, [[
-            "kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "task", parent_name,
-            "-n", NAMESPACE, "--ignore-not-found",
-        ]])
+        delete_argv, delete_kwargs = self._raw_task_delete_call()
+        self.assertEqual(delete_argv, [
+            "kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "--raw",
+            self._task_delete_raw_url(parent_name), "-f", "-",
+        ])
+        self.assertEqual(json.loads(delete_kwargs["input"]), {
+            "apiVersion": "meta.k8s.io/v1",
+            "kind": "DeleteOptions",
+            "preconditions": {"uid": self.parent_tasks["delegates"]["metadata"]["uid"]},
+        })
         ledger = json.loads((self.evidence / "campaign-ledger.json").read_text(encoding="utf-8"))
         self.assertEqual(ledger, {"entries": [{"case": "delegates", "attempt": 1, "parent_count": 1,
                                                 "child_count": 1, "actual_child_count": 1,
@@ -2751,14 +2828,22 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.assertEqual(probe_task_manifest["metadata"]["annotations"]["orka.ai/coordination-depth"], "1")
         self.assertNotIn("ownerReferences", probe_task_manifest["metadata"])
         delete_calls = [argv for argv, _ in self.kubectl.calls if argv and argv[0] == "kubectl" and argv[5] == "delete"]
-        self.assertEqual(delete_calls[-3:], [
+        self.assertEqual(delete_calls[:2], [
             ["kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "task", self.probe_task_name,
              "-n", NAMESPACE, "--ignore-not-found"],
             ["kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "agents.core.orka.ai",
              self.probe_agent_name, "-n", NAMESPACE, "--ignore-not-found"],
-            ["kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "task", parent_name,
-             "-n", NAMESPACE, "--ignore-not-found"],
         ])
+        delete_argv, delete_kwargs = self._raw_task_delete_call()
+        self.assertEqual(delete_argv, [
+            "kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "--raw",
+            self._task_delete_raw_url(parent_name), "-f", "-",
+        ])
+        self.assertEqual(json.loads(delete_kwargs["input"]), {
+            "apiVersion": "meta.k8s.io/v1",
+            "kind": "DeleteOptions",
+            "preconditions": {"uid": self.parent_tasks["refuses-unlisted"]["metadata"]["uid"]},
+        })
 
     def test_live_refusal_probe_failures_become_informational_after_evidence_capture(self):
         cases = (
@@ -3680,10 +3765,16 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(out, "")
         self.assertIn("eval failed: synthetic terminal failure", err)
-        self.assertEqual(self._delete_calls(), [[
-            "kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "task", parent_name,
-            "-n", NAMESPACE, "--ignore-not-found",
-        ]])
+        delete_argv, delete_kwargs = self._raw_task_delete_call()
+        self.assertEqual(delete_argv, [
+            "kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "--raw",
+            self._task_delete_raw_url(parent_name), "-f", "-",
+        ])
+        self.assertEqual(json.loads(delete_kwargs["input"]), {
+            "apiVersion": "meta.k8s.io/v1",
+            "kind": "DeleteOptions",
+            "preconditions": {"uid": self.parent_tasks["delegates"]["metadata"]["uid"]},
+        })
         self.assertEqual(sorted((self.coordinator / "eval" / "receipts").rglob("*.json")), [])
 
     def test_post_submit_journal_failure_cleans_up_and_preserves_the_original_error(self):
@@ -3694,17 +3785,24 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(out, "")
         self.assertIn("eval failed: could not retrieve the complete event journal", err)
-        self.assertEqual(self._delete_calls(), [[
-            "kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "task", parent_name,
-            "-n", NAMESPACE, "--ignore-not-found",
-        ]])
+        delete_argv, delete_kwargs = self._raw_task_delete_call()
+        self.assertEqual(delete_argv, [
+            "kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "--raw",
+            self._task_delete_raw_url(parent_name), "-f", "-",
+        ])
+        self.assertEqual(json.loads(delete_kwargs["input"]), {
+            "apiVersion": "meta.k8s.io/v1",
+            "kind": "DeleteOptions",
+            "preconditions": {"uid": self.parent_tasks["delegates"]["metadata"]["uid"]},
+        })
         self.assertEqual(sorted((self.coordinator / "eval" / "receipts").rglob("*.json")), [])
 
     def test_post_submit_receipt_validation_failure_cleans_up_and_cleanup_failures_do_not_mask_it(self):
         parent_name = self.parent_tasks["delegates"]["metadata"]["name"]
+        raw_delete_url = self._task_delete_raw_url(parent_name)
         cases = (
-            ("returncode", lambda: self.kubectl.failures.add(("delete", "task", parent_name)), ("kubectl exited 1",)),
-            ("exception", None, ("TimeoutExpired",)),
+            ("returncode", lambda: self.kubectl.failures.add(("delete", "--raw", raw_delete_url)), ("kubectl exited 1", raw_delete_url, self.parent_tasks["delegates"]["metadata"]["uid"])),
+            ("exception", None, ("TimeoutExpired", raw_delete_url, self.parent_tasks["delegates"]["metadata"]["uid"])),
         )
         for label, arrange, forbidden in cases:
             with self.subTest(case=label):
@@ -3715,8 +3813,8 @@ class ComposedEvalCliTestCase(unittest.TestCase):
                 attempted = []
 
                 def flaky_run_kubectl(context, kubeconfig, args, *, input=None, timeout=60):
-                    attempted.append(tuple(args))
-                    if label == "exception" and args[:3] == ["delete", "task", parent_name]:
+                    attempted.append((tuple(args), None if input is None else json.loads(input)))
+                    if label == "exception" and args[:3] == ["delete", "--raw", raw_delete_url]:
                         raise subprocess.TimeoutExpired(cmd=["kubectl", *args], timeout=timeout)
                     return original_run_kubectl(context, kubeconfig, args, input=input, timeout=timeout)
 
@@ -3731,14 +3829,21 @@ class ComposedEvalCliTestCase(unittest.TestCase):
                 self.assertIn("eval failed: synthetic validation failure", err)
                 for text in forbidden:
                     self.assertNotIn(text, err)
+                expected_delete_body = {
+                    "apiVersion": "meta.k8s.io/v1",
+                    "kind": "DeleteOptions",
+                    "preconditions": {"uid": self.parent_tasks["delegates"]["metadata"]["uid"]},
+                }
                 if label == "exception":
-                    self.assertIn(("delete", "task", parent_name, "-n", NAMESPACE, "--ignore-not-found"), attempted)
+                    self.assertIn((("delete", "--raw", raw_delete_url, "-f", "-"), expected_delete_body), attempted)
                     self.assertEqual(self._delete_calls(), [])
                 else:
-                    self.assertEqual(self._delete_calls(), [[
-                        "kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "task", parent_name,
-                        "-n", NAMESPACE, "--ignore-not-found",
-                    ]])
+                    delete_argv, delete_kwargs = self._raw_task_delete_call()
+                    self.assertEqual(delete_argv, [
+                        "kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "--raw",
+                        raw_delete_url, "-f", "-",
+                    ])
+                    self.assertEqual(json.loads(delete_kwargs["input"]), expected_delete_body)
                 self.assertEqual(sorted((self.coordinator / "eval" / "receipts").rglob("*.json")), [])
 
     def test_submitted_task_cleanup_does_not_run_for_pre_submit_or_failed_submit_failures(self):
@@ -3787,12 +3892,25 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             {"seq": 5, "type": "ModelMessage", "contentText": FIXED_PHRASE},
         ], "latestSeq": 5}]
         self.results_by_task = {parent_name: FIXED_PHRASE, self.child_task["metadata"]["name"]: FIXED_PHRASE}
-        self.kubectl.failures.add(("delete", "task", parent_name))
+        raw_delete_url = self._task_delete_raw_url(parent_name)
+        self.kubectl.failures.add(("delete", "--raw", raw_delete_url))
 
         code, out, err = self.run_eval_main("delegates", self.root / "delegates-task.json")
         self.assertEqual(code, 1)
         self.assertEqual(out, "")
         self.assertIn("cleanup failed", err)
+        self.assertNotIn(raw_delete_url, err)
+        self.assertNotIn(self.parent_tasks["delegates"]["metadata"]["uid"], err)
+        delete_argv, delete_kwargs = self._raw_task_delete_call()
+        self.assertEqual(delete_argv, [
+            "kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "--raw",
+            raw_delete_url, "-f", "-",
+        ])
+        self.assertEqual(json.loads(delete_kwargs["input"]), {
+            "apiVersion": "meta.k8s.io/v1",
+            "kind": "DeleteOptions",
+            "preconditions": {"uid": self.parent_tasks["delegates"]["metadata"]["uid"]},
+        })
         self.assertEqual(self.receipt("delegates")["verdict"], "pass")
         self.assertTrue((self.evidence / "delegates" / "terminal-task.json").is_file())
 

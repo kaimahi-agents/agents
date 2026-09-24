@@ -228,6 +228,48 @@ class ScanFileTestCase(unittest.TestCase):
         )
         self.assertEqual(agentctl.scan_file(self.root, "notes.txt"), [])
 
+    def test_plain_yaml_explicit_secret_ref_key_fails_closed_by_position_only(self):
+        cases = (
+            (
+                "nested-value",
+                [
+                    "spec:",
+                    "  ? secret" + "Ref",
+                    "  :",
+                    "    name:",
+                    "      nested: safe",
+                ],
+                2,
+            ),
+            (
+                "quoted-commented",
+                [
+                    "spec:",
+                    "  ? \"secret" + "Ref\" # external secret",
+                    "  # comment between explicit key and value",
+                    "  :",
+                    "    name: provider-key",
+                ],
+                2,
+            ),
+        )
+        for label, lines, line_number in cases:
+            with self.subTest(case=label):
+                self._write_lines("explicit.yaml", *lines)
+                findings = agentctl.scan_file(self.root, "explicit.yaml")
+                self.assertEqual(findings, [("explicit.yaml", line_number, REF_SHAPE_RULE_ID)])
+                self.assertFalse(any("safe" in str(item) or "provider-key" in str(item) for item in findings))
+
+    def test_plain_yaml_other_explicit_key_is_not_treated_as_secret_ref(self):
+        self._write_lines(
+            "explicit.yaml",
+            "spec:",
+            "  ? other-key",
+            "  :",
+            "    name: provider-key",
+        )
+        self.assertEqual(agentctl.scan_file(self.root, "explicit.yaml"), [])
+
     def test_malformed_json_secret_ref_shape_fails_closed_by_opener_line(self):
         self._write_lines(
             "provider.json",

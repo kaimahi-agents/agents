@@ -1054,6 +1054,33 @@ def _plain_yaml_mapping_entry(line: str) -> tuple[int, str, str] | None:
         return -1, "", ""
     return indent, key, rest
 
+def _plain_yaml_explicit_key(line: str) -> tuple[int, str] | None:
+    if not line.strip() or line.lstrip().startswith("#"):
+        return None
+    indent = _plain_yaml_indent(line)
+    if indent is None:
+        return None
+    content = line[indent:]
+    if not content.startswith("?"):
+        return None
+    key = _unquote(_strip_plain_yaml_comment(content[1:]).strip())
+    return (indent, key) if key and not any(char.isspace() for char in key) else None
+
+def _plain_yaml_has_explicit_secret_ref_key(lines: list[str], index: int) -> bool:
+    explicit = _plain_yaml_explicit_key(lines[index])
+    if explicit is None or explicit[1] != "secretRef":
+        return False
+    indent = explicit[0]
+    for next_index in range(index + 1, len(lines)):
+        line = lines[next_index]
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        next_indent = _plain_yaml_indent(line)
+        if next_indent != indent:
+            return False
+        return _strip_plain_yaml_comment(line[indent:]).lstrip().startswith(":")
+    return False
+
 def _plain_yaml_secret_ref_scalar(rest: str) -> str | None:
     value = _strip_plain_yaml_comment(rest).strip()
     if (not value or value[0] in "|>&*!" or any(char in value for char in "{}[]")):
@@ -1100,6 +1127,10 @@ def _scan_plain_yaml_ref_bindings(relative_path: str, text: str) -> list[tuple[s
         return []
     findings, lines, index = [], text.splitlines(), 0
     while index < len(lines):
+        if _plain_yaml_has_explicit_secret_ref_key(lines, index):
+            findings.append((relative_path, index + 1, _REF_BINDING_SHAPE_RULE))
+            index += 1
+            continue
         entry = _plain_yaml_mapping_entry(lines[index])
         if entry is None or entry[0] < 0 or entry[1] != "secretRef":
             index += 1
@@ -3369,23 +3400,51 @@ def _lifecycle_cli(kind: str, argv) -> int:
 
 _PENDING_SUBMITTED_TASK_CLEANUP_ATTR = "_pending_submitted_task_cleanup"
 _SUBMITTED_TASK_CLEANUP_WARNING = "eval warning: submitted Task cleanup failed while handling an earlier error"
+_SUBMITTED_TASK_CREATE_IDENTITY_ERROR = "Task submission did not return the expected created Task identity"
 
-def _set_pending_submitted_task_cleanup(args, *, task_name: str, namespace: str) -> None:
-    setattr(args, _PENDING_SUBMITTED_TASK_CLEANUP_ATTR, {"task_name": task_name, "namespace": namespace})
+def _task_raw_resource_url(namespace: str, task_name: str) -> str:
+    return ("/apis/core.orka.ai/v1alpha1/namespaces/"
+            f"{urllib.parse.quote(namespace, safe='')}/tasks/{urllib.parse.quote(task_name, safe='')}")
+
+def _task_delete_options(uid: str) -> dict:
+    return {"apiVersion": "meta.k8s.io/v1", "kind": "DeleteOptions", "preconditions": {"uid": uid}}
+
+def _validated_task_cleanup_binding(create_result, *, task_name: str, namespace: str) -> dict:
+    try:
+        created = json.loads(create_result.stdout)
+    except json.JSONDecodeError as exc:
+        raise CliError(_SUBMITTED_TASK_CREATE_IDENTITY_ERROR) from exc
+    metadata = created.get("metadata") if isinstance(created, dict) else None
+    name = metadata.get("name") if isinstance(metadata, dict) else None
+    created_namespace = metadata.get("namespace") if isinstance(metadata, dict) else None
+    uid = metadata.get("uid") if isinstance(metadata, dict) else None
+    if not (isinstance(name, str) and name == task_name and isinstance(created_namespace, str)
+            and created_namespace == namespace and isinstance(uid, str) and uid):
+        raise CliError(_SUBMITTED_TASK_CREATE_IDENTITY_ERROR)
+    return {"task_name": task_name, "namespace": namespace, "uid": uid}
+
+def _set_pending_submitted_task_cleanup(args, *, task_name: str, namespace: str, uid: str) -> None:
+    setattr(args, _PENDING_SUBMITTED_TASK_CLEANUP_ATTR,
+            {"task_name": task_name, "namespace": namespace, "uid": uid})
 
 def _clear_pending_submitted_task_cleanup(args) -> dict | None:
     cleanup = getattr(args, _PENDING_SUBMITTED_TASK_CLEANUP_ATTR, None)
     setattr(args, _PENDING_SUBMITTED_TASK_CLEANUP_ATTR, None)
     return cleanup if isinstance(cleanup, dict) else None
 
+def _run_task_uid_precondition_delete(args, cleanup: dict):
+    return run_kubectl(
+        args.context, args.kubeconfig,
+        ["delete", "--raw", _task_raw_resource_url(cleanup["namespace"], cleanup["task_name"]), "-f", "-"],
+        input=json.dumps(_task_delete_options(cleanup["uid"])),
+    )
+
 def _best_effort_cleanup_submitted_task(args) -> None:
     cleanup = _clear_pending_submitted_task_cleanup(args)
     if not cleanup:
         return
     try:
-        deleted = run_kubectl(args.context, args.kubeconfig,
-                              ["delete", "task", cleanup["task_name"], "-n", cleanup["namespace"],
-                               "--ignore-not-found"])
+        deleted = _run_task_uid_precondition_delete(args, cleanup)
     except Exception:
         print(_SUBMITTED_TASK_CLEANUP_WARNING, file=sys.stderr)
         return
@@ -4054,11 +4113,12 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict]
                                       child_count=limits["child_tasks"], probe_count=0)
     _require_task_inventory_clear(
         args.context, args.kubeconfig, reserved_task_name=task_name, reserved_task_namespace=args.namespace)
-    submit = run_kubectl(args.context, args.kubeconfig, ["create", "-n", args.namespace, "-f", "-"],
+    submit = run_kubectl(args.context, args.kubeconfig, ["create", "-n", args.namespace, "-f", "-", "-o", "json"],
                          input=json.dumps(task_manifest))
     if submit.returncode != 0:
         raise CliError(f"Task submission failed (kubectl exited {submit.returncode})")
-    _set_pending_submitted_task_cleanup(args, task_name=task_name, namespace=args.namespace)
+    cleanup_binding = _validated_task_cleanup_binding(submit, task_name=task_name, namespace=args.namespace)
+    _set_pending_submitted_task_cleanup(args, **cleanup_binding)
     terminal_task = wait_for_terminal(
         lambda: get_task(task_name), max_attempts=args.max_poll_attempts,
         poll_interval_seconds=args.poll_interval_seconds)
@@ -4156,7 +4216,7 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict]
                                       else evidence_sha256)
     if probe_warning:
         print(_CONTROLLER_ALLOWLIST_PROBE_WARNING, file=sys.stderr)
-    cleanup = {"task_name": task_name, "namespace": args.namespace} if reserved else None
+    cleanup = dict(cleanup_binding) if reserved else None
     return summaries[args.case_id], receipts, cleanup
 
 
@@ -4304,9 +4364,7 @@ def _eval_cli(argv) -> int:
     finally:
         _clear_pending_submitted_task_cleanup(args)
     if cleanup is not None:
-        deleted = run_kubectl(args.context, args.kubeconfig,
-                              ["delete", "task", cleanup["task_name"], "-n", cleanup["namespace"],
-                               "--ignore-not-found"])
+        deleted = _run_task_uid_precondition_delete(args, cleanup)
         if deleted.returncode != 0:
             raise CliError(f"Task cleanup failed (kubectl exited {deleted.returncode})")
     sys.stdout.write(_json_text(summary))
