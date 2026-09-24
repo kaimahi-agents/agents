@@ -1008,6 +1008,12 @@ _PLAIN_YAML_SCAN_SUFFIXES = frozenset({".yaml", ".yml"})
 _REF_BINDING_SHAPE_RULE = "secret-ref-structure"
 _REF_KEY_LINE_RE = re.compile(r'(?:["\']secretRef["\']|\bsecretRef\b)\s*:')
 _REF_ALLOWED_KEYS = frozenset({"name", "key"})
+class _JsonPairsObject(list):
+    pass
+
+def _json_pairs_object(pairs):
+    return _JsonPairsObject(pairs)
+
 def _unquote(value: str) -> str:
     return value[1:-1] if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'" else value
 
@@ -1088,6 +1094,13 @@ def _plain_yaml_secret_ref_scalar(rest: str) -> str | None:
     value = _unquote(value)
     return value if is_safe_slug(value) else None
 
+def _is_structural_secret_ref_opener_line(line: str) -> bool:
+    match = _ASSIGNMENT_RE.match(line)
+    if match and _unquote(match.group(1)) == "secretRef":
+        normalized = _strip_plain_yaml_comment(_unquote(match.group(2).strip())).rstrip(",").strip()
+        return normalized in ("", "{", "[")
+    return bool(re.fullmatch(r"\s*[\"']?secretRef[\"']?\s*:\s*(?:#.*)?", line))
+
 def _is_credential_assignment(line: str) -> bool:
     match = _ASSIGNMENT_RE.match(line)
     raw_key = _unquote(match.group(1)) if match else ""
@@ -1095,27 +1108,28 @@ def _is_credential_assignment(line: str) -> bool:
     if not match or not any(part in key for part in _SENSITIVE_KEYS):
         return False
     value = _unquote(match.group(2).strip())
-    normalized = value.rstrip(",").strip()
-    if raw_key == "secretRef":
-        normalized = _strip_plain_yaml_comment(normalized).strip()
-        if normalized in ("", "{", "["):
-            return False
     if value.lower() in _PLACEHOLDERS or value.lower().startswith(("$", "{{", "<")):
         return False
     return not _is_image_digest(value) and not _CALL_RE.match(value)
 def scan_line(line: str) -> list[str]:
     """Rule IDs matched by one line, in fixed rule order; never the matched text itself."""
     rule_ids = [rule_id for rule_id, pattern in _LINE_RULES if pattern.search(line)]
-    return rule_ids + ["credential-assignment"] if _is_credential_assignment(line) else list(rule_ids)
+    return rule_ids + ["credential-assignment"] if (_is_credential_assignment(line)
+                                                      or _is_structural_secret_ref_opener_line(line)) else list(rule_ids)
+
+def _json_secret_ref_mapping_is_valid(node) -> bool:
+    if not isinstance(node, _JsonPairsObject):
+        return False
+    keys = [key for key, _ in node]
+    return ("name" in keys and len(keys) == len(set(keys)) and set(keys) <= _REF_ALLOWED_KEYS
+            and all(isinstance(value, str) and is_safe_slug(value) for _, value in node))
 
 def _walk_invalid_ref_bindings(node):
-    if isinstance(node, dict):
-        for key, value in node.items():
+    if isinstance(node, _JsonPairsObject):
+        duplicate_ref_keys = sum(1 for key, _ in node if key == "secretRef") > 1
+        for key, value in node:
             if key == "secretRef":
-                valid = (isinstance(value, dict) and set(value) <= _REF_ALLOWED_KEYS and "name" in value
-                         and all(isinstance(value.get(part), str) and is_safe_slug(value.get(part))
-                                 for part in value))
-                yield not valid
+                yield duplicate_ref_keys or not _json_secret_ref_mapping_is_valid(value)
             yield from _walk_invalid_ref_bindings(value)
     elif isinstance(node, list):
         for item in node:
@@ -1180,25 +1194,34 @@ def _scan_plain_yaml_ref_bindings(relative_path: str, text: str) -> list[tuple[s
                 index += 1
     return findings
 
+def _ref_binding_occurrence_lines(text: str) -> list[int]:
+    return [number for number, line in enumerate(text.splitlines(), start=1)
+            for _ in _REF_KEY_LINE_RE.finditer(line)]
+
 def _scan_malformed_json_ref_bindings(relative_path: str, text: str) -> list[tuple[str, int, str]]:
     return [(relative_path, number, _REF_BINDING_SHAPE_RULE)
             for number, line in enumerate(text.splitlines(), start=1)
-            if (match := _REF_KEY_LINE_RE.search(line)) and line[match.end():].strip()[:1] in ("", "{", "[")]
+            for match in _REF_KEY_LINE_RE.finditer(line)
+            if line[match.end():].strip()[:1] in ("", "{", "[")]
 
-def _scan_json_compatible_ref_bindings(relative_path: str, text: str) -> list[tuple[str, int, str]]:
+def _scan_json_compatible_ref_bindings(relative_path: str, text: str) -> tuple[list[tuple[str, int, str]], bool]:
     suffix = Path(relative_path).suffix
     if suffix not in _JSON_COMPATIBLE_SCAN_SUFFIXES:
-        return []
+        return [], False
     try:
-        document = json.loads(text)
+        document = json.loads(text, object_pairs_hook=_json_pairs_object)
     except json.JSONDecodeError:
-        if suffix == ".json":
-            return _scan_malformed_json_ref_bindings(relative_path, text)
-        return _scan_plain_yaml_ref_bindings(relative_path, text) if suffix in _PLAIN_YAML_SCAN_SUFFIXES else []
-    ref_lines = [number for number, line in enumerate(text.splitlines(), start=1) if _REF_KEY_LINE_RE.search(line)]
+        findings = (_scan_malformed_json_ref_bindings(relative_path, text) if suffix == ".json"
+                    else _scan_plain_yaml_ref_bindings(relative_path, text) if suffix in _PLAIN_YAML_SCAN_SUFFIXES
+                    else [])
+        return findings, bool(suffix in _PLAIN_YAML_SCAN_SUFFIXES and not findings)
+    ref_lines = _ref_binding_occurrence_lines(text)
     ref_validity = list(_walk_invalid_ref_bindings(document))
-    return [(relative_path, ref_lines[index] if index < len(ref_lines) else 1, _REF_BINDING_SHAPE_RULE)
-            for index, bad in enumerate(ref_validity) if bad]
+    if len(ref_validity) != len(ref_lines):
+        return ([(relative_path, number, _REF_BINDING_SHAPE_RULE) for number in ref_lines], False)
+    findings = [(relative_path, ref_lines[index], _REF_BINDING_SHAPE_RULE)
+                for index, bad in enumerate(ref_validity) if bad]
+    return findings, not findings
 def _walk_failed(exc: OSError) -> None:
     raise CliError(f"directory walk failed ({type(exc).__name__})")
 def _is_plain_file(root: Path, relative_path: str) -> bool:
@@ -1246,7 +1269,13 @@ def scan_file(root: Path, relative_path: str) -> list[tuple[str, int, str]]:
     findings = [(relative_path, number, rule_id)
                 for number, line in enumerate(text.splitlines(), start=1)
                 for rule_id in scan_line(line)]
-    findings += _scan_json_compatible_ref_bindings(relative_path, text)
+    ref_findings, ref_validation_succeeded = _scan_json_compatible_ref_bindings(relative_path, text)
+    if ref_validation_succeeded:
+        opener_lines = {number for number, line in enumerate(text.splitlines(), start=1)
+                        if _is_structural_secret_ref_opener_line(line)}
+        findings = [finding for finding in findings
+                    if not (finding[2] == "credential-assignment" and finding[1] in opener_lines)]
+    findings += ref_findings
     return sorted(findings, key=lambda item: (item[1], item[2]))
 def scan_repository(root: Path) -> list[tuple[str, int, str]]:
     """Every finding under `root`, sorted by path, then line, then rule ID."""
@@ -3433,6 +3462,8 @@ def _clear_pending_submitted_task_cleanup(args) -> dict | None:
     return cleanup if isinstance(cleanup, dict) else None
 
 def _run_task_uid_precondition_delete(args, cleanup: dict):
+    # `kubectl delete --raw URL -f -` intentionally forwards stdin as the raw DELETE body, so this
+    # sends DeleteOptions with UID preconditions without a racy GET-then-delete fallback.
     return run_kubectl(
         args.context, args.kubeconfig,
         ["delete", "--raw", _task_raw_resource_url(cleanup["namespace"], cleanup["task_name"]), "-f", "-"],

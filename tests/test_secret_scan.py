@@ -92,11 +92,12 @@ class CredentialAssignmentTestCase(unittest.TestCase):
             with self.subTest(rest=rest):
                 self.assertEqual(agentctl.scan_line(prefix + rest), [])
 
-    def test_only_exact_structural_secret_ref_openings_are_exempt(self):
-        lines = ('"secret' + 'Ref": {', 'secret' + 'Ref: [', 'secret' + 'Ref: {   ', 'secret' + 'Ref: [,')
+    def test_exact_structural_secret_ref_openers_are_flagged_by_scan_line(self):
+        lines = ('"secret' + 'Ref": {', 'secret' + 'Ref: [', 'secret' + 'Ref: {   ', 'secret' + 'Ref:',
+                 'secret' + 'Ref: # external secret')
         for line in lines:
             with self.subTest(line=line):
-                self.assertEqual(agentctl.scan_line(line), [])
+                self.assertIn("credential-assignment", agentctl.scan_line(line))
         self.assertIn("credential-assignment", agentctl.scan_line('api_' + 'key_' + 'secret' + 'Ref: {'))
 
     def test_inline_secret_ref_objects_and_arrays_still_flag(self):
@@ -128,6 +129,13 @@ class ScanFileTestCase(unittest.TestCase):
 
     def _write_lines(self, path: str, *lines: str) -> None:
         (self.root / path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _invalid_structured_ref_findings(self, path: str, *line_numbers: int) -> list[tuple[str, int, str]]:
+        return [
+            finding
+            for line_number in line_numbers
+            for finding in ((path, line_number, "credential-assignment"), (path, line_number, REF_SHAPE_RULE_ID))
+        ]
 
     def test_findings_carry_path_line_and_rule_but_never_the_value(self):
         (self.root / "notes.md").write_text(f"one\ntwo\n{HOME_PATH}\n", encoding="utf-8")
@@ -226,7 +234,18 @@ class ScanFileTestCase(unittest.TestCase):
             "    name: provider-key",
             "    key: api-key",
         )
-        self.assertEqual(agentctl.scan_file(self.root, "notes.txt"), [])
+        self.assertEqual(agentctl.scan_file(self.root, "notes.txt"), [("notes.txt", 2, "credential-assignment")])
+
+    def test_structural_secret_ref_openers_stay_flagged_in_nonstructured_extensions(self):
+        cases = (
+            ("notes.txt", ["spec:", "  secret" + "Ref:", "    name: provider-key"], 2),
+            ("script.py", ["cfg = {", '    "secret' + 'Ref": {', '        "name": "provider-key"'], 2),
+        )
+        for path, lines, line_number in cases:
+            with self.subTest(path=path):
+                self._write_lines(path, *lines)
+                findings = agentctl.scan_file(self.root, path)
+                self.assertEqual(findings, [(path, line_number, "credential-assignment")])
 
     def test_plain_yaml_explicit_secret_ref_key_fails_closed_by_position_only(self):
         cases = (
@@ -278,7 +297,8 @@ class ScanFileTestCase(unittest.TestCase):
             "    name: provider-key",
             "    key: api-key",
         )
-        self.assertEqual(agentctl.scan_file(self.root, "provider.json"), [("provider.json", 2, REF_SHAPE_RULE_ID)])
+        self.assertEqual(agentctl.scan_file(self.root, "provider.json"),
+                         self._invalid_structured_ref_findings("provider.json", 2))
 
     def test_malformed_json_secret_ref_openers_report_structure_by_position_only(self):
         cases = (
@@ -291,7 +311,7 @@ class ScanFileTestCase(unittest.TestCase):
                     '      "name": {',
                     '        "note": "safe"',
                 ],
-                [3],
+                self._invalid_structured_ref_findings("bad.json", 3),
             ),
             (
                 "multiple-openers",
@@ -302,17 +322,14 @@ class ScanFileTestCase(unittest.TestCase):
                     "  },",
                     '  "second": {"secret' + 'Ref": {',
                 ],
-                [2, 5],
+                [("bad.json", 2, REF_SHAPE_RULE_ID), ("bad.json", 5, REF_SHAPE_RULE_ID)],
             ),
         )
-        for label, lines, line_numbers in cases:
+        for label, lines, expected in cases:
             with self.subTest(case=label):
                 self._write_lines("bad.json", *lines)
                 findings = agentctl.scan_file(self.root, "bad.json")
-                self.assertEqual(
-                    findings,
-                    [("bad.json", line_number, REF_SHAPE_RULE_ID) for line_number in line_numbers],
-                )
+                self.assertEqual(findings, expected)
                 self.assertFalse(any("safe" in str(item) or "provider-key" in str(item) for item in findings))
 
     def test_malformed_json_without_secret_ref_does_not_report_structure(self):
@@ -322,6 +339,103 @@ class ScanFileTestCase(unittest.TestCase):
             '  "note": "safe"',
         )
         self.assertEqual(agentctl.scan_file(self.root, "bad.json"), [])
+
+    def test_valid_json_document_suppresses_only_the_structural_secret_ref_opener_line(self):
+        self._write_lines(
+            "provider.json",
+            "{",
+            '  "spec": {',
+            '    "secret' + 'Ref": {',
+            '      "name": "provider-key",',
+            '      "key": "api-key"',
+            '    }',
+            '  }',
+            "}",
+        )
+        self.assertEqual(agentctl.scan_file(self.root, "provider.json"), [])
+
+    def test_duplicate_json_secret_ref_keys_report_each_textual_occurrence(self):
+        cases = (
+            (
+                "first-invalid-second-valid",
+                [
+                    "{",
+                    '  "spec": {',
+                    '    "secret' + 'Ref": {',
+                    '      "name": {',
+                    '        "nested": "safe"',
+                    '      }',
+                    '    },',
+                    '    "secret' + 'Ref": {',
+                    '      "name": "provider-key",',
+                    '      "key": "api-key"',
+                    '    }',
+                    '  }',
+                    "}",
+                ],
+                [3, 8],
+            ),
+            (
+                "two-valid-duplicates",
+                [
+                    "{",
+                    '  "spec": {',
+                    '    "secret' + 'Ref": {',
+                    '      "name": "provider-key"',
+                    '    },',
+                    '    "secret' + 'Ref": {',
+                    '      "name": "provider-key",',
+                    '      "key": "api-key"',
+                    '    }',
+                    '  }',
+                    "}",
+                ],
+                [3, 6],
+            ),
+        )
+        for label, lines, line_numbers in cases:
+            with self.subTest(case=label):
+                self._write_lines("bad.json", *lines)
+                findings = agentctl.scan_file(self.root, "bad.json")
+                self.assertEqual(findings, self._invalid_structured_ref_findings("bad.json", *line_numbers))
+                self.assertFalse(any("safe" in str(item) or "provider-key" in str(item) for item in findings))
+
+    def test_duplicate_json_secret_ref_child_keys_fail_closed_by_position_only(self):
+        cases = (
+            (
+                "name",
+                [
+                    "{",
+                    '  "spec": {',
+                    '    "secret' + 'Ref": {',
+                    '      "name": "provider-key",',
+                    '      "name": "other-key"',
+                    '    }',
+                    '  }',
+                    "}",
+                ],
+            ),
+            (
+                "key",
+                [
+                    "{",
+                    '  "spec": {',
+                    '    "secret' + 'Ref": {',
+                    '      "name": "provider-key",',
+                    '      "key": "api-key",',
+                    '      "key": "other-key"',
+                    '    }',
+                    '  }',
+                    "}",
+                ],
+            ),
+        )
+        for label, lines in cases:
+            with self.subTest(case=label):
+                self._write_lines("bad.json", *lines)
+                findings = agentctl.scan_file(self.root, "bad.json")
+                self.assertEqual(findings, self._invalid_structured_ref_findings("bad.json", 3))
+                self.assertFalse(any("provider-key" in str(item) or "api-key" in str(item) for item in findings))
 
     def test_document_scan_reports_malformed_secret_ref_structures_by_position_only(self):
         cases = (

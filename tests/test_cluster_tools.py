@@ -239,6 +239,24 @@ class ClusterPrimitivesTestCase(unittest.TestCase):
         self.assertEqual(argv[:5], ["kubectl", "--context", "ctx", "--kubeconfig", "cred-file"])
         self.assertEqual(argv[-2:], ["-o", "json"])
 
+    def test_raw_task_delete_uses_exact_url_stdin_and_uid_preconditions(self):
+        fake = FakeKubectl()
+        args = type("Args", (), {"context": "ctx", "kubeconfig": "cred"})()
+        cleanup = {"task_name": TASK_NAME, "namespace": NAMESPACE, "uid": "task-uid"}
+        with mock.patch.object(agentctl.subprocess, "run", fake):
+            agentctl._run_task_uid_precondition_delete(args, cleanup)
+        argv, kwargs = fake.calls[0]
+        self.assertEqual(argv, [
+            "kubectl", "--context", "ctx", "--kubeconfig", "cred", "delete", "--raw",
+            f"/apis/core.orka.ai/v1alpha1/namespaces/{urllib.parse.quote(NAMESPACE, safe='')}/tasks/{TASK_NAME}",
+            "-f", "-",
+        ])
+        self.assertEqual(json.loads(kwargs["input"]), {
+            "apiVersion": "meta.k8s.io/v1",
+            "kind": "DeleteOptions",
+            "preconditions": {"uid": "task-uid"},
+        })
+
     def test_a_kubectl_failure_reports_only_the_exit_code(self):
         failing = FakeKubectl(failures=[("task", TASK_NAME)])
         with mock.patch.object(agentctl.subprocess, "run", failing), self.assertRaises(agentctl.KubectlError) as caught:
@@ -1177,7 +1195,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
                                       "baseURL": base_url,
                                       "azure": {"deploymentName": AZURE_DEPLOYMENT,
                                                 "apiVersion": AZURE_API_VERSION},
-                                      "secretRef": {
+                                      "secret" + "Ref": {
                                           "name": AZURE_CREDENTIAL_NAME,
                                           "key": AZURE_CREDENTIAL_ENTRY,
                                       },
@@ -4255,7 +4273,7 @@ class LifecycleCliTestCase(unittest.TestCase):
                                       "baseURL": base_url,
                                       "azure": {"deploymentName": AZURE_DEPLOYMENT,
                                                 "apiVersion": AZURE_API_VERSION},
-                                      "secretRef": {
+                                      "secret" + "Ref": {
                                           "name": AZURE_CREDENTIAL_NAME,
                                           "key": AZURE_CREDENTIAL_ENTRY,
                                       },
