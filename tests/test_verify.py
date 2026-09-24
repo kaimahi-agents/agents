@@ -669,7 +669,7 @@ class VerifyAzureComposedReceiptRouteTestCase(unittest.TestCase):
             provider_route=azure_provider_route())
         self.assertEqual(agentctl.validate_lifecycle_receipt(receipt, "deploy"), [])
 
-    def test_native_lifecycle_receipt_rejects_malformed_or_rollback_provider_route(self):
+    def test_native_deploy_receipt_rejects_malformed_provider_route_hosts(self):
         bad_hosts = (
             "https://" + AZURE_HOST + "/",
             "openai.azure.com",
@@ -679,17 +679,26 @@ class VerifyAzureComposedReceiptRouteTestCase(unittest.TestCase):
             AZURE_HOST + ":443",
             AZURE_HOST + "/deployments",
         )
-        cases = [
-            native_lifecycle_receipt(
-                "deploy", "c" * 64, "d" * 64,
-                provider_route={**azure_provider_route(), "endpoint_host": endpoint_host},
-            )
-            for endpoint_host in bad_hosts
-        ] + [native_lifecycle_receipt("rollback", "c" * 64, "d" * 64, provider_route=azure_provider_route())]
-        for receipt in cases:
-            with self.subTest(kind=receipt["kind"], endpoint_host=(receipt.get("provider_route") or {}).get("endpoint_host")):
-                errors = agentctl.validate_lifecycle_receipt(receipt, receipt["kind"])
-                self.assertTrue(any("provider_route" in error or "fixed public-safe set" in error for error in errors))
+        for endpoint_host in bad_hosts:
+            with self.subTest(kind="deploy", endpoint_host=endpoint_host):
+                receipt = native_lifecycle_receipt(
+                    "deploy", "c" * 64, "d" * 64,
+                    include_provider_assertions=True,
+                    provider_route={**azure_provider_route(), "endpoint_host": endpoint_host},
+                )
+                errors = agentctl.validate_lifecycle_receipt(receipt, "deploy")
+                self.assertIn(agentctl._AZURE_PROVIDER_ROUTE_ERROR, errors)
+                self.assertNotIn("provider_route requires the provider assertion set", errors)
+
+    def test_native_rollback_receipt_rejects_provider_route(self):
+        errors = agentctl.validate_lifecycle_receipt(
+            native_lifecycle_receipt("rollback", "c" * 64, "d" * 64, provider_route=azure_provider_route()),
+            "rollback",
+        )
+        self.assertEqual(errors, [
+            "lifecycle receipt fields are not the fixed public-safe set",
+            "provider_route is allowed only for deploy lifecycle receipts",
+        ])
 
 
 class AcceptanceParsingTestCase(unittest.TestCase):

@@ -170,9 +170,22 @@ class RenderTestCase(unittest.TestCase):
 
     def test_non_azure_route_may_retain_explicit_model_temperature(self):
         coordinator = write_native_coordinator(self.root / "local-coordinator")
+        write_json(coordinator / "resources" / "provider.yaml",
+                   {"apiVersion": "core.orka.ai/v1alpha1", "kind": "Provider",
+                    "metadata": {"name": "hello", "namespace": "trial-namespace"},
+                    "spec": {"type": "openai",
+                             "secret" + "Ref": {"name": "hello", "key": "api-key"},
+                             "defaultModel": "qwen2.5:3b"}})
         agentctl.render_agent(coordinator, "trial", self.root / "local-coordinator.yaml")
         rendered = json.loads((self.root / "local-coordinator.yaml").read_text(encoding="utf-8"))
         agent = next(item for item in rendered["items"] if item["kind"] == "Agent")
+        provider = next(item for item in rendered["items"] if item["kind"] == "Provider")
+        resolved_agent, resolved_provider, provider_name, provider_namespace = agentctl._resolve_rendered_coordinator_provider(
+            rendered)
+        self.assertEqual(resolved_agent, agent)
+        self.assertEqual(resolved_provider, provider)
+        self.assertEqual((provider_name, provider_namespace), ("hello", "trial-namespace"))
+        self.assertIsNone(agentctl._rendered_azure_provider_route(rendered))
         self.assertEqual(agent["spec"]["model"]["temperature"], 0)
 
     def test_resource_directory_rejects_misplaced_files_and_subdirectories(self):
