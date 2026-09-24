@@ -148,6 +148,10 @@ def _transform(resource: dict, environment: str, overlay: dict) -> dict:
     return rendered
 
 
+_EMBEDDED_PROVIDER_DUPLICATE_ERROR = (
+    "resources/ must not contain more than one embedded Provider matching the Agent providerRef")
+
+
 def _embedded_provider_item_for_single_agent(items: list[dict]) -> dict | None:
     agents = [item for item in items if isinstance(item, dict) and item.get("kind") == "Agent"]
     if len(agents) != 1:
@@ -159,6 +163,8 @@ def _embedded_provider_item_for_single_agent(items: list[dict]) -> dict | None:
                  if isinstance(item, dict) and item.get("kind") == "Provider"
                  and ((item.get("metadata") or {}).get("name") == provider_name)
                  and ((item.get("metadata") or {}).get("namespace") == provider_namespace)]
+    if len(providers) > 1:
+        raise BundleError(_EMBEDDED_PROVIDER_DUPLICATE_ERROR)
     return providers[0] if len(providers) == 1 else None
 
 

@@ -1532,12 +1532,15 @@ class ComposedEvalCliTestCase(unittest.TestCase):
 
     def test_composed_live_eval_requires_exact_rendered_provider_resolution_for_non_legacy_routes_before_side_effects(self):
         cases = (
-            ("missing", lambda: (self.coordinator / "resources" / "provider.yaml").unlink()),
+            ("missing", lambda: (self.coordinator / "resources" / "provider.yaml").unlink(),
+             "eval failed: rendered bundle does not resolve exactly one coordinator Provider"),
             ("mismatch", lambda: self._rewrite_coordinator_provider_resource(
-                lambda provider: provider["metadata"].update({"name": "other-provider"}))),
-            ("duplicate", lambda: self._duplicate_coordinator_provider_resource()),
+                lambda provider: provider["metadata"].update({"name": "other-provider"})),
+             "eval failed: rendered bundle does not resolve exactly one coordinator Provider"),
+            ("duplicate", lambda: self._duplicate_coordinator_provider_resource(),
+             "eval failed: render: resources/ must not contain more than one embedded Provider matching the Agent providerRef"),
         )
-        for label, mutate in cases:
+        for label, mutate, message in cases:
             with self.subTest(case=label):
                 self.setUp()
                 self._switch_coordinator_to_azure()
@@ -1546,7 +1549,7 @@ class ComposedEvalCliTestCase(unittest.TestCase):
                     "delegates", self.root / "delegates-task.json", **{"--model": AZURE_DEPLOYMENT})
                 self._assert_rejected_before_side_effects(
                     code, out, err,
-                    message="eval failed: rendered bundle does not resolve exactly one coordinator Provider",
+                    message=message,
                 )
 
     def test_azure_delegate_receipt_derives_provider_route_token_usage_and_request_count_from_the_journal(self):
@@ -3313,19 +3316,22 @@ class ComposedEvalCliTestCase(unittest.TestCase):
 
     def test_reuse_current_azure_anchor_requires_exact_rendered_provider_resolution_for_non_legacy_routes(self):
         cases = (
-            ("missing", lambda: (self.coordinator / "resources" / "provider.yaml").unlink()),
+            ("missing", lambda: (self.coordinator / "resources" / "provider.yaml").unlink(),
+             "eval failed: rendered bundle does not resolve exactly one coordinator Provider"),
             ("mismatch", lambda: self._rewrite_coordinator_provider_resource(
-                lambda provider: provider["metadata"].update({"name": "other-provider"}))),
-            ("duplicate", lambda: self._duplicate_coordinator_provider_resource()),
+                lambda provider: provider["metadata"].update({"name": "other-provider"})),
+             "eval failed: rendered bundle does not resolve exactly one coordinator Provider"),
+            ("duplicate", lambda: self._duplicate_coordinator_provider_resource(),
+             "eval failed: render: resources/ must not contain more than one embedded Provider matching the Agent providerRef"),
         )
-        for label, mutate in cases:
+        for label, mutate, message in cases:
             with self.subTest(case=label):
                 self.setUp()
                 self.seed_azure_delegate_evidence()
                 mutate()
                 self._assert_reuse_failure_preserves_bytes(
                     self.reuse_eval_argv("delegates", **{"--model": AZURE_DEPLOYMENT}),
-                    "eval failed: rendered bundle does not resolve exactly one coordinator Provider",
+                    message,
                 )
 
     def test_reuse_current_azure_anchor_rejects_unsupported_rendered_provider_endpoints(self):
@@ -4922,20 +4928,23 @@ class LifecycleCliTestCase(unittest.TestCase):
 
     def test_native_lifecycle_requires_exact_rendered_provider_resolution_for_non_legacy_routes_before_cluster_calls(self):
         cases = (
-            ("missing", lambda: (self.coordinator / "resources" / "provider.yaml").unlink()),
+            ("missing", lambda: (self.coordinator / "resources" / "provider.yaml").unlink(),
+             "rendered bundle does not resolve exactly one coordinator Provider"),
             ("mismatch", lambda: self._rewrite_native_coordinator_provider_resource(
-                lambda provider: provider["metadata"].update({"name": "other-provider"}))),
-            ("duplicate", lambda: self._duplicate_native_coordinator_provider_resource()),
+                lambda provider: provider["metadata"].update({"name": "other-provider"})),
+             "rendered bundle does not resolve exactly one coordinator Provider"),
+            ("duplicate", lambda: self._duplicate_native_coordinator_provider_resource(),
+             "resources/ must not contain more than one embedded Provider matching the Agent providerRef"),
         )
         for kind in ("deploy", "rollback"):
-            for label, mutate in cases:
+            for label, mutate, message in cases:
                 with self.subTest(kind=kind, case=label):
                     self.setup_native_composition()
                     self._switch_native_coordinator_to_azure()
                     mutate()
                     with self.assertRaises(agentctl.CliError) as caught:
                         self.run_native_lifecycle(kind)
-                    self.assertIn("rendered bundle does not resolve exactly one coordinator Provider", str(caught.exception))
+                    self.assertIn(message, str(caught.exception))
                     self.assertEqual(
                         [argv for argv, _ in self.native_kubectl.calls if argv and argv[0] == "kubectl"],
                         [],

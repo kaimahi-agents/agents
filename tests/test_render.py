@@ -105,6 +105,47 @@ class RenderTestCase(unittest.TestCase):
         coordinator = write_azure_native_coordinator(self.root / "azure-coordinator")
         agentctl.render_agent(coordinator, "trial", self.root / "azure-coordinator.yaml")
 
+    def test_duplicate_matching_embedded_providers_raise_a_fixed_safe_error_regardless_of_file_order(self):
+        duplicate_message = "resources/ must not contain more than one embedded Provider matching the Agent providerRef"
+        cases = (
+            ("hostile-current-safe-later-duplicate", "z-provider.yaml", "https://127.0.0.1/", AZURE_ENDPOINT),
+            ("safe-current-hostile-earlier-duplicate", "a-provider.yaml", AZURE_ENDPOINT, "https://127.0.0.1/"),
+        )
+        for label, duplicate_file, current_url, duplicate_url in cases:
+            with self.subTest(case=label):
+                coordinator = write_azure_native_coordinator(self.root / label)
+                provider_path = coordinator / "resources" / "provider.yaml"
+                current = json.loads(provider_path.read_text(encoding="utf-8"))
+                current["spec"]["baseURL"] = current_url
+                duplicate = json.loads(provider_path.read_text(encoding="utf-8"))
+                duplicate["spec"]["baseURL"] = duplicate_url
+                write_json(provider_path, current)
+                write_json(coordinator / "resources" / duplicate_file, duplicate)
+                with self.assertRaises(agentctl.BundleError) as caught:
+                    agentctl.render_agent(coordinator, "trial", self.root / f"{label}.yaml")
+                self.assertEqual(str(caught.exception), duplicate_message)
+                self.assertNotIn("baseURL", str(caught.exception))
+                self.assertNotIn("127.0.0.1", str(caught.exception))
+
+    def test_two_safe_duplicate_matching_embedded_providers_are_rejected(self):
+        duplicate_message = "resources/ must not contain more than one embedded Provider matching the Agent providerRef"
+        coordinator = write_azure_native_coordinator(self.root / "azure-duplicate-safe")
+        provider_path = coordinator / "resources" / "provider.yaml"
+        duplicate = json.loads(provider_path.read_text(encoding="utf-8"))
+        write_json(coordinator / "resources" / "a-provider.yaml", duplicate)
+        with self.assertRaises(agentctl.BundleError) as caught:
+            agentctl.render_agent(coordinator, "trial", self.root / "never.yaml")
+        self.assertEqual(str(caught.exception), duplicate_message)
+
+    def test_unrelated_embedded_providers_do_not_count_toward_the_single_match(self):
+        coordinator = write_azure_native_coordinator(self.root / "azure-unrelated-provider")
+        provider_path = coordinator / "resources" / "provider.yaml"
+        unrelated = json.loads(provider_path.read_text(encoding="utf-8"))
+        unrelated["metadata"]["name"] = "other-provider"
+        unrelated["spec"]["baseURL"] = "https://127.0.0.1/"
+        write_json(coordinator / "resources" / "a-unrelated-provider.yaml", unrelated)
+        agentctl.render_agent(coordinator, "trial", self.root / "azure-unrelated-provider.yaml")
+
     def test_azure_route_requires_a_public_openai_resource_subdomain_endpoint(self):
         coordinator = write_azure_native_coordinator(self.root / "azure-coordinator")
         provider_path = coordinator / "resources" / "provider.yaml"
