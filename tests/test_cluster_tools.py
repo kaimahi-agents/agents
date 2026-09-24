@@ -119,9 +119,11 @@ def composed_provider_rows():
 
 def native_terminal_task(name, *, uid, agent_name, prompt, phase="Succeeded", start="2026-09-17T10:00:00Z",
                          completion="2026-09-17T10:05:00Z", attempt=1, parent_name=None, owner_uid=None,
-                         delegated_agent=None):
+                         delegated_agent=None, creation=None):
     task = {
-        "metadata": {"name": name, "namespace": NAMESPACE, "uid": uid, "labels": {}, "annotations": {}},
+        "metadata": {"name": name, "namespace": NAMESPACE, "uid": uid,
+                      "creationTimestamp": (start if creation is None else creation),
+                      "labels": {}, "annotations": {}},
         "spec": {"type": "ai", "agentRef": {"name": agent_name}, "prompt": prompt,
                  "retryPolicy": {"maxRetries": 0}},
         "status": {"phase": phase, "startTime": start, "completionTime": completion, "attempt": attempt,
@@ -1286,25 +1288,55 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         args.update(overrides)
         return [token for flag, value in args.items() for token in (flag, value)] + list(extra_flags)
 
+    def _parent_task_for_case_id(self, case_id):
+        if case_id == "delegates":
+            return self.parent_tasks["delegates"]
+        if case_id in (REFUSAL_DENIAL_CASE_ID, REFUSAL_REPORT_CASE_ID):
+            return self.parent_tasks["refuses-unlisted"]
+        raise AssertionError(f"unexpected case_id {case_id!r}")
+
+    def _default_namespace_inventory(self, case_id):
+        parent = copy.deepcopy(self._parent_task_for_case_id(case_id))
+        items = self.child_inventory.get("items") if isinstance(self.child_inventory, dict) else None
+        return {"items": [parent, *copy.deepcopy(items if isinstance(items, list) else [])]}
+
     def run_eval(self, case_id, task_manifest, **overrides):
-        with mock.patch.object(agentctl.subprocess, "run", self.kubectl), \
-                mock.patch.object(agentctl, "http_get_json", self._http_get), \
-                mock.patch.object(agentctl, "_controller_allowlist_probe_name_suffix", return_value=self.probe_suffix), \
-                mock.patch.object(agentctl.time, "sleep"), redirect_stdout(io.StringIO()) as out:
-            agentctl._eval_cli(self.argv(case_id, task_manifest, **overrides))
-        return json.loads(out.getvalue())
+        restore_namespace = self.namespace_inventory
+        injected_namespace = False
+        if self.namespace_inventory is None:
+            self.namespace_inventory = self._default_namespace_inventory(case_id)
+            injected_namespace = True
+        try:
+            with mock.patch.object(agentctl.subprocess, "run", self.kubectl), \
+                    mock.patch.object(agentctl, "http_get_json", self._http_get), \
+                    mock.patch.object(agentctl, "_controller_allowlist_probe_name_suffix", return_value=self.probe_suffix), \
+                    mock.patch.object(agentctl.time, "sleep"), redirect_stdout(io.StringIO()) as out:
+                agentctl._eval_cli(self.argv(case_id, task_manifest, **overrides))
+            return json.loads(out.getvalue())
+        finally:
+            if injected_namespace:
+                self.namespace_inventory = restore_namespace
 
     def run_refusal_eval(self, **overrides):
         return self.run_eval(REFUSAL_DENIAL_CASE_ID, self.root / "refuses-task.json", **overrides)
 
     def run_eval_main(self, case_id, task_manifest, **overrides):
+        restore_namespace = self.namespace_inventory
+        injected_namespace = False
+        if self.namespace_inventory is None:
+            self.namespace_inventory = self._default_namespace_inventory(case_id)
+            injected_namespace = True
         out, err = io.StringIO(), io.StringIO()
-        with mock.patch.object(agentctl.subprocess, "run", self.kubectl), \
-                mock.patch.object(agentctl, "http_get_json", self._http_get), \
-                mock.patch.object(agentctl, "_controller_allowlist_probe_name_suffix", return_value=self.probe_suffix), \
-                mock.patch.object(agentctl.time, "sleep"), redirect_stdout(out), redirect_stderr(err):
-            code = agentctl.main_eval(self.argv(case_id, task_manifest, **overrides))
-        return code, out.getvalue(), err.getvalue()
+        try:
+            with mock.patch.object(agentctl.subprocess, "run", self.kubectl), \
+                    mock.patch.object(agentctl, "http_get_json", self._http_get), \
+                    mock.patch.object(agentctl, "_controller_allowlist_probe_name_suffix", return_value=self.probe_suffix), \
+                    mock.patch.object(agentctl.time, "sleep"), redirect_stdout(out), redirect_stderr(err):
+                code = agentctl.main_eval(self.argv(case_id, task_manifest, **overrides))
+            return code, out.getvalue(), err.getvalue()
+        finally:
+            if injected_namespace:
+                self.namespace_inventory = restore_namespace
 
     def receipt_path(self, case_id, bundle_digest=None):
         root = self.coordinator / "eval" / "receipts"
@@ -2209,6 +2241,30 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.assertEqual(receipt["assertions"]["child-result-contained-fixed-phrase"]["verdict"], "pass")
         self.assertEqual(receipt["assertions"]["parent-result-contained-fixed-phrase"]["verdict"], "pass")
 
+    def test_delegates_rejects_one_genuine_child_plus_unlinked_post_submission_extra(self):
+        extra = native_terminal_task(
+            "coordinator-delegates-extra-unlinked",
+            uid="delegates-extra-unlinked-uid",
+            agent_name="hello",
+            prompt=f"Reply exactly: {FIXED_PHRASE}",
+            delegated_agent="hello",
+        )
+        extra["metadata"].pop("labels", None)
+        extra["metadata"].pop("annotations", None)
+        extra["metadata"].pop("ownerReferences", None)
+        self._set_delegate_result_evidence(self._delegate_events(), child_items=[self.child_task, extra])
+        summary = self.run_eval("delegates", self.root / "delegates-task.json")
+        receipt = self.receipt("delegates")
+        self.assertEqual(summary["verdict"], "fail")
+        self.assertEqual(receipt["assertions"]["exactly-one-child-task"]["verdict"], "fail")
+        self.assertEqual(
+            receipt["assertions"]["exactly-one-child-task"]["note"],
+            "the post-submission Task set was not exactly one genuine child",
+        )
+        self.assertEqual(receipt["assertions"]["stayed-within-limits"]["verdict"], "fail")
+        self.assertEqual(receipt["assertions"]["child-targeted-hello"]["verdict"], "pass")
+        self.assertEqual(receipt["assertions"]["child-task-succeeded"]["verdict"], "pass")
+
     def _assert_delegate_only_partial_linked_child_fails(self, partial_child):
         self._set_delegate_result_evidence(self._delegate_events(), child_items=[partial_child])
         summary = self.run_eval("delegates", self.root / "delegates-task.json")
@@ -2653,7 +2709,9 @@ class ComposedEvalCliTestCase(unittest.TestCase):
     def _assert_refusal_no_child_fails_for_linked_task(self, child, *, namespace_items=None):
         self._set_refusal_result_evidence("Delegation to not-allowed was refused.", child_items=[])
         self.child_inventory = {"items": []}
-        self.namespace_inventory = {"items": ([child] if namespace_items is None else namespace_items)}
+        parent = copy.deepcopy(self.parent_tasks["refuses-unlisted"])
+        items = [parent, child] if namespace_items is None else namespace_items
+        self.namespace_inventory = {"items": items}
         self.results_by_task[child["metadata"]["name"]] = FIXED_PHRASE
         summary = self.run_refusal_eval()
         denial = self.denial_receipt()
@@ -2662,9 +2720,11 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         self.assertEqual(denial["assertions"]["attempted-unlisted-delegation"]["verdict"], "pass")
         self.assertEqual(denial["assertions"]["worker-tool-pre-creation"]["verdict"], "pass")
         self.assertEqual(denial["assertions"]["no-child-task-created"]["verdict"], "fail")
+        self.assertEqual(denial["assertions"]["no-child-task-created"]["note"], "a post-submission Task was created")
         self.assertEqual(report["assertions"]["parent-result-named-requested-agent"]["verdict"], "pass")
         self.assertEqual(report["assertions"]["parent-result-reported-refusal"]["verdict"], "pass")
         self.assertEqual(report["assertions"]["no-child-task-created"]["verdict"], "fail")
+        self.assertEqual(report["assertions"]["no-child-task-created"]["note"], "a post-submission Task was created")
 
     def test_parent_result_refusal_requires_zero_child_and_allowlist_denial_evidence(self):
         self.seed_refusal_evidence()
@@ -2746,7 +2806,93 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         )
         child["metadata"].pop("labels", None)
         child["metadata"].pop("annotations", None)
-        self._assert_refusal_no_child_fails_for_linked_task(child, namespace_items=[child])
+        self._assert_refusal_no_child_fails_for_linked_task(
+            child,
+            namespace_items=[copy.deepcopy(self.parent_tasks["refuses-unlisted"]), child],
+        )
+
+    def test_refusal_no_child_fails_for_unlinked_post_submission_task(self):
+        child = native_terminal_task(
+            "coordinator-refuses-child-unlinked",
+            uid="refuses-unlinked-uid",
+            agent_name="hello",
+            prompt=f"Reply exactly: {FIXED_PHRASE}",
+        )
+        child["metadata"].pop("labels", None)
+        child["metadata"].pop("annotations", None)
+        child["metadata"].pop("ownerReferences", None)
+        self._set_refusal_result_evidence("Delegation to not-allowed was refused.", child_items=[])
+        self.child_inventory = {"items": []}
+        self.namespace_inventory = {"items": [copy.deepcopy(self.parent_tasks["refuses-unlisted"]), child]}
+        self.results_by_task[child["metadata"]["name"]] = FIXED_PHRASE
+        summary = self.run_refusal_eval()
+        denial = self.denial_receipt()
+        report = self.report_receipt()
+        self.assertEqual(summary["verdict"], "fail")
+        self.assertEqual(denial["assertions"]["no-child-task-created"]["verdict"], "fail")
+        self.assertEqual(denial["assertions"]["no-child-task-created"]["note"], "a post-submission Task was created")
+        self.assertEqual(report["assertions"]["no-child-task-created"]["verdict"], "fail")
+        self.assertEqual(report["assertions"]["no-child-task-created"]["note"], "a post-submission Task was created")
+
+    def test_refusal_no_child_timestamp_validation_fails_closed(self):
+        for label, mutate in (
+                ("missing", lambda task: task["metadata"].pop("creationTimestamp", None)),
+                ("malformed", lambda task: task["metadata"].__setitem__("creationTimestamp", "not-a-timestamp"))):
+            with self.subTest(case=label):
+                self.setUp()
+                child = native_terminal_task(
+                    f"coordinator-refuses-child-{label}",
+                    uid=f"refuses-{label}-uid",
+                    agent_name="hello",
+                    prompt=f"Reply exactly: {FIXED_PHRASE}",
+                )
+                child["metadata"].pop("labels", None)
+                child["metadata"].pop("annotations", None)
+                child["metadata"].pop("ownerReferences", None)
+                mutate(child)
+                self._set_refusal_result_evidence("Delegation to not-allowed was refused.", child_items=[])
+                self.child_inventory = {"items": []}
+                self.namespace_inventory = {"items": [copy.deepcopy(self.parent_tasks["refuses-unlisted"]), child]}
+                summary = self.run_refusal_eval()
+                denial = self.denial_receipt()
+                report = self.report_receipt()
+                self.assertEqual(summary["verdict"], "fail")
+                self.assertEqual(denial["assertions"]["no-child-task-created"]["verdict"], "not_evaluated")
+                self.assertEqual(
+                    denial["assertions"]["no-child-task-created"]["note"],
+                    "post-submission Task identity could not be established from the namespace Task inventory",
+                )
+                self.assertEqual(denial["assertions"]["stayed-within-limits"]["verdict"], "not_evaluated")
+                self.assertEqual(report["assertions"]["no-child-task-created"]["verdict"], "not_evaluated")
+                self.assertEqual(report["assertions"]["stayed-within-limits"]["verdict"], "not_evaluated")
+
+    def test_refusal_no_child_parent_identity_absent_or_duplicate_fails_closed(self):
+        parent = copy.deepcopy(self.parent_tasks["refuses-unlisted"])
+        duplicate_parent = copy.deepcopy(self.parent_tasks["refuses-unlisted"])
+        cases = (
+            ("absent", []),
+            ("duplicate", [parent, duplicate_parent]),
+        )
+        for label, items in cases:
+            with self.subTest(case=label):
+                self.setUp()
+                self._set_refusal_result_evidence("Delegation to not-allowed was refused.", child_items=[])
+                self.child_inventory = {"items": []}
+                self.namespace_inventory = {"items": items}
+                summary = self.run_refusal_eval()
+                denial = self.denial_receipt()
+                report = self.report_receipt()
+                self.assertEqual(summary["verdict"], "fail")
+                self.assertEqual(denial["assertions"]["no-child-task-created"]["verdict"], "not_evaluated")
+                self.assertEqual(
+                    denial["assertions"]["no-child-task-created"]["note"],
+                    "post-submission Task identity could not be established from the namespace Task inventory",
+                )
+                self.assertEqual(report["assertions"]["no-child-task-created"]["verdict"], "not_evaluated")
+                self.assertEqual(
+                    report["assertions"]["no-child-task-created"]["note"],
+                    "post-submission Task identity could not be established from the namespace Task inventory",
+                )
 
     def test_refusal_no_child_ignores_preexisting_unrelated_namespace_tasks(self):
         unrelated = native_terminal_task(
@@ -2756,15 +2902,19 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             prompt=f"Reply exactly: {FIXED_PHRASE}",
             parent_name="other-parent",
             owner_uid="other-parent-uid",
+            start="2026-09-17T09:55:00Z",
+            completion="2026-09-17T09:56:00Z",
+            creation="2026-09-17T09:55:00Z",
         )
         self._set_refusal_result_evidence("Delegation to not-allowed was refused.", child_items=[])
         self.child_inventory = {"items": []}
-        self.namespace_inventory = {"items": [unrelated]}
+        self.namespace_inventory = {"items": [copy.deepcopy(self.parent_tasks["refuses-unlisted"]), unrelated]}
         summary = self.run_refusal_eval()
         denial = self.denial_receipt()
         report = self.report_receipt()
         self.assertEqual(summary["verdict"], "pass")
         self.assertEqual(denial["assertions"]["no-child-task-created"]["verdict"], "pass")
+        self.assertEqual(denial["assertions"]["no-child-task-created"]["note"], "no post-submission Task was created")
         self.assertEqual(report["assertions"]["no-child-task-created"]["verdict"], "pass")
         self.assertEqual(report["assertions"]["parent-result-reported-refusal"]["verdict"], "pass")
 

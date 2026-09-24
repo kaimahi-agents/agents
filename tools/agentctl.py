@@ -1435,6 +1435,55 @@ def parse_timestamp(value) -> datetime.datetime:
                                                + ("+00:00" if offset == "Z" else offset))
     except ValueError as exc:
         raise CliError("timestamp is not a valid RFC3339 value") from exc
+
+
+def _task_name(task) -> str | None:
+    metadata = task.get("metadata") if isinstance(task, dict) else None
+    name = metadata.get("name") if isinstance(metadata, dict) else None
+    return name if isinstance(name, str) and name else None
+
+
+def _task_creation_timestamp(task) -> datetime.datetime | None:
+    metadata = task.get("metadata") if isinstance(task, dict) else None
+    value = metadata.get("creationTimestamp") if isinstance(metadata, dict) else None
+    try:
+        return parse_timestamp(value)
+    except CliError:
+        return None
+
+
+def _bound_post_submission_task_inventory(terminal_task, raw_child_inventory) -> dict | None:
+    raw_child_items = (raw_child_inventory.get("items")
+                       if isinstance(raw_child_inventory, dict) and isinstance(raw_child_inventory.get("items"), list)
+                       else None)
+    parent_name = _task_name(terminal_task)
+    parent_uid = _task_uid(terminal_task)
+    parent_created = _task_creation_timestamp(terminal_task)
+    if not (isinstance(raw_child_items, list) and isinstance(parent_name, str) and parent_name
+            and isinstance(parent_uid, str) and parent_uid and parent_created is not None):
+        return None
+    parent_matches, post_submission_tasks = [], []
+    for task in raw_child_items:
+        task_name = _task_name(task)
+        task_uid = _task_uid(task)
+        if task_name == parent_name and task_uid == parent_uid:
+            parent_matches.append(task)
+            continue
+        task_created = _task_creation_timestamp(task)
+        if not (isinstance(task_name, str) and task_name and isinstance(task_uid, str) and task_uid
+                and task_created is not None):
+            return None
+        if task_created >= parent_created:
+            post_submission_tasks.append(task)
+    if len(parent_matches) != 1:
+        return None
+    return {
+        "parent_name": parent_name,
+        "parent_uid": parent_uid,
+        "post_submission_tasks": post_submission_tasks,
+        "linked_children": linked_child_tasks(post_submission_tasks, parent_name, parent_uid),
+        "genuine_children": genuine_child_tasks(post_submission_tasks, parent_name, parent_uid),
+    }
 def check_journal_completeness(events, latest_seq) -> list[str]:
     """Diagnostics; empty means `events` covers `1..latest_seq` with no gap and no duplicate."""
     if not isinstance(latest_seq, int) or latest_seq < 0:
@@ -3764,21 +3813,16 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
                                  requested_agent: str | None = None,
                                  observation: dict | None = None) -> tuple[dict, dict]:
     limits = case["limits"]
-    raw_child_items = (raw_child_inventory.get("items")
-                       if isinstance(raw_child_inventory, dict) and isinstance(raw_child_inventory.get("items"), list)
-                       else None)
-    task_name = (task_manifest.get("metadata") or {}).get("name") if isinstance(task_manifest, dict) else None
-    parent_uid = ((terminal_task.get("metadata") or {}).get("uid") if isinstance(terminal_task, dict) else None)
-    child_inventory_known = (isinstance(task_name, str) and task_name and isinstance(parent_uid, str) and parent_uid
-                             and raw_child_items is not None)
-    linked_children = (linked_child_tasks(raw_child_items or [], task_name, parent_uid)
-                       if child_inventory_known else [])
-    genuine_children = (genuine_child_tasks(raw_child_items or [], task_name, parent_uid)
-                        if child_inventory_known else [])
+    task_inventory = _bound_post_submission_task_inventory(terminal_task, raw_child_inventory)
+    child_inventory_known = task_inventory is not None
+    post_submission_tasks = (task_inventory["post_submission_tasks"] if task_inventory is not None else [])
+    linked_children = task_inventory["linked_children"] if task_inventory is not None else []
+    genuine_children = task_inventory["genuine_children"] if task_inventory is not None else []
+    inventory_incomplete_note = "post-submission Task identity could not be established from the namespace Task inventory"
     completeness_errors = check_journal_completeness(events, latest_seq)
     journal_complete = not completeness_errors
     incomplete_journal_note = f"journal is incomplete: {'; '.join(completeness_errors)}"
-    expected_child_tasks = ([(child.get("metadata") or {}).get("name") for child in genuine_children]
+    expected_child_tasks = ([_task_name(child) for child in genuine_children]
                             if child_inventory_known else None)
     azure_authoritative_requests = provider_route is not None
     if azure_authoritative_requests:
@@ -3975,7 +4019,7 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
         "no-unexpected-tool-calls": no_unexpected_assertion(),
         "stayed-within-limits": ((lambda within: settled(within, limit_pass_note if within else limit_fail_note))(
                 count <= limits["provider_requests"] and total_calls <= limits["tool_calls"]
-                and len(linked_children) <= limits["child_tasks"] and retry_ok)
+                and len(post_submission_tasks) <= limits["child_tasks"] and retry_ok)
             if limit_counts_established else
             not_evaluated(limit_incomplete_note)),
     }
@@ -3995,11 +4039,13 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
         assertions |= {
             "expected-delegation-tool-calls": expected_call_assertion(),
             "exactly-one-child-task": ((lambda exact: settled(
-                exact, "exactly one linked child Task was captured and it was genuine" if exact
-                else "the linked child Task count was not exactly one genuine child"))(
-                    len(linked_children) == 1 and len(genuine_children) == 1)
+                exact, "exactly one post-submission Task was captured and it was the one genuine child" if exact
+                else "the post-submission Task set was not exactly one genuine child"))(
+                    len(post_submission_tasks) == 1 and len(genuine_children) == 1
+                    and _task_name(post_submission_tasks[0]) == _task_name(genuine_children[0])
+                    and _task_uid(post_submission_tasks[0]) == _task_uid(genuine_children[0]))
                 if child_inventory_known else
-                not_evaluated("genuine child Task identity could not be established")),
+                not_evaluated(inventory_incomplete_note)),
             "child-targeted-hello": tri_state(child_targeted, "the genuine child targeted hello",
                                                "the genuine child did not target hello",
                                                "the genuine child targeting evidence was incomplete"),
@@ -4023,10 +4069,10 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
         attempted_unlisted = attempted_unlisted_assertion()
         worker_tool_refusal = worker_tool_refusal_assertion()
         no_child_created = ((lambda none_created: settled(
-            none_created, "no linked child Task was created" if none_created
-            else "a linked child Task was created"))(len(linked_children) == 0)
+            none_created, "no post-submission Task was created" if none_created
+            else "a post-submission Task was created"))(len(post_submission_tasks) == 0)
             if child_inventory_known else
-            not_evaluated("linked child Task identity could not be established from the namespace Task inventory"))
+            not_evaluated(inventory_incomplete_note))
         assertions |= {
             "expected-delegation-tool-calls": expected_call_assertion(),
             "attempted-unlisted-delegation": attempted_unlisted,
@@ -4035,10 +4081,10 @@ def _score_composed_coordination(args, case: dict, *, render_context: dict, task
         }
     else:
         no_child_created = ((lambda none_created: settled(
-            none_created, "no linked child Task was created" if none_created
-            else "a linked child Task was created"))(len(linked_children) == 0)
+            none_created, "no post-submission Task was created" if none_created
+            else "a post-submission Task was created"))(len(post_submission_tasks) == 0)
             if child_inventory_known else
-            not_evaluated("linked child Task identity could not be established from the namespace Task inventory"))
+            not_evaluated(inventory_incomplete_note))
         named_requested_agent = (_parent_result_names_requested_agent(parent_result, requested_agent)
                                  if isinstance(parent_result, str) else None)
         refusal_reported = (_parent_result_matches_closed_denial_report(parent_result, requested_agent)
@@ -4198,15 +4244,11 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict]
     raw_child_inventory = run_kubectl_json(
         args.context, args.kubeconfig,
         ["get", "tasks.core.orka.ai", "-n", args.namespace])
-    raw_child_items = (raw_child_inventory.get("items")
-                       if isinstance(raw_child_inventory, dict) and isinstance(raw_child_inventory.get("items"), list)
-                       else None)
-    parent_uid = ((terminal_task.get("metadata") or {}).get("uid") if isinstance(terminal_task, dict) else None)
-    child_inventory_known = isinstance(parent_uid, str) and raw_child_items is not None
-    linked_children = (linked_child_tasks(raw_child_items or [], task_name, parent_uid)
-                       if child_inventory_known else [])
-    genuine_children = (genuine_child_tasks(raw_child_items or [], task_name, parent_uid)
-                        if child_inventory_known else [])
+    task_inventory = _bound_post_submission_task_inventory(terminal_task, raw_child_inventory)
+    child_inventory_known = task_inventory is not None
+    linked_children = task_inventory["linked_children"] if task_inventory is not None else []
+    genuine_children = task_inventory["genuine_children"] if task_inventory is not None else []
+    post_submission_tasks = (task_inventory["post_submission_tasks"] if task_inventory is not None else [])
     child_terminal_tasks, child_results = [], {}
     for child in genuine_children:
         phase = (child.get("status") or {}).get("phase") if isinstance(child, dict) else None
@@ -4238,13 +4280,13 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict]
                     child_events, child_latest_seq = [], None
             child_journals.append({"task": child_name, "events": child_events, "latestSeq": child_latest_seq})
     reconcile_campaign_entry(args.evidence_root, source_case_id, reserved["attempt"], parent_count=1,
-                             child_count=len(genuine_children), probe_count=0)
+                             child_count=len(post_submission_tasks), probe_count=0)
     records = ([] if provider_route is not None
                else parse_provider_log_for_composed_coordination(_read_text(args.provider_log, "--provider-log")))
     observation, probe_evidence_sha256, probe_warning = None, [], False
     if args.case_id in COMPOSED_REFUSAL_CASE_IDS:
         if not campaign_case_reserved(args.evidence_root, CONTROLLER_ALLOWLIST_OBSERVATION_ID):
-            if child_inventory_known and len(linked_children) == 0:
+            if child_inventory_known and len(post_submission_tasks) == 0:
                 try:
                     observation = run_controller_allowlist_probe(
                         args, evidence_dir=evidence_dir, coordinator_live=coordinator_live,
@@ -4325,15 +4367,9 @@ def _reuse_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict
                      if isinstance(parent_result_holder, dict) and isinstance(parent_result_holder.get("result"), str)
                      else None)
     raw_child_inventory = _read_receipt_bound_json(prior_receipt, evidence_dir, "child-inventory.json")
-    raw_child_items = (raw_child_inventory.get("items")
-                       if isinstance(raw_child_inventory, dict) and isinstance(raw_child_inventory.get("items"), list)
-                       else None)
-    task_name = (task_manifest.get("metadata") or {}).get("name") if isinstance(task_manifest, dict) else None
-    parent_uid = ((terminal_task.get("metadata") or {}).get("uid") if isinstance(terminal_task, dict) else None)
-    child_inventory_known = (isinstance(task_name, str) and task_name and isinstance(parent_uid, str) and parent_uid
-                             and raw_child_items is not None)
-    genuine_children = (genuine_child_tasks(raw_child_items or [], task_name, parent_uid)
-                        if child_inventory_known else [])
+    task_inventory = _bound_post_submission_task_inventory(terminal_task, raw_child_inventory)
+    child_inventory_known = task_inventory is not None
+    genuine_children = task_inventory["genuine_children"] if task_inventory is not None else []
     child_tasks_holder = _read_receipt_bound_json(prior_receipt, evidence_dir, "child-tasks.json")
     child_terminal_tasks = child_tasks_holder.get("items") if isinstance(child_tasks_holder, dict) else None
     if not isinstance(child_terminal_tasks, list):
