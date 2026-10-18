@@ -1,27 +1,58 @@
 # Changing an agent
 
-Keep the definition, prompt, dependency lock, acceptance rules, and receipts in
-one agent directory. A change to any behavior input creates a new version
-digest.
+Keep source and evidence in one agent directory. `hello` uses a KMX workspace
+and portable evidence; the remaining agents temporarily use legacy resources,
+locks, acceptance rules, and receipts. A change to any behavior input creates a
+new version digest in either format.
 
 ## 1. Edit the agent
 
 Change only the files needed for the behavior you want. Do not edit an old
 receipt to fit a new version.
 
-## 2. Render and check it
+## 2. Prepare and check it
+
+For `hello`, prepare the current source into a local OCI layout and inspect its
+exact manifest digest without evaluating:
+
+```sh
+tmp="$(mktemp -d)"
+KMX_HOME="$tmp/kmx-home" kmx push --workspace agents/hello/workspace \
+  --unevaluated --to-layout "$tmp/layout" hello:review
+kmx suite validate "$tmp/layout"
+```
+
+For a legacy agent, render and verify every declared environment:
 
 ```sh
 tools/render agents/<name> trial --output /tmp/<name>.json
 tools/verify agents/<name> trial
 ```
 
-Run the same check for every environment named by the agent's acceptance
+Run the same check for every environment named by the legacy agent's acceptance
 rules.
 
 ## 3. Run the required cases
 
-Each agent README says what its cases check. `tools/eval` submits one case and
+For `hello`, use KMX v0.8.1 to run the complete workspace against an explicit
+context and Ready Provider. KMX registers passing managed proof only after all
+cases pass, candidate cleanup completes, and source inputs remain unchanged:
+
+```sh
+export KMX_HOME="$HOME/.local/share/kmx-hello"
+kmx eval --workspace agents/hello/workspace \
+  --to-context "$CONTEXT" --to-namespace orka-system \
+  --inference provider:"$PROVIDER"
+kmx eval export --workspace agents/hello/workspace \
+  --member hello --out "$PWD/agents/hello/verification/evidence.next.json"
+```
+
+Independently review the exact suite descriptors and accepted KMX/runtime/model
+policy, then update `verification/expected.json`. Never derive the expectation
+by selecting claims from `evidence.json`, and request fresh review after the
+final expectation push.
+
+For a legacy agent, its README says what its cases check. `tools/eval` submits one case and
 writes raw evidence outside the repository. It writes a public summary receipt
 under the digest it tested.
 
@@ -46,11 +77,12 @@ journals, credentials, or local paths.
 
 ## 4. Commit the result
 
-Commit the behavior change and its receipt together. Open a pull request. CI
-renders the changed agent and verifies its receipts without contacting a
-cluster.
+Commit the behavior change and its evidence together. Open a pull request. CI
+prepares and verifies hello's exact local suite, or renders and verifies a
+legacy agent, without contacting a model or cluster.
 
-A red `agent-gate` means one of three things: a required receipt is missing,
-the receipt belongs to another digest, or the case did not pass with complete
-evidence. Fix the agent or run the case again. Do not copy a receipt from a
-different version.
+A red `agent-gate` means required evidence is missing, belongs to another
+digest, disagrees with the reviewed policy, or does not record a complete pass.
+Fix the agent or run the case again. Do not copy evidence from a different
+version. Hello's public evidence is unsigned consistency proof, not evaluator
+authentication or deployment authority.

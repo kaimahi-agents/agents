@@ -3175,6 +3175,58 @@ def _rendered_agent_item(rendered_bundle, *, label: str) -> dict:
     return agents[0]
 
 
+_NATIVE_SUITE_OWNERSHIP_PREFIX = "kaimahi.dev/suite"
+_NATIVE_SUITE_OWNERSHIP_REFUSAL = (
+    "legacy coordinator path refuses a KMX suite-owned hello resource; "
+    "use a separate destination or migrate coordinator"
+)
+
+
+def _read_optional_live_resource(context: str, kubeconfig: str, resource: str, name: str,
+                                 namespace: str) -> dict | None:
+    result = run_kubectl(context, kubeconfig, [
+        "get", resource, name, "-n", namespace, "--ignore-not-found", "-o", "json",
+    ])
+    if result.returncode != 0:
+        raise CliError("legacy coordinator path could not inspect live hello ownership")
+    if not result.stdout.strip():
+        return None
+    try:
+        observed = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise CliError("legacy coordinator path could not inspect live hello ownership") from exc
+    metadata = observed.get("metadata") if isinstance(observed, dict) else None
+    if not (isinstance(metadata, dict) and metadata.get("name") == name
+            and metadata.get("namespace") == namespace):
+        raise CliError("legacy coordinator path could not inspect live hello ownership")
+    return observed
+
+
+def _has_native_suite_ownership(resource: dict | None) -> bool:
+    if resource is None:
+        return False
+    metadata = resource.get("metadata") if isinstance(resource, dict) else None
+    annotations = metadata.get("annotations") if isinstance(metadata, dict) else None
+    if annotations is None:
+        return False
+    if not isinstance(annotations, dict):
+        raise CliError("legacy coordinator path could not inspect live hello ownership")
+    return any(key.startswith(_NATIVE_SUITE_OWNERSHIP_PREFIX) for key in annotations)
+
+
+def _require_legacy_child_not_suite_owned(context: str, kubeconfig: str, *, agent_name: str,
+                                          agent_namespace: str, provider_name: str,
+                                          provider_namespace: str) -> None:
+    selected = (
+        ("agents.core.orka.ai", agent_name, agent_namespace),
+        ("providers.core.orka.ai", provider_name, provider_namespace),
+    )
+    for resource, name, namespace in selected:
+        if _has_native_suite_ownership(
+                _read_optional_live_resource(context, kubeconfig, resource, name, namespace)):
+            raise CliError(_NATIVE_SUITE_OWNERSHIP_REFUSAL)
+
+
 def _load_native_composition_rendered(args) -> dict:
     coordinator_dir = Path(args.agent_dir)
     graph = load_catalogue_graph(coordinator_dir.parent.parent)
@@ -3192,12 +3244,17 @@ def _load_native_composition_rendered(args) -> dict:
         raise CliError("catalogue dependency digest does not match dependencies.lock.yaml for this environment")
     coordinator_result, coordinator_rendered = _render_checked(args, Path(args.evidence_root) / "coordinator-bundle.yaml")
     child_item = _rendered_agent_item(child_rendered, label="child")
+    child_provider_name, child_provider_namespace = _referenced_provider_identity(child_item)
+    if child_provider_name is None or child_provider_namespace is None:
+        raise CliError("rendered child Agent does not resolve an exact Provider")
     coordinator_item, provider_item, provider_name, provider_namespace = _resolve_rendered_coordinator_provider(
         coordinator_rendered)
     return {
         "child_digest": child_digest,
         "child_item": child_item,
         "child_name": (child_item.get("metadata") or {}).get("name"),
+        "child_provider_name": child_provider_name,
+        "child_provider_namespace": child_provider_namespace,
         "child_path": Path(args.evidence_root) / "child-bundle.yaml",
         "coordinator_digest": coordinator_result["bundle_digest"],
         "coordinator_item": coordinator_item,
@@ -3280,6 +3337,14 @@ def _native_composition_lifecycle_cli(kind: str, argv) -> int:
 
     if kind == "deploy":
         _require_task_inventory_clear(args.context, args.kubeconfig)
+        _require_legacy_child_not_suite_owned(
+            args.context,
+            args.kubeconfig,
+            agent_name=rendered["child_name"],
+            agent_namespace=args.namespace,
+            provider_name=rendered["child_provider_name"],
+            provider_namespace=rendered["child_provider_namespace"],
+        )
         for label, path in (("child", rendered["child_path"]), ("coordinator", rendered["coordinator_path"])):
             applied = run_kubectl(args.context, args.kubeconfig, ["apply", "-n", args.namespace, "-f", str(path)])
             if applied.returncode != 0:
@@ -3789,9 +3854,12 @@ def _prepare_composed_render_context(args, *, evidence_dir: Path | None) -> dict
     if child_agent_item is None or coordinator_agent_item is None:
         raise CliError("rendered bundle is missing the expected Agent resource")
     child_agent_name = (child_agent_item.get("metadata") or {}).get("name")
+    child_provider_name, child_provider_namespace = _referenced_provider_identity(child_agent_item)
     coordinator_agent_name = (coordinator_agent_item.get("metadata") or {}).get("name")
     if not all(isinstance(name, str) and name for name in (child_agent_name, coordinator_agent_name)):
         raise CliError("rendered Agent resources are missing metadata.name")
+    if child_provider_name is None or child_provider_namespace is None:
+        raise CliError("rendered child Agent does not resolve an exact Provider")
     coordinator_model_name = _require_rendered_coordinator_model_name(coordinator_agent_item)
     return {
         "environment": args.environment,
@@ -3801,6 +3869,8 @@ def _prepare_composed_render_context(args, *, evidence_dir: Path | None) -> dict
         "child_agent_item": child_agent_item,
         "coordinator_agent_item": coordinator_agent_item,
         "child_agent_name": child_agent_name,
+        "child_provider_name": child_provider_name,
+        "child_provider_namespace": child_provider_namespace,
         "coordinator_agent_name": coordinator_agent_name,
         "child_bundle_sha256": child_bundle_sha256,
         "coordinator_bundle_sha256": coordinator_bundle_sha256,
@@ -4178,6 +4248,14 @@ def _eval_composed_coordination(args, case: dict) -> tuple[dict, dict[str, dict]
     if not isinstance(annotations, dict) or annotations.get(_DISABLE_COORDINATION_TOOL_INJECTION) != "true":
         raise CliError("Task manifest must set orka.ai/disable-coordination-tool-injection to 'true'")
     _require_task_inventory_clear(args.context, args.kubeconfig)
+    _require_legacy_child_not_suite_owned(
+        args.context,
+        args.kubeconfig,
+        agent_name=preflight_render_context["child_agent_name"],
+        agent_namespace=args.namespace,
+        provider_name=preflight_render_context["child_provider_name"],
+        provider_namespace=preflight_render_context["child_provider_namespace"],
+    )
     preserved_observation, preserved_probe_evidence_sha256 = ((None, []) if args.case_id not in COMPOSED_REFUSAL_CASE_IDS
                                                               else _load_preserved_controller_allowlist_observation(
                                                                   args.agent_dir,

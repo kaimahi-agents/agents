@@ -2,29 +2,37 @@
 
 ## What makes a version
 
-An agent version is a SHA-256 digest over every file that changes its behavior.
-That includes the prompt, Orka resources, dependency lock, runtime image digest,
-acceptance rules, memory baseline, and environment overlay. The renderer frames
-and sorts those files before hashing them, so the same inputs produce the same
-digest.
+Hello's version is the exact OCI suite manifest digest prepared from its
+workspace. The graph binds its member, model, instruction bytes, build profile,
+composition, and ordered evaluation cases. Deterministic preparation gives the
+same digest for the same source.
 
-Test results are stored as receipts under that digest. A receipt records the
-case, result, evidence completeness, and hashes of raw evidence kept outside the
-repository.
+Legacy agent versions are SHA-256 digests over every file that changes behavior,
+including prompts, Orka resources, dependency locks, runtime image digests,
+acceptance rules, memory baselines, and environment overlays. The old renderer
+frames and sorts those files before hashing them.
+
+Hello's detached portable evidence and reviewed expectation both bind its exact
+suite digest. Legacy test results remain receipts under their bundle digest.
 
 ## What the gate checks
 
-A changed agent can merge only when every required case has a passing receipt
-for the new digest. CI renders the bundle and checks those receipts offline. It
-never contacts a cluster.
+A changed hello suite can merge only when its committed evidence completely
+passes against the current prepared graph and independently reviewed policy.
+CI prepares a temporary local OCI layout and runs `kmx eval verify`; missing or
+mismatched evidence fails closed. Legacy agents retain their rendered-bundle
+receipt checks. CI never contacts a model or cluster.
 
 For coordinating native agents, `dependencies.lock.yaml.catalogueAgents` is a
-catalogue/promotion pin, not immutable runtime binding: CI rerenders each
-pinned child per environment, requires the coordinator lock to match
+catalogue/promotion pin, not immutable runtime binding: CI rerenders each pinned
+legacy child projection per environment, requires the coordinator lock to match
 `allowedAgents`, and expands the reverse-dependent gate so a changed child also
-re-verifies every pinned coordinator that depends on it. That proves the
-catalogue pair is promoted together, but not that an already-running native
-Task is frozen to one child revision.
+re-verifies every pinned coordinator that depends on it. Hello keeps that frozen
+projection only until coordinator's multi-member suite migration. Its pins are
+not the canonical hello suite digest. Legacy coordinator mutation paths also
+refuse a child Agent or Provider carrying any `kaimahi.dev/suite*` ownership
+annotation. The check proves the legacy catalogue pair is promoted together,
+not that an already-running native Task is frozen to one child revision.
 
 ## Deploy and roll back
 
@@ -34,9 +42,13 @@ from the cluster, then writes a deploy receipt. In native-composition mode it
 applies the pinned child and coordinator bundles, then verifies both live Agent
 definitions and Ready conditions before writing the receipt.
 
-Rollback is `git revert`. Reverting restores the earlier behavior inputs, so the
-digest returns to its earlier value. Its test receipts already exist and the
-gate needs no retest. Deploy the reverted bundle, then run the readback verifier. Use
+Rollback starts with `git revert`. For hello, reverting restores the earlier
+workspace, portable evidence, and reviewed expectation, so offline verification
+returns to the earlier exact suite digest. Public evidence does not authorize
+Lift: retain the matching private full-passing evidence outside Git, or run a
+fresh evaluation before publishing and Lifting the restored digest. For legacy
+agents, reverting restores the earlier bundle digest and receipts. Deploy the
+reverted bundle, then run the readback verifier. Use
 `tools/rollback-verify --help` to inspect the interface.
 
 ```sh

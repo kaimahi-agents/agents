@@ -1,10 +1,11 @@
 name: Agent Gate
 
 # Branch protection on `main` requires this check and applies it to
-# administrators. Reviews are not required while there is one maintainer,
-# so this workflow performs no review-count logic and calls no GitHub API
-# or token. It only renders and verifies offline, and is a single job
-# named exactly `agent-gate`: the stable required-status-check context.
+# administrators. Organization rules separately require review; this workflow
+# performs no review-count logic and calls no GitHub API or token. It only
+# prepares local artifacts and verifies them without model or cluster calls,
+# and is a single job named exactly `agent-gate`: the stable required-status
+# check context.
 on:
   pull_request:
     types: [opened, synchronize, reopened, edited]
@@ -26,6 +27,7 @@ jobs:
   agent-gate:
     name: agent-gate
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -54,10 +56,12 @@ jobs:
       - name: Run the bounded secret scanner
         run: python3 tools/secret-scan .
 
-      - name: Discover changed agents and render/verify every environment
+      - name: Discover changed agents and run their offline gates
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          KMX_VERSION: v0.8.1
+          KMX_LINUX_AMD64_SHA256: 7f2d02d4c22d222d91ece03a9214bbd10a3e43403b9c37965c51110ba74151fc
         run: |
           set -euo pipefail
 
@@ -70,6 +74,20 @@ jobs:
             echo "failed to compute the changed-agent list" >&2
             exit 1
           fi
+          # A gate implementation/test change must execute the gate it changes,
+          # even when no agents/* source path moved.
+          if ! git diff --quiet "$BASE_SHA...$HEAD_SHA" -- \
+            .github/workflows/agent-gate.yaml tests/test_workflow.py tests/test_hello_suite.py; then
+            hello_listed=false
+            for agent in $agents; do
+              if [ "$agent" = "hello" ]; then
+                hello_listed=true
+              fi
+            done
+            if [ "$hello_listed" = false ]; then
+              agents="${agents:+$agents }hello"
+            fi
+          fi
           if [ -z "$agents" ]; then
             echo "no agents/* changes in this pull request"
             exit 0
@@ -79,6 +97,71 @@ jobs:
           mkdir -p "$bundle_dir"
           status=0
           for agent in $agents; do
+            if [ "$agent" = "hello" ]; then
+              echo "== hello / native suite evidence =="
+              hello_root="${RUNNER_TEMP:-/tmp}/hello-suite-gate"
+              kmx="$hello_root/kmx"
+              kmx_download="$hello_root/kmx.download"
+              layout="$hello_root/layout"
+              mkdir -p "$hello_root"
+
+              curl --fail --location --proto '=https' --tlsv1.2 \
+                --connect-timeout 15 --max-time 120 \
+                --retry 3 --retry-delay 2 --retry-all-errors \
+                --output "$kmx_download" \
+                "https://github.com/kaimahi-agents/kaimahi/releases/download/$KMX_VERSION/kmx-linux-amd64"
+              printf '%s  %s\n' "$KMX_LINUX_AMD64_SHA256" "$kmx_download" | sha256sum --check -
+              install -m 0755 "$kmx_download" "$kmx"
+
+              KMX_HOME="$hello_root/kmx-home" "$kmx" push \
+                --workspace agents/hello/workspace \
+                --unevaluated \
+                --to-layout "$layout" \
+                hello:agent-gate
+
+              suite_digest="$(python3 -c 'import json; print(json.load(open("agents/hello/verification/expected.json", encoding="utf-8"))["subject"]["manifest"]["digest"])')"
+              "$kmx" eval verify \
+                --suite "$suite_digest" \
+                --from-layout "$layout" \
+                --evidence agents/hello/verification/evidence.json \
+                --expect agents/hello/verification/expected.json \
+                -o json
+
+              # Exercise the fail-closed paths without contacting a model,
+              # cluster, registry, or private KMX state.
+              missing_stdout="$hello_root/missing.stdout"
+              if "$kmx" eval verify \
+                --suite "$suite_digest" \
+                --from-layout "$layout" \
+                --evidence "$hello_root/missing-evidence.json" \
+                --expect agents/hello/verification/expected.json \
+                -o json >"$missing_stdout" 2>"$hello_root/missing.stderr"; then
+                echo "hello: missing evidence unexpectedly verified" >&2
+                status=1
+              elif [ -s "$missing_stdout" ]; then
+                echo "hello: missing-evidence refusal emitted success output" >&2
+                status=1
+              fi
+
+              mismatched="$hello_root/mismatched-evidence.json"
+              python3 -c 'import json, pathlib, sys; evidence = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")); evidence["subject"]["manifest"]["digest"] = "sha256:" + "0" * 64; pathlib.Path(sys.argv[2]).write_text(json.dumps(evidence, separators=(",", ":"), sort_keys=True), encoding="utf-8")' \
+                agents/hello/verification/evidence.json "$mismatched"
+              mismatch_stdout="$hello_root/mismatch.stdout"
+              if "$kmx" eval verify \
+                --suite "$suite_digest" \
+                --from-layout "$layout" \
+                --evidence "$mismatched" \
+                --expect agents/hello/verification/expected.json \
+                -o json >"$mismatch_stdout" 2>"$hello_root/mismatch.stderr"; then
+                echo "hello: mismatched evidence unexpectedly verified" >&2
+                status=1
+              elif [ -s "$mismatch_stdout" ]; then
+                echo "hello: mismatched-evidence refusal emitted success output" >&2
+                status=1
+              fi
+              continue
+            fi
+
             # $agent is already a validated safe slug (tools/discover-
             # changed-agents), so this path can never traverse outside
             # $bundle_dir.
@@ -114,5 +197,6 @@ jobs:
             done
           done
           exit "$status"
-          # CI never contacts a cluster: every step above is render/verify
-          # only, offline, against files already checked out.
+          # CI never contacts a model or cluster. Hello prepares a local OCI
+          # graph and verifies detached evidence; other agents retain their
+          # legacy render/receipt checks.

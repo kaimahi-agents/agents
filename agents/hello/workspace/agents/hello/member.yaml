@@ -1,0 +1,7 @@
+id: hello
+instructions: instructions.md
+model:
+    protocol: openai-compatible
+    model: gpt-4.1-mini
+runtime:
+    id: orka

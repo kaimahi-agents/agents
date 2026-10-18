@@ -19,10 +19,16 @@ catalogue `hello` Agent and must report refusals truthfully.
   Kubernetes Secret only; no credential value or Secret manifest is committed in
   this repository
 
-`dependencies.lock.yaml` pins the rendered `hello` child bundle digest for both
-environments. That lock is a promotion pin for catalogue verification and
-lifecycle workflows, not immutable runtime binding for already-running native
-Tasks.
+`dependencies.lock.yaml` pins the frozen legacy `hello` compatibility projection
+for both environments. The canonical hello source is now a KMX suite with a
+different OCI manifest digest. This lock remains only until coordinator's
+multi-member suite migration; it is neither a pin to the canonical suite nor
+immutable runtime binding for already-running native Tasks.
+
+Because both forms use the live name `hello`, coordinator eval/deploy refuses
+before apply when the selected Agent or Provider carries any
+`kaimahi.dev/suite*` ownership annotation. Run the legacy coordinator and
+canonical hello Lift in separate destinations.
 
 ## Run it
 

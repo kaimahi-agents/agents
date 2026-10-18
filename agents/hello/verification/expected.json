@@ -1,0 +1,56 @@
+{
+  "subject": {
+    "manifest": {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:243f8347413d583c9a5b401fa05d7fc5f2558660f809bc919037fc9fcd2ee379",
+      "size": 523
+    },
+    "memberID": "hello",
+    "memberDigest": "sha256:222fc8a481c515084d9ac0e82ab7b8cbf17133e655ff2ee0281774f236e05e47",
+    "compositionDigest": "sha256:ec482da6178dba15928cdbc17e14787f049b41d510ec5d32b04c8667007064b1",
+    "buildProfileDigest": "sha256:cd3a5fd2a53cdf83177a65537a3f21181c2f28cc62a7badfd13cc81d66df52a7",
+    "platform": {
+      "os": "linux",
+      "architecture": "amd64",
+      "variant": ""
+    }
+  },
+  "execution": {
+    "runtime": {
+      "id": "orka",
+      "version": "0.2.0",
+      "digest": "sha256:7c1727f92d5c0cf05d464c6eb9e70b8342cb5a7a87c2e35338f051d7b85aa370"
+    },
+    "model": {
+      "protocol": "openai-compatible",
+      "id": "gpt-4.1-mini",
+      "configurationDigest": "sha256:790098c9b7bee7a064bd7075b1a744c768b10c3db434356753209feb60be09b7"
+    },
+    "harness": {
+      "id": "orka",
+      "version": "harness-v2",
+      "digest": "sha256:814d7149308e62730df59759c5137667cad04520c94cc50ff56e5028fdc8bcd4"
+    },
+    "renderer": {
+      "id": "kmx.native-orka",
+      "version": "v2",
+      "digest": "sha256:e6f82c8b38ec7fff52f49e2ffbcf068af2f774232f5a1fc38dbc2aeb3065a041"
+    },
+    "profile": {
+      "id": "kmx.orka-harness-v2-tool-free-openai",
+      "version": "v1",
+      "digest": "sha256:e6f82c8b38ec7fff52f49e2ffbcf068af2f774232f5a1fc38dbc2aeb3065a041"
+    },
+    "configurationDigest": "sha256:773fe5bfc757b800d06b21f9c3fa0873b28cfc8283d86c198e3889b23a73f33e"
+  },
+  "evaluator": {
+    "id": "kmx",
+    "version": "v0.8.1-git-8039af98567f8067c4d3d741dc70752026a212b1",
+    "policy": {
+      "id": "agentsuite-text-v1",
+      "version": "1.0.0",
+      "configurationDigest": "sha256:a72ad70813bad75ac6a9d8232494d7825208745e945b170e83e7bf41eadf9930"
+    }
+  },
+  "judges": []
+}

@@ -1,0 +1,4 @@
+schemaVersion: 1
+name: hello
+member: agents/hello/member.yaml
+buildProfile: build-profiles/default.json

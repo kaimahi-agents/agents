@@ -4,8 +4,8 @@ This maps the [Agent Lifecycle Contract proposal](https://gist.github.com/sajaya
 
 | Contract term | What Orka has today (object, field, file:line) | What our tools do | Gap |
 |---|---|---|---|
-| AgentRevision | `Agent` metadata UID/generation plus behavior in `spec` (`api/v1alpha1/agent_types.go:330-336`). | `render` hashes all catalogue behavior inputs into a bundle digest. | No Orka field names that cross-resource digest as a revision. |
-| EvaluationAttestation | none. | `eval` writes a digest-bound, summary-only evaluation receipt. | The smallest addition would be a signed or otherwise verifiable attestation envelope only when a consumer needs one. |
+| AgentRevision | `Agent` metadata UID/generation plus behavior in `spec` (`api/v1alpha1/agent_types.go:330-336`). | Hello uses its exact OCI suite manifest digest; legacy agents use renderer bundle digests. | No Orka field names either cross-resource digest as a revision. |
+| EvaluationAttestation | none. | Hello exports detached AgentSuite portable evidence and verifies it against a reviewed expectation; legacy eval writes digest-bound summary receipts. | Portable evidence is unsigned consistency proof, not evaluator authentication. |
 | AgentDeployment | `Agent` desired state and Ready condition (`api/v1alpha1/agent_types.go:302-319`). | `deploy` applies a rendered bundle and reads it back. | No object binds an Agent revision to an environment as a deployment record. |
 | DeploymentOperation | none; Kubernetes apply plus reconciliation is the operation. | The command performs apply/readback synchronously. | The smallest addition would be an operation ID and terminal result if asynchronous tracking is needed. |
 | TaskBinding | Under another name for `type: agent`: `Task.status.agentExecutionBinding` (`api/v1alpha1/task_types.go:428-487`) contains Task UID/generation, Agent UID/generation, binding digest, snapshot digest, protocol, backend, and runtime profile (`api/v1alpha1/agent_execution_binding_types.go:27-141`). | No catalogue command reads it today. | Native `type: ai` Tasks have no equivalent Agent UID/generation or snapshot reference in status; they expose only Job identity. |
@@ -16,6 +16,6 @@ This maps the [Agent Lifecycle Contract proposal](https://gist.github.com/sajaya
 
 The catalogue run exercised evaluation and deployment receipts; the rollback POC exercised digest restoration and live readback; the latest run exercised two native worker Jobs across A → B → A, including Ready conditions, namespace, immutable Job configuration, and worker image identity.
 
-They did not exercise the formal `agentExecutionBinding`, because local `hello` is a native `type: ai` Task. They also did not establish attestation signatures, asynchronous deployment operations, promotion policy, external side-effect rollback, or a durable accepted-revision catalogue.
+They did not exercise the formal `agentExecutionBinding`, because `hello` uses a native `type: ai` Task. Portable verification also did not establish attestation signatures, asynchronous deployment operations, promotion policy, external side-effect rollback, or a durable accepted-revision catalogue.
 
 **Recommendation:** First decide whether consumers need one stable revision identifier across the catalogue and Orka. If they do, connect that identifier to existing Ready/readback receipts and Orka’s existing agent-task binding. Separately decide whether native Tasks need the same status binding. Keep the ownership boundary—kmx, Orka, or repository workflow—open until the walkthrough.

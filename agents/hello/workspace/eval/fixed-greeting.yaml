@@ -1,0 +1,6 @@
+id: fixed-greeting
+input: "Reply with exactly: Hello world."
+assertions:
+  - id: exact-result-text
+    type: regex
+    pattern: '^Hello world\.$'

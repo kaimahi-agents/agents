@@ -1,66 +1,87 @@
 # hello
 
-The smallest native Orka Agent in the catalogue. It answers briefly in plain
-text and is a good place to start.
+The smallest native Orka suite in the catalogue. Its canonical source is
+[`workspace/`](workspace/); it answers briefly in plain text and is the best
+place to start with the KMX Create-Prove-Lift lifecycle.
 
 ## What it needs
 
-- Runtime: native `type: ai` Task execution
-- Provider: an existing `hello` Provider using `qwen2.5:3b`
-- Credential role: `local-provider-key`, provisioned outside this repository
-- Gateway or monitor: none
+- KMX v0.8.1 and Orka v0.2.0 in `harness-v2` mode
+- A Ready `openai` Provider whose exact default model is `gpt-4.1-mini`
+- A separately provisioned Provider Secret and namespaced Task-result reader
+- No tools, member image, gateway, monitor, or committed credential
 
-The Agent definition is the `Agent` emitted by `kmx agent create` on Kaimahi
-main. The value-free Secret skeleton and environment-specific Provider endpoint
-are not committed. Both overlays keep the Agent in `orka-system` because its
-Provider reference points there, so the environments are version labels rather
-than isolated namespaces.
+The suite packages one Linux/amd64 Orka member, the exact instruction bytes,
+the pinned build profile, and the ordered `fixed-greeting` case. Runtime
+endpoints, Secret references, cluster identities, answers, and private receipts
+are deliberately absent from the workspace and public evidence.
 
-## Run it
+## Prove it
 
-Create the Provider first and wait for it to become ready. Then render and apply
-the Agent. Submit a Task by filling in `examples/task.yaml`, which is the
-primary way to submit a Task to this Agent.
+Evaluation is the only model-calling stage. Keep a private `KMX_HOME`, the same
+absolute workspace path, and the same released KMX producer through evaluation
+and export:
 
 ```sh
-tools/render agents/hello trial --output /tmp/hello.json
-tools/verify agents/hello trial
-kubectl --context "$CONTEXT" --kubeconfig "$KUBECONFIG" apply -f /tmp/hello.json
-NAMESPACE=orka-system PROVIDER=hello envsubst '${NAMESPACE} ${PROVIDER}' < agents/hello/examples/task.yaml | kubectl --context "$CONTEXT" --kubeconfig "$KUBECONFIG" create -f -
+export KMX_HOME="$HOME/.local/share/kmx-hello"
+kmx eval --workspace agents/hello/workspace \
+  --to-context "$CONTEXT" --to-namespace orka-system \
+  --inference provider:"$PROVIDER"
+kmx eval export --workspace agents/hello/workspace \
+  --member hello --out "$PWD/agents/hello/verification/evidence.next.json"
 ```
 
-`examples/task.yaml` has exactly two placeholders, `${NAMESPACE}` and
-`${PROVIDER}`; `envsubst` fills them in and nothing else in the file changes.
-The Task it submits has a generated name, is native `type: ai`, sets
-`retryPolicy.maxRetries` to zero, and adds no tools. That the Task adds no
-tools does not itself disable Agent tools: the effective no-tools behavior
-comes from the Agent declaring none and the Task adding none.
+Review the prepared OCI graph independently and update
+[`verification/expected.json`](verification/expected.json) from accepted
+artifact and producer contracts, never by copying fields from the evidence
+being checked. Replace the committed evidence and expectation together only
+after the exact new suite passes. Expectation changes are policy changes and
+need a fresh approval after the final push; the current repository rules do not
+mechanically dismiss an older approval.
 
-Submitting the Task makes a model request. Its generated name is single-use in
-a namespace; run the command again to generate a fresh Task name.
+To reproduce the offline gate without a model, cluster, or registry, prepare in
+an isolated KMX home and then run the state-free verifier:
 
-This native Agent has no runtime image digest, so use the `kubectl` flow above
-instead of `tools/deploy`.
+```sh
+tmp="$(mktemp -d)"
+KMX_HOME="$tmp/kmx-home" kmx push --workspace agents/hello/workspace \
+  --unevaluated --to-layout "$tmp/layout" hello:verify
+digest="$(python3 -c 'import json; print(json.load(open("agents/hello/verification/expected.json"))["subject"]["manifest"]["digest"])')"
+kmx eval verify --suite "$digest" --from-layout "$tmp/layout" \
+  --evidence agents/hello/verification/evidence.json \
+  --expect agents/hello/verification/expected.json
+```
 
-The Task's `status` field exposes whether a result is available. The result
-text itself is read separately, from the authenticated Orka
-`GET /api/v1/tasks/<name>/result` endpoint over a loopback port-forward, using
-a read-only Task credential.
+The evidence is unsigned. Verification proves complete internal consistency
+with the reviewed suite and policy; it does not authenticate who evaluated it,
+attest the model server or binary, or grant deployment authority.
 
 ## What the test checks
 
-`fixed-greeting` asks for exactly `Hello world.` with zero retries and a limit
-of five provider requests. Against the current digest, one Task ran, succeeded
-on the first attempt, and returned exactly `Hello world.` with no tools
-available, zero retries, and 3 provider requests within the limit of 5 (2
-successful chat completions plus 1 rejected `/v1/responses` call).
+`fixed-greeting` creates one fresh, never-retried Task and requires the complete
+answer to match `Hello world.`. The public evidence records one completed run
+and one passing regex assertion. Tool-free behavior is structural in the suite;
+provider request counts from the retired catalogue receipt are not part of the
+portable evidence schema.
 
-## Where it has run
+The current suite digest is
+`sha256:243f8347413d583c9a5b401fa05d7fc5f2558660f809bc919037fc9fcd2ee379`.
+It passed a fresh local kind evaluation on 2026-10-18 with KMX v0.8.1, pinned
+Orka v0.2.0, and `gpt-4.1-mini`; candidate cleanup completed before proof was
+registered and exported.
 
-This Agent has a passing local `kind` run against the current digest, recorded
-on 2026-09-22. That receipt is bound to the current bundle digest, so the
-catalogue status is `tested`.
+## Coordinator compatibility
 
-It also answered `Hello world.` earlier in the hello-to-governed demo from
-[Kaimahi PR #187](https://github.com/kaimahi-agents/kaimahi/pull/187), which
-predates this catalogue receipt format.
+`resources/`, `environments/`, `dependencies.lock.yaml`, `memory/`, and the old
+`eval/` tree are a frozen compatibility projection for the unmigrated
+multi-member `coordinator`. They retain its existing `qwen2.5:3b` bundle pins
+and historical receipts, but they are not hello's canonical source or CI gate.
+Do not edit that projection as a way to change hello. Remove it when the
+coordinator moves to suites; until then, parity tests keep the shared prompt and
+greeting intent aligned.
+
+Both representations use the live name `hello`. The legacy coordinator eval and
+deploy paths inspect the exact Agent and Provider first and refuse any resource
+carrying a `kaimahi.dev/suite*` ownership annotation. Use separate destinations
+for canonical Lift and the legacy coordinator; neither path adopts or patches
+the other's live resources.

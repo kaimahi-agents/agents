@@ -1101,9 +1101,15 @@ class ComposedEvalCliTestCase(unittest.TestCase):
             ("task", self.child_task["metadata"]["name"]): self.child_task,
             ("jobs.batch",): {"items": []},
             ("agents.core.orka.ai", "hello"): {
-                "metadata": {"uid": "hello-agent-uid", "generation": 1, "namespace": NAMESPACE},
+                "metadata": {"name": "hello", "uid": "hello-agent-uid", "generation": 1,
+                             "namespace": NAMESPACE},
                 "spec": self.hello_spec,
                 "status": {"conditions": [{"type": "Ready", "status": "True", "observedGeneration": 1}]},
+            },
+            ("providers.core.orka.ai", "hello"): {
+                "metadata": {"name": "hello", "uid": "hello-provider-uid", "generation": 1,
+                             "namespace": NAMESPACE},
+                "spec": {"type": "openai", "defaultModel": "qwen2.5:3b"},
             },
             ("agents.core.orka.ai", "coordinator"): {
                 "metadata": {"uid": "coordinator-agent-uid", "generation": 1, "namespace": NAMESPACE},
@@ -1319,6 +1325,20 @@ class ComposedEvalCliTestCase(unittest.TestCase):
 
     def run_refusal_eval(self, **overrides):
         return self.run_eval(REFUSAL_DENIAL_CASE_ID, self.root / "refuses-task.json", **overrides)
+
+    def test_composed_eval_refuses_suite_owned_legacy_child_before_apply_or_task_creation(self):
+        for resource in (("agents.core.orka.ai", "hello"), ("providers.core.orka.ai", "hello")):
+            with self.subTest(resource=resource[0]):
+                self.setUp()
+                self.kubectl.responses[resource]["metadata"]["annotations"] = {
+                    "kaimahi.dev/suite-digest": "sha256:" + "a" * 64,
+                }
+                code, out, err = self.run_eval_main("delegates", self.root / "delegates-task.json")
+                self.assertEqual(code, 1)
+                self.assertEqual(out, "")
+                self.assertIn("legacy coordinator path refuses a KMX suite-owned hello resource", err)
+                self.assertNotIn("apply", self.kubectl.verbs())
+                self.assertNotIn("create", self.kubectl.verbs())
 
     def run_eval_main(self, case_id, task_manifest, **overrides):
         restore_namespace = self.namespace_inventory
@@ -1798,17 +1818,19 @@ class ComposedEvalCliTestCase(unittest.TestCase):
         cases = (
             ("missing",
              lambda: self.kubectl.failures.add(("agents.core.orka.ai", "hello")),
-             "eval failed: pinned hello or coordinator Agent readback could not be established before Task submission"),
+             "eval failed: legacy coordinator path could not inspect live hello ownership", 0, False),
             ("not-ready",
              lambda: self.kubectl.responses[("agents.core.orka.ai", "hello")].__setitem__(
                  "status", {"conditions": [{"type": "Ready", "status": "False", "observedGeneration": 1}]}
              ),
-             "eval failed: pinned hello or coordinator Agent was not current-generation Ready and spec-identical before Task submission"),
+             "eval failed: pinned hello or coordinator Agent was not current-generation Ready and spec-identical before Task submission",
+             2, True),
             ("spec-drift",
              lambda: self.kubectl.responses[("agents.core.orka.ai", "coordinator")]["spec"].update({"extra": True}),
-             "eval failed: pinned hello or coordinator Agent was not current-generation Ready and spec-identical before Task submission"),
+             "eval failed: pinned hello or coordinator Agent was not current-generation Ready and spec-identical before Task submission",
+             2, True),
         )
-        for label, mutate, message in cases:
+        for label, mutate, message, apply_count, readbacks in cases:
             with self.subTest(case=label):
                 self.setUp()
                 mutate()
@@ -1816,10 +1838,10 @@ class ComposedEvalCliTestCase(unittest.TestCase):
                 self.assertEqual(code, 1)
                 self.assertEqual(out, "")
                 self.assertIn(message, err)
-                self.assertEqual(self.kubectl.verbs().count("apply"), 2)
+                self.assertEqual(self.kubectl.verbs().count("apply"), apply_count)
                 self.assertEqual(self.kubectl.verbs().count("create"), 0)
-                self.assertTrue((self.evidence / "delegates" / "hello-agent-readback.json").is_file())
-                self.assertTrue((self.evidence / "delegates" / "coordinator-agent-readback.json").is_file())
+                self.assertEqual((self.evidence / "delegates" / "hello-agent-readback.json").is_file(), readbacks)
+                self.assertEqual((self.evidence / "delegates" / "coordinator-agent-readback.json").is_file(), readbacks)
                 self.assertFalse((self.evidence / "campaign-ledger.json").exists())
                 self.assertEqual(sorted((self.coordinator / "eval" / "receipts").rglob("*.json")), [])
 
@@ -4531,9 +4553,15 @@ class LifecycleCliTestCase(unittest.TestCase):
         self.native_kubectl = FakeKubectl({
             ("tasks.core.orka.ai",): {"items": []},
             ("agents.core.orka.ai", "hello"): {
-                "metadata": {"uid": "hello-agent-uid", "generation": 1, "namespace": NAMESPACE},
+                "metadata": {"name": "hello", "uid": "hello-agent-uid", "generation": 1,
+                             "namespace": NAMESPACE},
                 "spec": self.hello_spec,
                 "status": {"conditions": [{"type": "Ready", "status": "True", "observedGeneration": 1}]},
+            },
+            ("providers.core.orka.ai", "hello"): {
+                "metadata": {"name": "hello", "uid": "hello-provider-uid", "generation": 1,
+                             "namespace": NAMESPACE},
+                "spec": {"type": "openai", "defaultModel": "qwen2.5:3b"},
             },
             ("agents.core.orka.ai", "coordinator"): {
                 "metadata": {"uid": "coordinator-agent-uid", "generation": 1, "namespace": NAMESPACE},
@@ -4907,8 +4935,21 @@ class LifecycleCliTestCase(unittest.TestCase):
         self.assertEqual(receipt["child_digest"], self.hello_digest)
         self.assertEqual(receipt["namespace"], NAMESPACE)
         self.assertEqual(set(receipt["assertions"]),
-                         {"child-matches-rendered", "child-ready",
-                          "coordinator-matches-rendered", "coordinator-ready"})
+                          {"child-matches-rendered", "child-ready",
+                           "coordinator-matches-rendered", "coordinator-ready"})
+
+    def test_native_deploy_refuses_suite_owned_legacy_child_before_apply(self):
+        for resource in (("agents.core.orka.ai", "hello"), ("providers.core.orka.ai", "hello")):
+            with self.subTest(resource=resource[0]):
+                self.setup_native_composition()
+                self.native_kubectl.responses[resource]["metadata"]["annotations"] = {
+                    "kaimahi.dev/suite": "hello",
+                }
+                with self.assertRaises(agentctl.CliError) as caught:
+                    self.run_native_lifecycle("deploy")
+                self.assertIn("legacy coordinator path refuses a KMX suite-owned hello resource",
+                              str(caught.exception))
+                self.assertNotIn("apply", self.native_kubectl.verbs())
 
     def test_native_deploy_includes_the_public_safe_azure_provider_route(self):
         self.setup_native_composition()
